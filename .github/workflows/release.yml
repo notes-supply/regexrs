@@ -85,7 +85,7 @@ jobs:
           mise exec -- cargo package --locked --all-features --no-verify
           candidate="target/package/regexrs-$VERSION.crate"
           cmp "work/verified/regexrs-$VERSION.crate" "$candidate"
-          code=$(curl --silent --show-error --retry 3 --max-time 30 --output work/registry.json --write-out '%{http_code}' "https://crates.io/api/v1/crates/regexrs/$VERSION")
+          code=$(curl --silent --show-error --retry 3 --max-time 30 --user-agent 'regexrs-release (https://github.com/notes-supply/regexrs)' --output work/registry.json --write-out '%{http_code}' "https://crates.io/api/v1/crates/regexrs/$VERSION")
           case "$code" in
             200)
               [[ "$(jq -r '.version.checksum' work/registry.json)" == "$(sha256sum "$candidate" | cut -d ' ' -f1)" ]]
