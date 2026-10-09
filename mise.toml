@@ -31,6 +31,13 @@ depends = ["fmt:check", "lint", "test", "doc", "features"]
 [tasks.build]
 run = "cargo build --locked --release"
 
+[tasks.package]
+run = "cargo package --locked --all-features"
+
+[tasks.publish]
+description = "Publish an already verified package; invoked by the release workflow"
+run = "cargo publish --locked --all-features --no-verify --registry crates-io"
+
 [tasks.bench]
 description = "Parity-gated backreference comparison against Rust competitors"
 run = "cargo run --locked --release --example competition --features native -- bench 1 1000000 7"
