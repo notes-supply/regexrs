@@ -99,7 +99,7 @@ use crate::Formatter;
 use crate::Result;
 use crate::error::RuntimeError;
 use crate::input::{Input as HaystackInput, RegexInput};
-use crate::seek::StartFilter;
+use crate::start::StartFilter;
 use crate::{HardRegexRuntimeOptions, codepoint_len};
 
 /// Enable tracing of VM execution. Only for debugging/investigating.
@@ -262,6 +262,11 @@ pub(crate) type FoldRanges = Box<[(char, char)]>;
 impl CaseiLiteral {
     pub(crate) fn new(chars: Box<[FoldRanges]>) -> Self {
         CaseiLiteral { chars }
+    }
+
+    /// The characters a match can begin with.
+    pub(crate) fn first_char(&self) -> Option<&[(char, char)]> {
+        self.chars.first().map(AsRef::as_ref)
     }
 
     /// If the literal matches at `ix`, returns the matched byte length (which
@@ -564,8 +569,7 @@ pub struct Prog {
     bytes_mode: BytesMode,
     /// A pattern compatible with a DFA which can be used to seek to candidate positions where the real/full pattern might match
     pub(crate) seek_pattern: String,
-    /// Positions where the `SplitUnanchored` preamble may start an attempt;
-    /// see [`crate::seek::candidate_starts`].
+    /// Positions the `SplitUnanchored` preamble may skip; see [`StartFilter`].
     start_filter: Option<StartFilter>,
     scratch_pool: Pool<Scratch, fn() -> Scratch>,
 }
@@ -1073,7 +1077,7 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
     if option_flags & OPTION_TRACE != 0 {
         println!("pos\tinstruction");
     }
-    let mut backtrack_count = 0;
+    let mut backtrack_count: usize = 0;
     let mut pc = 0;
     let mut ix = pos;
     let mut slash_z_matched = false;
@@ -1234,16 +1238,30 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     continue;
                 }
                 Insn::SplitUnanchored(x, y) => {
-                    // Searched to the haystack end: rewritten trailing
-                    // lookaheads consume text after the reported match.
-                    if let Some(start_filter) = start_filter {
-                        match start_filter.find(haystack.as_bytes(), ix) {
-                            Some(candidate) => ix = candidate,
-                            None => return Ok(None),
-                        }
-                    }
                     if ix > match_range.end {
                         return Ok(None);
+                    }
+                    if let Some(start_filter) = start_filter {
+                        // Searched to the haystack end: rewritten trailing
+                        // lookaheads consume text after the reported match.
+                        let candidate = start_filter.find(haystack.as_bytes(), ix);
+                        let stop = candidate
+                            .unwrap_or(usize::MAX)
+                            .min(match_range.end.saturating_add(1));
+                        backtrack_count =
+                            backtrack_count.saturating_add(start_filter.skipped_cost(
+                                haystack.as_bytes(),
+                                ix,
+                                stop,
+                                prog.bytes_mode,
+                            ));
+                        if backtrack_count > options.backtrack_limit {
+                            return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded));
+                        }
+                        match candidate {
+                            Some(candidate) if candidate <= match_range.end => ix = candidate,
+                            _ => return Ok(None),
+                        }
                     }
                     match_attempt_start = ix;
                     slash_z_matched = false;

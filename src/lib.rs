@@ -65,6 +65,7 @@ mod regexset;
 mod replacer;
 mod searcher;
 mod seek;
+mod start;
 mod to_hir;
 mod vm;
 
@@ -528,8 +529,7 @@ struct RegexOptions {
     delegate_prefilter: bool,
     #[cfg(feature = "native")]
     native_enabled: bool,
-    /// An explicit limit keeps the reference engine's exhaustive per-position
-    /// accounting, so candidate skipping and native execution stay off.
+    #[cfg(feature = "native")]
     explicit_backtrack_limit: bool,
 }
 
@@ -575,6 +575,7 @@ impl Default for RegexOptions {
             delegate_prefilter: true,
             #[cfg(feature = "native")]
             native_enabled: true,
+            #[cfg(feature = "native")]
             explicit_backtrack_limit: false,
         }
     }
@@ -764,12 +765,13 @@ impl RegexOptionsBuilder {
     /// [`Error::BacktrackLimitExceeded`](enum.Error.html#variant.BacktrackLimitExceeded).
     /// This is for preventing a regex with catastrophic backtracking to run for too long.
     ///
-    /// Default is `1_000_000` (1 million). Under the default, unanchored searches skip start
-    /// positions that cannot begin a match, and that skipped work is not counted. Setting a
-    /// limit explicitly, even to the default value, retains exhaustive per-position counting.
+    /// Default is `1_000_000` (1 million).
     pub fn backtrack_limit(&mut self, limit: usize) -> &mut Self {
         self.options.hard_regex_runtime_options.backtrack_limit = limit;
-        self.options.explicit_backtrack_limit = true;
+        #[cfg(feature = "native")]
+        {
+            self.options.explicit_backtrack_limit = true;
+        }
         self
     }
 
@@ -1305,7 +1307,6 @@ impl Regex {
                     && !matches!(options.bytes_mode, BytesMode::Ascii),
                 delegate_size_limit: options.delegate_size_limit,
                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
-                start_filter: options.delegate_prefilter && !options.explicit_backtrack_limit,
             },
         )?;
         Ok(Regex {

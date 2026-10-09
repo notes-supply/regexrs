@@ -22,8 +22,8 @@ results remain snapshots, unaffected by later searches.
 The optional `native` feature accelerates supported whole-string boolean queries
 on Linux x86-64. Other syntax, byte inputs, ranged searches and captures retain
 the complete portable engine. Native work is capped; a deferral reruns the input
-portably. Explicit backtracking limits disable native execution and position
-skipping. No C regex library or C fallback is used.
+portably. Explicit backtracking limits disable native execution. No C regex
+library or C fallback is used.
 
 Development: `mise install --locked`, then `mise run check`.
 Benchmarks: `mise run bench`; see [performance](docs/performance.md) for scope

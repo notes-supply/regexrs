@@ -34,14 +34,16 @@ option changes many apparent gaps. Compare configured engines, hit-heavy and
 miss-heavy inputs, and compilation cost separately.
 
 Unanchored portable searches, including `find`, captures, iteration and
-replacement, only start attempts where one of the pattern's leading literals
-occurs: memmem or memchr via `regex-automata`, or a first-byte table. Patterns
-led by a character class, backreference or other unknown text still try every
-position, as do byte haystacks outside ASCII mode; dense hits gain nothing. Skipped positions do not count toward the
-default backtrack limit; an explicit limit keeps exhaustive counting. Repeated
-alternatives such as `((a|ab)+)\1` remain portable. `RegexBuilder::seek(true)`
-uses a fuller regular approximation for explicit tuning, but is not selected
-automatically: it can regress hit-heavy searches.
+replacement, skip start positions where the program's leading literal or class
+tests cannot succeed: memmem or memchr via `regex-automata`, or a first-byte
+table. Each skipped position is charged the backtracks its failing attempt
+would have performed, so matches and limit errors are unchanged. Positions are
+only skipped when that cost is fixed, so patterns led by a delegated
+alternation, `.`, an assertion before alternatives or another construct whose
+failure cost varies still try every position, as do byte haystacks outside
+ASCII mode; dense hits gain nothing. Repeated alternatives such as `((a|ab)+)\1` remain portable.
+`RegexBuilder::seek(true)` uses a fuller regular approximation for explicit
+tuning, but is not selected automatically: it can regress hit-heavy searches.
 
 Caller-owned scratch is an allocation/ownership interface, not a guaranteed
 speedup: the portable implementation already pools working memory. Owned capture
