@@ -1,0 +1,21 @@
+regexrs is an independently maintained derivative of Fancy Regex.
+
+Initial source: published fancy-regex 0.19.1
+Upstream: https://github.com/fancy-regex/fancy-regex
+Recorded upstream revision: 255e05c227e7398a64919cfa2a2fda03dbdd8b28
+
+Copyright 2015 The Fancy Regex Authors.
+Modifications copyright 2026 Notes Supply AB.
+
+The upstream MIT license and source copyright notices are retained. AUTHORS
+records the upstream authors. The Oniguruma test fixtures have their own retained
+license in tests/oniguruma/README.md; they are data parsed by Rust tests, not a C
+implementation or compiled C dependency.
+
+The unmodified published Fancy Regex is used as a development-only oracle.
+It is not a runtime dependency of this library.
+
+The optional native compiler was developed separately for the Memoirs project
+and adapted here to lower the already-parsed expression tree. Its source is
+copyright Notes Supply AB under the MIT license; no Memoirs storage, runtime
+integration or private data is included.

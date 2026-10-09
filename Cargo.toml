@@ -1,0 +1,72 @@
+[package]
+name = "regexrs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A pure-Rust rich regular expression engine with portable matching and optional native acceleration"
+readme = "README.md"
+repository = "https://github.com/notes-supply/regexrs"
+documentation = "https://docs.rs/regexrs"
+categories = ["text-processing"]
+keywords = ["regex", "backreferences", "lookaround", "unicode"]
+exclude = ["/work/", "/target/", "/.github/"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["unicode", "perf", "std", "variable-lookbehinds"]
+track_caller = []
+perf = ["regex-automata/perf"]
+unicode = ["regex-automata/unicode", "regex-syntax/unicode"]
+std = ["regex-automata/std", "regex-syntax/std", "bit-set/std"]
+variable-lookbehinds = ["regex-automata/dfa-search"]
+perf-dfa-full = ["regex-automata/dfa-build"]
+native = ["std", "unicode", "dep:dynasmrt", "dep:memchr", "dep:thiserror"]
+
+[dependencies]
+regex-automata = { version = "0.4.18", default-features = false, features = ["alloc", "syntax", "meta", "nfa", "dfa-onepass", "dfa-search", "hybrid"] }
+regex-syntax = { version = "0.8.11", default-features = false }
+bit-set = { version = "0.8", default-features = false }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+dynasmrt = { version = "=5.1.0", optional = true }
+memchr = { version = "2.8", optional = true }
+thiserror = { version = "2", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+matches = "0.1.10"
+quickcheck = "1.0"
+regex = "1.13.1"
+oracle = { package = "fancy-regex", version = "=0.19.1" }
+regexr = { version = "=0.6.0", features = ["full"] }
+regress = "=0.12.0"
+serde_json = "1"
+
+[[example]]
+name = "competition"
+required-features = ["native"]
+
+[[bench]]
+name = "bench"
+harness = false
+
+[[bench]]
+name = "regexset_vs_individual"
+harness = false
+
+[[bench]]
+name = "compile"
+harness = false
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
