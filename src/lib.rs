@@ -164,7 +164,7 @@ pub struct Regex {
     inner: RegexImpl,
     named_groups: Arc<NamedGroups>,
     #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
-    native: Option<Arc<native::NativeRegex>>,
+    native: Option<Arc<native::LazyNative>>,
 }
 
 // Separate enum because we don't want to expose any of this
@@ -528,7 +528,8 @@ struct RegexOptions {
     delegate_prefilter: bool,
     #[cfg(feature = "native")]
     native_enabled: bool,
-    #[cfg(feature = "native")]
+    /// An explicit limit keeps the reference engine's exhaustive per-position
+    /// accounting, so candidate skipping and native execution stay off.
     explicit_backtrack_limit: bool,
 }
 
@@ -574,7 +575,6 @@ impl Default for RegexOptions {
             delegate_prefilter: true,
             #[cfg(feature = "native")]
             native_enabled: true,
-            #[cfg(feature = "native")]
             explicit_backtrack_limit: false,
         }
     }
@@ -764,13 +764,12 @@ impl RegexOptionsBuilder {
     /// [`Error::BacktrackLimitExceeded`](enum.Error.html#variant.BacktrackLimitExceeded).
     /// This is for preventing a regex with catastrophic backtracking to run for too long.
     ///
-    /// Default is `1_000_000` (1 million).
+    /// Default is `1_000_000` (1 million). Under the default, unanchored searches skip start
+    /// positions that cannot begin a match, and that skipped work is not counted. Setting a
+    /// limit explicitly, even to the default value, retains exhaustive per-position counting.
     pub fn backtrack_limit(&mut self, limit: usize) -> &mut Self {
         self.options.hard_regex_runtime_options.backtrack_limit = limit;
-        #[cfg(feature = "native")]
-        {
-            self.options.explicit_backtrack_limit = true;
-        }
+        self.options.explicit_backtrack_limit = true;
         self
     }
 
@@ -1306,6 +1305,7 @@ impl Regex {
                     && !matches!(options.bytes_mode, BytesMode::Ascii),
                 delegate_size_limit: options.delegate_size_limit,
                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+                start_filter: options.delegate_prefilter && !options.explicit_backtrack_limit,
             },
         )?;
         Ok(Regex {
@@ -1317,9 +1317,7 @@ impl Regex {
             },
             named_groups: Arc::new(tree.named_groups),
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
-            native: native_pattern
-                .and_then(native::NativeRegex::compile)
-                .map(Arc::new),
+            native: native_pattern.map(|pattern| Arc::new(native::LazyNative::new(pattern))),
         })
     }
 
@@ -1367,7 +1365,8 @@ impl Regex {
     pub(crate) fn native_match<S: input::Input + ?Sized>(&self, input: &S) -> Option<bool> {
         #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
         {
-            self.native.as_ref()?.is_match(input.as_utf8()?)
+            let text = input.as_utf8()?;
+            self.native.as_ref()?.get()?.is_match(text)
         }
         #[cfg(not(all(feature = "native", target_os = "linux", target_arch = "x86_64")))]
         {
@@ -1376,17 +1375,22 @@ impl Regex {
         }
     }
 
-    /// Whether a native boolean-matching candidate was compiled. An expensive
-    /// input can still defer to the portable matcher; this is not route telemetry.
+    /// Whether native boolean-matching code exists for this expression. Code is
+    /// emitted on the first boolean search or query. An expensive input can
+    /// still defer to the portable matcher; this is not route telemetry.
     pub fn has_native_code(&self) -> bool {
         self.native_code_bytes() != 0
     }
 
     /// Native instruction-buffer size, or zero on a portable-only expression.
+    /// Emits the code if no boolean search has done so yet.
     pub fn native_code_bytes(&self) -> usize {
         #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
         {
-            self.native.as_ref().map_or(0, |native| native.code_bytes())
+            self.native
+                .as_ref()
+                .and_then(|native| native.get())
+                .map_or(0, native::NativeRegex::code_bytes)
         }
         #[cfg(not(all(feature = "native", target_os = "linux", target_arch = "x86_64")))]
         {

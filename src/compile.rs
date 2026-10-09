@@ -41,7 +41,7 @@ use std::collections::HashMap as Map;
 
 use crate::LookAround::*;
 use crate::analyze::Info;
-use crate::seek::build_seek_pattern;
+use crate::seek::{StartFilter, build_seek_pattern, candidate_starts};
 use crate::to_hir::{HirCtx, expr_to_hir};
 #[cfg(feature = "variable-lookbehinds")]
 use crate::vm::{CachePoolFn, ReverseBackwardsDelegate};
@@ -69,8 +69,19 @@ impl VMBuilder {
         }
     }
 
-    fn build(self, bytes_mode: BytesMode, seek_pattern: String) -> Prog {
-        Prog::new(self.prog, self.n_saves, bytes_mode, seek_pattern)
+    fn build(
+        self,
+        bytes_mode: BytesMode,
+        seek_pattern: String,
+        start_filter: Option<StartFilter>,
+    ) -> Prog {
+        Prog::new(
+            self.prog,
+            self.n_saves,
+            bytes_mode,
+            seek_pattern,
+            start_filter,
+        )
     }
 
     fn newsave(&mut self) -> usize {
@@ -1209,6 +1220,9 @@ pub struct CompileOptions {
     pub delegate_size_limit: Option<usize>,
     /// Optional size limit in bytes for the DFA of each delegated sub-expression.
     pub delegate_dfa_size_limit: Option<usize>,
+    /// Whether unanchored searches may skip start positions that cannot begin
+    /// a match. Off for anchored-only use and exhaustive backtrack accounting.
+    pub start_filter: bool,
 }
 
 impl core::fmt::Debug for CompileOptions {
@@ -1234,6 +1248,7 @@ impl core::fmt::Debug for CompileOptions {
             .field("unicode", &self.unicode)
             .field("delegate_size_limit", &self.delegate_size_limit)
             .field("delegate_dfa_size_limit", &self.delegate_dfa_size_limit)
+            .field("start_filter", &self.start_filter)
             .finish()
     }
 }
@@ -1249,6 +1264,7 @@ impl Default for CompileOptions {
             unicode: true,
             delegate_size_limit: None,
             delegate_dfa_size_limit: None,
+            start_filter: true,
         }
     }
 }
@@ -1273,6 +1289,7 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
     let mut seek_pattern = String::new();
     build_seek_pattern(info, &c.group_info_map, 0, &mut seek_pattern, 0);
 
+    let mut start_filter = None;
     if !c.options.anchored {
         let mut used_seek = false;
         if let Some(filter) = c.options.seek_filter
@@ -1300,6 +1317,9 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
             c.b.add(Insn::SplitUnanchored(current_pc + 3, current_pc + 1));
             c.b.add(Insn::Any);
             c.b.add(Insn::Jmp(current_pc));
+            if c.options.start_filter {
+                start_filter = candidate_starts(info);
+            }
         }
     }
     if info.start_group() == 1 {
@@ -1315,7 +1335,7 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
         c.b.add(Insn::RejectEmptyMatchAtEOFFollowingNewline);
     }
     c.b.add(Insn::End);
-    Ok(c.b.build(bytes_mode, seek_pattern))
+    Ok(c.b.build(bytes_mode, seek_pattern, start_filter))
 }
 
 struct DelegateBuilder {

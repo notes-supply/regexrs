@@ -39,11 +39,27 @@ enum CodeOwner {
     },
 }
 
-impl NativeRegex {
-    pub(crate) fn compile(pattern: pattern::Pattern) -> Option<Self> {
-        x64::compile(pattern).ok().flatten()
+type Emit = Box<dyn FnOnce() -> Option<NativeRegex> + Send + std::panic::UnwindSafe>;
+
+/// Native code for a validated, lowered pattern, emitted on first use.
+/// Expressions never searched for a boolean answer over a whole UTF-8 string
+/// pay neither code generation nor an executable mapping.
+pub(crate) struct LazyNative(std::sync::LazyLock<Option<NativeRegex>, Emit>);
+
+impl LazyNative {
+    pub(crate) fn new(pattern: pattern::Pattern) -> Self {
+        Self(std::sync::LazyLock::new(Box::new(move || {
+            x64::compile(pattern).ok().flatten()
+        })))
     }
 
+    /// The emitted matcher, or `None` when emission was not possible.
+    pub(crate) fn get(&self) -> Option<&NativeRegex> {
+        std::sync::LazyLock::force(&self.0).as_ref()
+    }
+}
+
+impl NativeRegex {
     /// Match, or defer the entire input to the reference engine.
     pub fn is_match(&self, text: &str) -> Option<bool> {
         // Shared by every attempted start and every generated repeat/backref.
@@ -239,6 +255,7 @@ mod tests {
             let native = regex
                 .native
                 .as_ref()
+                .and_then(|native| native.get())
                 .expect("pattern should be accelerated");
             let oracle = oracle::Regex::new(pattern).unwrap();
             for text in &texts {
@@ -254,7 +271,11 @@ mod tests {
     #[test]
     fn exhausted_native_work_returns_deferral_not_a_false_nonmatch() {
         let regex = Regex::new(r"\A(a+)\1\z").unwrap();
-        let native = regex.native.as_ref().unwrap();
+        let native = regex
+            .native
+            .as_ref()
+            .and_then(|native| native.get())
+            .unwrap();
         let input = "a".repeat(100_002);
         assert_eq!(native.is_match(&input), None);
         assert!(regex.is_match(&input).unwrap());

@@ -99,6 +99,7 @@ use crate::Formatter;
 use crate::Result;
 use crate::error::RuntimeError;
 use crate::input::{Input as HaystackInput, RegexInput};
+use crate::seek::StartFilter;
 use crate::{HardRegexRuntimeOptions, codepoint_len};
 
 /// Enable tracing of VM execution. Only for debugging/investigating.
@@ -563,6 +564,9 @@ pub struct Prog {
     bytes_mode: BytesMode,
     /// A pattern compatible with a DFA which can be used to seek to candidate positions where the real/full pattern might match
     pub(crate) seek_pattern: String,
+    /// Positions where the `SplitUnanchored` preamble may start an attempt;
+    /// see [`crate::seek::candidate_starts`].
+    start_filter: Option<StartFilter>,
     scratch_pool: Pool<Scratch, fn() -> Scratch>,
 }
 
@@ -572,14 +576,21 @@ impl Prog {
         n_saves: usize,
         bytes_mode: BytesMode,
         seek_pattern: String,
+        start_filter: Option<StartFilter>,
     ) -> Prog {
         Prog {
             body,
             n_saves,
             bytes_mode,
             seek_pattern,
+            start_filter,
             scratch_pool: Pool::new(new_scratch),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_filter(&self) -> Option<&StartFilter> {
+        self.start_filter.as_ref()
     }
 
     #[doc(hidden)]
@@ -1051,6 +1062,13 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
     state.reset(prog.n_saves, option_flags);
     inner_slots.clear();
     let look_matcher = LookMatcher::new();
+    // Skipping is exact only where the VM would otherwise start an attempt at
+    // every literal position: byte stepping, or whole-character stepping over
+    // valid UTF-8, where each literal begins on a character boundary.
+    let start_filter = prog.start_filter.as_ref().filter(|_| {
+        !input.is_anchored()
+            && (prog.bytes_mode == BytesMode::Ascii || haystack.as_utf8().is_some())
+    });
     #[cfg(feature = "std")]
     if option_flags & OPTION_TRACE != 0 {
         println!("pos\tinstruction");
@@ -1216,6 +1234,14 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     continue;
                 }
                 Insn::SplitUnanchored(x, y) => {
+                    // Searched to the haystack end: rewritten trailing
+                    // lookaheads consume text after the reported match.
+                    if let Some(start_filter) = start_filter {
+                        match start_filter.find(haystack.as_bytes(), ix) {
+                            Some(candidate) => ix = candidate,
+                            None => return Ok(None),
+                        }
+                    }
                     if ix > match_range.end {
                         return Ok(None);
                     }

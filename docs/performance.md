@@ -25,17 +25,23 @@ are record count and sample count. `conformance` runs a small targeted semantic
 comparison, not comprehensive fuzzing. Other engines intentionally use different
 regex flavors; disagreement is not automatically a bug.
 
-Native compilation currently accelerates boolean matching on Linux x86-64.
-Captures, iteration, replacement and unsupported patterns remain fully available
-through the portable implementation. Some expressions favor competing engines;
-ordinary matching is not inherently faster than `regex-automata`, and enabling
-Fancy's existing seek option changes many apparent gaps. Compare configured
-engines, hit-heavy and miss-heavy inputs, and compilation cost separately.
+Native compilation currently accelerates boolean matching on Linux x86-64; its
+code is emitted on the first such search. Captures, iteration, replacement and
+unsupported patterns remain fully available through the portable
+implementation. Some expressions favor competing engines; ordinary matching is
+not inherently faster than `regex-automata`, and enabling Fancy's existing seek
+option changes many apparent gaps. Compare configured engines, hit-heavy and
+miss-heavy inputs, and compilation cost separately.
 
-Repeated alternatives such as `((a|ab)+)\1` currently defer to portable execution
-and are a known performance weak spot. The existing `RegexBuilder::seek(true)`
-option is available for explicit workload tuning, but is not selected
-automatically: it can regress other, hit-heavy searches.
+Unanchored portable searches, including `find`, captures, iteration and
+replacement, only start attempts where one of the pattern's leading literals
+occurs: memmem or memchr via `regex-automata`, or a first-byte table. Patterns
+led by a character class, backreference or other unknown text still try every
+position, as do byte haystacks outside ASCII mode; dense hits gain nothing. Skipped positions do not count toward the
+default backtrack limit; an explicit limit keeps exhaustive counting. Repeated
+alternatives such as `((a|ab)+)\1` remain portable. `RegexBuilder::seek(true)`
+uses a fuller regular approximation for explicit tuning, but is not selected
+automatically: it can regress hit-heavy searches.
 
 Caller-owned scratch is an allocation/ownership interface, not a guaranteed
 speedup: the portable implementation already pools working memory. Owned capture
