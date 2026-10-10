@@ -1068,12 +1068,18 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
     let look_matcher = LookMatcher::new();
     // Skipping is exact only where the VM would otherwise start an attempt at
     // every literal position: byte stepping, or whole-character stepping over
-    // valid UTF-8, where each literal begins on a character boundary.
+    // valid UTF-8 from a character boundary, where each literal begins on a
+    // boundary. A start inside a character steps by the lengths its
+    // continuation bytes imply, so such a run tries every position it visits.
     let text = haystack
         .as_utf8()
         .filter(|_| prog.bytes_mode != BytesMode::Ascii);
     let start_filter = prog.start_filter.as_ref().filter(|_| {
-        !input.is_anchored() && (prog.bytes_mode == BytesMode::Ascii || text.is_some())
+        !input.is_anchored()
+            && match text {
+                Some(text) => text.is_char_boundary(pos),
+                None => prog.bytes_mode == BytesMode::Ascii,
+            }
     });
     #[cfg(feature = "std")]
     if option_flags & OPTION_TRACE != 0 {

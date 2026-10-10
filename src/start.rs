@@ -715,6 +715,113 @@ mod tests {
     }
 
     #[test]
+    fn interior_utf8_starts_try_every_visited_position() {
+        // A start inside a character steps by the lengths its continuation
+        // bytes imply (from 1 in "é€": 1, 3, 5), so those runs must not skip.
+        for (pattern, text, range, limit) in [
+            (r"(?>ab|cd)(?!z)", "é", 1..1, 0),
+            (r"(?>ab|cd)(?!z)", "é€", 1..5, 2),
+            (r"(?>event|incident) \d+:", "é", 1..1, 0),
+            (r"(?>event|incident) \d+:", "é€", 1..5, 2),
+        ] {
+            let (Some(regex), Some(reference)) = build(pattern, false, Some(limit)) else {
+                unreachable!("{pattern:?} compiles");
+            };
+            let found = regex.find_input(RegexInput::new(text).range(range.clone()));
+            let expected = reference.find_input(oracle::RegexInput::new(text).range(range));
+            assert!(expected.is_err(), "{pattern:?} {text:?}");
+            assert_eq!(alloc::format!("{found:?}"), alloc::format!("{expected:?}"));
+        }
+        let patterns = [
+            r"(?>ab|cd)(?!z)",
+            r"(?>|ab)(?!z)",
+            r"ab(?!c)",
+            r"(?i)k(?!x)",
+            r"(?:ab|é)(?!z)",
+            r"\b€\d?(?!x)",
+            r"(?<=é)𝄞(?!x)",
+            r"#(\d)\1",
+        ];
+        let texts = ["é€𝄞 ab", "a€b𝄞cd é"];
+        let modes = [
+            BytesMode::Unicode,
+            BytesMode::UnicodeBytes,
+            BytesMode::Ascii,
+        ];
+        let spans = |r: Option<crate::Match<'_>>| r.map(|m| m.range());
+        let groups = |c: Option<crate::Captures<'_, str>>| {
+            c.map(|c| c.iter().map(|m| m.map(|m| m.range())).collect::<Vec<_>>())
+        };
+        let (mut builds, mut checks) = (0, 0);
+        for pattern in patterns {
+            for mode in modes {
+                for limit in [0, 1, 2, 3, 4, 5, 8] {
+                    let candidate = RegexBuilder::new(pattern)
+                        .bytes_mode(mode)
+                        .backtrack_limit(limit)
+                        .build();
+                    let reference = oracle::RegexBuilder::new(pattern)
+                        .bytes_mode(match mode {
+                            BytesMode::Unicode => oracle::BytesMode::Unicode,
+                            BytesMode::UnicodeBytes => oracle::BytesMode::UnicodeBytes,
+                            BytesMode::Ascii => oracle::BytesMode::Ascii,
+                        })
+                        .backtrack_limit(limit)
+                        .build();
+                    let (regex, reference) = match (candidate, reference) {
+                        (Ok(regex), Ok(reference)) => (regex, reference),
+                        (Err(_), Err(_)) => continue,
+                        (candidate, reference) => panic!(
+                            "{pattern:?} {mode:?} compile disagreement: {:?} vs {:?}",
+                            candidate.err(),
+                            reference.err()
+                        ),
+                    };
+                    builds += 1;
+                    for text in texts {
+                        for start in 0..=text.len() {
+                            for end in start..=text.len() {
+                                let found = regex
+                                    .find_input(RegexInput::new(text).range(start..end))
+                                    .map(spans);
+                                let expected = reference
+                                    .find_input(oracle::RegexInput::new(text).range(start..end))
+                                    .map(|m| m.map(|m| m.range()));
+                                assert_eq!(
+                                    alloc::format!("{found:?}"),
+                                    alloc::format!("{expected:?}"),
+                                    "{pattern:?} {mode:?} limit={limit} {text:?} {start}..{end}"
+                                );
+                                checks += 1;
+                            }
+                            let found = regex
+                                .captures_input(RegexInput::new(text).from_pos(start))
+                                .map(groups);
+                            let expected = reference
+                                .captures_input(oracle::RegexInput::new(text).from_pos(start))
+                                .map(|c| {
+                                    c.map(|c| {
+                                        c.iter().map(|m| m.map(|m| m.range())).collect::<Vec<_>>()
+                                    })
+                                });
+                            assert_eq!(
+                                alloc::format!("{found:?}"),
+                                alloc::format!("{expected:?}"),
+                                "{pattern:?} {mode:?} limit={limit} {text:?} from {start}"
+                            );
+                            checks += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            builds >= 100 && checks >= 20_000,
+            "{builds} builds, {checks} checks"
+        );
+    }
+
+    #[test]
     fn skipping_follows_whole_character_stepping_on_bytes() {
         // Whole-character stepping from an invalid lead byte never visits
         // offset 1 or 4, so an `A` there is not a match outside ASCII mode.
