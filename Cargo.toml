@@ -1,6 +1,6 @@
 [package]
 name = "regexrs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "A pure-Rust rich regular expression engine with portable matching and optional native acceleration"
