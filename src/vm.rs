@@ -217,14 +217,7 @@ impl CharClassMatcher {
                 }
             }
             CharClassMatcher::Codepoint { ranges, .. } => {
-                let len = codepoint_len(bytes[ix]);
-                let end = ix + len;
-                if end > bytes.len() {
-                    return None;
-                }
-                // The haystack is valid UTF-8 in Unicode mode, so this decodes the
-                // codepoint; the `?` is a safety net for an unexpected boundary.
-                let c = core::str::from_utf8(&bytes[ix..end]).ok()?.chars().next()?;
+                let (c, len) = char_at(bytes, ix)?;
                 if range_contains(ranges, c) {
                     Some(len)
                 } else {
@@ -276,27 +269,30 @@ impl CaseiLiteral {
         let bytes = s.as_bytes();
         let mut pos = ix;
         for ranges in self.chars.iter() {
-            if pos >= bytes.len() {
-                return None;
-            }
-            let len = codepoint_len(bytes[pos]);
-            let end = pos + len;
-            if end > bytes.len() {
-                return None;
-            }
-            // The haystack is valid UTF-8 in Unicode mode, so this decodes the
-            // codepoint; the `?` is a safety net for an unexpected boundary.
-            let c = core::str::from_utf8(&bytes[pos..end])
-                .ok()?
-                .chars()
-                .next()?;
+            let (c, len) = char_at(bytes, pos)?;
             if !range_contains(ranges.as_ref(), c) {
                 return None;
             }
-            pos = end;
+            pos += len;
         }
         Some(pos - ix)
     }
+}
+
+/// The character starting at `ix` and its length in bytes; `None` at the end
+/// of input or where the bytes there are not one valid UTF-8 character.
+#[inline]
+fn char_at(bytes: &[u8], ix: usize) -> Option<(char, usize)> {
+    let lead = *bytes.get(ix)?;
+    if lead < 0x80 {
+        return Some((char::from(lead), 1));
+    }
+    let len = codepoint_len(lead);
+    let c = core::str::from_utf8(bytes.get(ix..ix + len)?)
+        .ok()?
+        .chars()
+        .next()?;
+    Some((c, len))
 }
 
 /// Binary-searches `ranges` (sorted, non-overlapping, inclusive) for `needle`.
@@ -1252,19 +1248,21 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     if let Some(start_filter) = start_filter {
                         // Searched to the haystack end: rewritten trailing
                         // lookaheads consume text after the reported match.
-                        let candidate = start_filter.find(haystack.as_bytes(), ix);
-                        let stop = candidate
-                            .unwrap_or(usize::MAX)
-                            .min(match_range.end.saturating_add(1));
-                        backtrack_count = backtrack_count.saturating_add(
-                            start_filter.skipped_cost(haystack.as_bytes(), text, ix, stop),
+                        let room = options.backtrack_limit.saturating_sub(backtrack_count);
+                        let (candidate, cost) = start_filter.advance(
+                            haystack.as_bytes(),
+                            text,
+                            ix,
+                            match_range.end,
+                            room,
                         );
+                        backtrack_count = backtrack_count.saturating_add(cost);
                         if backtrack_count > options.backtrack_limit {
                             return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded));
                         }
                         match candidate {
-                            Some(candidate) if candidate <= match_range.end => ix = candidate,
-                            _ => return Ok(None),
+                            Some(candidate) => ix = candidate,
+                            None => return Ok(None),
                         }
                     }
                     match_attempt_start = ix;
@@ -1643,6 +1641,42 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
 mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen, quickcheck};
+
+    #[test]
+    fn char_at_decodes_like_from_utf8() {
+        // The previous decode: the lead byte's length, then `from_utf8`.
+        fn reference(bytes: &[u8]) -> Option<(char, usize)> {
+            let len = codepoint_len(*bytes.first()?);
+            let c = core::str::from_utf8(bytes.get(..len)?)
+                .ok()?
+                .chars()
+                .next()?;
+            Some((c, len))
+        }
+        let tails = [
+            0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC2, 0xE0, 0xED, 0xF0,
+            0xF4, 0xFF,
+        ];
+        let mut checked = 0;
+        for lead in 0..=u8::MAX {
+            for &b1 in &tails {
+                for &b2 in &tails {
+                    for &b3 in &tails {
+                        let bytes = [lead, b1, b2, b3];
+                        for end in 0..=bytes.len() {
+                            assert_eq!(
+                                char_at(&bytes[..end], 0),
+                                reference(&bytes[..end]),
+                                "{bytes:02X?} ..{end}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 256 * 16 * 16 * 16 * 5);
+    }
 
     #[test]
     fn casei_unicode_fold_equality() {

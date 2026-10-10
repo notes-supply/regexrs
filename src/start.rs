@@ -10,6 +10,8 @@
 //! pushes only a bounded number of branches and cannot error. Such positions
 //! are skipped with a literal search, and each one is charged that number of
 //! backtracks, so matches and limit errors are those of the exhaustive scan.
+//! When every test needs at least two bytes, a candidate's second byte must
+//! also be one some test can begin with.
 
 use regex_automata::util::prefilter::Prefilter;
 use regex_automata::{MatchKind, Span};
@@ -17,20 +19,22 @@ use regex_syntax::hir::Hir;
 use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
 use crate::BytesMode;
-use crate::vm::{CharClassMatcher, Insn};
+use crate::vm::{CharClassMatcher, FoldRanges, Insn};
 
 /// Instructions examined before giving up, which also bounds the branches a
 /// skipped attempt can push.
 const BUDGET: usize = 64;
 
-/// Longest delegate literal prefix extracted; longer prefixes add little
-/// selectivity but grow case-insensitive cross products.
+/// Longest delegate literal prefix extracted for a shared needle; longer
+/// prefixes add little selectivity but grow case-insensitive cross products.
 const DELEGATE_LITERAL_LEN: usize = 4;
 
 /// Candidate positions for unanchored attempts and the cost of the others.
 #[derive(Debug)]
 pub(crate) struct StartFilter {
     candidates: Candidates,
+    /// Bytes a candidate's next byte must be one of, when known.
+    seconds: Option<ByteSet>,
     /// Backtracks an attempt performs at any position that is not a candidate.
     cost: usize,
 }
@@ -129,6 +133,7 @@ impl StartFilter {
         let mut walk = Walk {
             budget: BUDGET,
             first_bytes: ByteSet::default(),
+            seconds: Some(ByteSet::default()),
             common: Common::Unknown,
             delegates,
         };
@@ -144,8 +149,12 @@ impl StartFilter {
         if first_bytes.len() > 128 || (continuation && bytes_mode != BytesMode::Ascii) {
             return None;
         }
+        // A needle already tests the second byte; a set nearly every byte is
+        // in rejects too little to pay for the check.
+        let mut seconds = walk.seconds.filter(|set| set.len() <= 128);
         let literal = match walk.common {
             Common::Prefix(prefix) if prefix.len() >= 2 => {
+                seconds = None;
                 Prefilter::new(MatchKind::LeftmostFirst, &[prefix])
             }
             _ if (1..=3).contains(&first_bytes.len()) => {
@@ -164,33 +173,69 @@ impl StartFilter {
             _ => None,
         };
         let candidates = literal.map_or(Candidates::Bytes(first_bytes), Candidates::Literal);
-        Some(StartFilter { candidates, cost })
+        Some(StartFilter {
+            candidates,
+            seconds,
+            cost,
+        })
     }
 
     /// The first candidate at or after `start`.
-    pub(crate) fn find(&self, haystack: &[u8], start: usize) -> Option<usize> {
-        match &self.candidates {
-            Candidates::Literal(prefilter) => prefilter
-                .find(haystack, Span::from(start..haystack.len()))
-                .map(|span| span.start),
-            Candidates::Bytes(set) => haystack[start..]
-                .iter()
-                .position(|&byte| set.contains(byte))
-                .map(|offset| start + offset),
+    fn find(&self, haystack: &[u8], mut start: usize) -> Option<usize> {
+        loop {
+            let found = match &self.candidates {
+                Candidates::Literal(prefilter) => prefilter
+                    .find(haystack, Span::from(start..haystack.len()))
+                    .map(|span| span.start),
+                Candidates::Bytes(set) => haystack[start..]
+                    .iter()
+                    .position(|&byte| set.contains(byte))
+                    .map(|offset| start + offset),
+            }?;
+            match &self.seconds {
+                Some(seconds)
+                    if !haystack
+                        .get(found + 1)
+                        .is_some_and(|&b| seconds.contains(b)) =>
+                {
+                    start = found + 1;
+                }
+                _ => return Some(found),
+            }
         }
+    }
+
+    /// The first candidate at or before `end` for an unanchored run at `from`
+    /// in `haystack` (see [`skipped_cost`](Self::skipped_cost) for `text`),
+    /// and the backtracks the exhaustive scan performs at the positions
+    /// skipped to reach it, or at all remaining ones when there is none. A
+    /// run that ends here only compares that count with the `room` left under
+    /// the limit, so a byte count that fits stands in for the exact count.
+    pub(crate) fn advance(
+        &self,
+        haystack: &[u8],
+        text: Option<&str>,
+        from: usize,
+        end: usize,
+        room: usize,
+    ) -> (Option<usize>, usize) {
+        let candidate = self.find(haystack, from).filter(|&at| at <= end);
+        let stop = candidate.unwrap_or(end.saturating_add(1));
+        let len = haystack.len();
+        let bound = (stop.min(len) - from + usize::from(stop > len)).saturating_mul(self.cost);
+        let cost = if candidate.is_none() && bound <= room {
+            bound
+        } else {
+            self.skipped_cost(haystack, text, from, stop)
+        };
+        (candidate, cost)
     }
 
     /// Backtracks the exhaustive scan performs at the attempt positions in
     /// `from..stop`, where `stop` may be one past the end of `haystack`. With
     /// `text`, the scan steps whole characters of that valid UTF-8; without
     /// it, single bytes.
-    pub(crate) fn skipped_cost(
-        &self,
-        haystack: &[u8],
-        text: Option<&str>,
-        from: usize,
-        stop: usize,
-    ) -> usize {
+    fn skipped_cost(&self, haystack: &[u8], text: Option<&str>, from: usize, stop: usize) -> usize {
         let end = stop.min(haystack.len());
         let positions = match text {
             None => end - from,
@@ -213,6 +258,9 @@ impl StartFilter {
 struct Walk<'a> {
     budget: usize,
     first_bytes: ByteSet,
+    /// The second bytes of the tests' texts, until a test that can match a
+    /// single byte or whose second byte is not tracked.
+    seconds: Option<ByteSet>,
     common: Common,
     delegates: &'a [(usize, Hir)],
 }
@@ -289,24 +337,31 @@ impl Walk<'_> {
                 {
                     next += 1;
                 }
-                match (needle.first(), insn) {
-                    (Some(&first), _) => {
-                        self.first_bytes.insert(first);
+                match (needle.as_slice(), insn) {
+                    ([first, rest @ ..], _) => {
+                        self.first_bytes.insert(*first);
+                        self.insert_second(rest.first().copied());
                         self.common.narrow(needle);
                     }
                     // A case-insensitive literal starting with a cased
                     // character: its folds fix the first bytes.
-                    (None, Insn::LitCasei(literal)) => self.insert_chars(literal.chars().first()?),
-                    (None, _) => return None,
+                    ([], Insn::LitCasei(literal)) => {
+                        let chars = literal.chars();
+                        self.insert_chars(chars.first()?);
+                        self.insert_seconds(&chars[0], chars.get(1));
+                    }
+                    ([], _) => return None,
                 }
                 Some(1)
             }
             Insn::CharClass(CharClassMatcher::Codepoint { ranges, .. }) if path.at_start => {
                 self.insert_chars(ranges);
+                self.seconds = None;
                 Some(1)
             }
             Insn::CharClass(CharClassMatcher::Byte { ranges, .. }) if path.at_start => {
                 self.common = Common::None;
+                self.seconds = None;
                 for &(lo, hi) in ranges.iter() {
                     for byte in lo..=hi {
                         self.first_bytes.insert(byte);
@@ -319,12 +374,35 @@ impl Walk<'_> {
                 // the text starts with one of its prefixes. An empty prefix
                 // or an unbounded set rejects the filter.
                 let (_, hir) = self.delegates.iter().find(|(at, _)| *at == pc)?;
-                let prefixes = Extractor::new()
-                    .kind(ExtractKind::Prefix)
-                    .limit_literal_len(DELEGATE_LITERAL_LEN)
-                    .extract(hir);
-                for literal in prefixes.literals()? {
-                    self.first_bytes.insert(*literal.as_bytes().first()?);
+                let mut extractor = Extractor::new();
+                extractor.kind(ExtractKind::Prefix).limit_literal_len(2);
+                let firsts = extractor.extract(hir);
+                let firsts = firsts.literals()?;
+                for literal in firsts {
+                    let (&first, rest) = literal.as_bytes().split_first()?;
+                    self.first_bytes.insert(first);
+                    self.insert_second(rest.first().copied());
+                }
+                // Longer prefixes can only lengthen a needle every candidate
+                // shares, so skip their case-fold cross products otherwise.
+                let open = match &self.common {
+                    Common::Unknown => true,
+                    Common::Prefix(prefix) => prefix.len() >= 2,
+                    Common::None => false,
+                };
+                let shared = firsts
+                    .iter()
+                    .all(|literal| literal.as_bytes()[..1] == firsts[0].as_bytes()[..1]);
+                let longer = (open && shared).then(|| {
+                    extractor
+                        .limit_literal_len(DELEGATE_LITERAL_LEN)
+                        .extract(hir)
+                });
+                let prefixes = longer
+                    .as_ref()
+                    .and_then(|seq| seq.literals())
+                    .unwrap_or(firsts);
+                for literal in prefixes {
                     self.common.narrow(literal.as_bytes().to_vec());
                 }
                 Some(1)
@@ -355,15 +433,45 @@ impl Walk<'_> {
     /// Record the first UTF-8 bytes of the characters in `ranges`.
     fn insert_chars(&mut self, ranges: &[(char, char)]) {
         self.common = Common::None;
-        let lead = |c: char| c.encode_utf8(&mut [0; 4]).as_bytes()[0];
-        for &(lo, hi) in ranges {
-            for byte in u32::from(lo)..=u32::from(hi).min(0x7F) {
-                self.first_bytes.insert(byte as u8);
-            }
-            if hi >= '\u{80}' {
-                for byte in lead(lo.max('\u{80}'))..=lead(hi) {
-                    self.first_bytes.insert(byte);
+        insert_leads(&mut self.first_bytes, ranges);
+    }
+
+    /// Record a test's second byte; `None` when it can match one byte.
+    fn insert_second(&mut self, byte: Option<u8>) {
+        match (byte, &mut self.seconds) {
+            (Some(byte), Some(seconds)) => seconds.insert(byte),
+            _ => self.seconds = None,
+        }
+    }
+
+    /// Record the second bytes of texts that begin with a character of the
+    /// fold class `first`, followed by one in `next` when it is a single byte.
+    fn insert_seconds(&mut self, first: &[(char, char)], next: Option<&FoldRanges>) {
+        for &(lo, hi) in first {
+            if lo <= '\x7F' {
+                match (next, &mut self.seconds) {
+                    (Some(next), Some(seconds)) => insert_leads(seconds, next),
+                    _ => self.seconds = None,
                 }
+            }
+            // Case-fold classes have a few characters each.
+            for c in lo.max('\u{80}')..=hi {
+                self.insert_second(Some(c.encode_utf8(&mut [0; 4]).as_bytes()[1]));
+            }
+        }
+    }
+}
+
+/// Record the first UTF-8 bytes of the characters in `ranges`.
+fn insert_leads(set: &mut ByteSet, ranges: &[(char, char)]) {
+    let lead = |c: char| c.encode_utf8(&mut [0; 4]).as_bytes()[0];
+    for &(lo, hi) in ranges {
+        for byte in u32::from(lo)..=u32::from(hi).min(0x7F) {
+            set.insert(byte as u8);
+        }
+        if hi >= '\u{80}' {
+            for byte in lead(lo.max('\u{80}'))..=lead(hi) {
+                set.insert(byte);
             }
         }
     }
@@ -552,7 +660,8 @@ mod tests {
         let mut patterns: Vec<String> = fixed.iter().map(|p| String::from(*p)).collect();
         patterns.extend((0..2000).map(|_| generated_pattern(&mut rng, 0)));
         let texts = generated_texts(&mut rng);
-        let (mut rich, mut accelerated, mut checked_starts, mut errors) = (0, 0, 0, 0);
+        let (mut rich, mut accelerated, mut paired, mut checked_starts, mut errors) =
+            (0, 0, 0, 0, 0);
         for (index, pattern) in patterns.iter().enumerate() {
             // Case-insensitive builds for every third pattern; inline flags
             // cover the rest of the generated mix.
@@ -580,6 +689,7 @@ mod tests {
                     continue;
                 };
                 accelerated += 1;
+                paired += usize::from(filter.seconds.is_some());
                 // Judge the filter directly: an anchored search never consults
                 // it, so a skipped viable start cannot hide behind the matcher.
                 for text in &texts {
@@ -601,8 +711,8 @@ mod tests {
         }
         // A mostly-fallback corpus would not exercise the skipping path.
         assert!(
-            rich >= 800 && accelerated >= 300,
-            "{accelerated}/{rich} accelerated"
+            rich >= 800 && accelerated >= 300 && paired >= 60,
+            "{accelerated}/{rich} accelerated, {paired} checking second bytes"
         );
         assert!(
             checked_starts >= 3_000,
@@ -710,6 +820,94 @@ mod tests {
                     observe!(reference, padded.as_str()),
                     "{pattern:?} {padded:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn delegate_prefixes_keep_needles_and_case_variants() {
+        // First and second bytes come from two-byte prefixes and a longer
+        // shared needle from a second extraction; many case-insensitive
+        // alternatives stay within the extractor's limits at two bytes.
+        let words = "alpha|bravo|charlie|delta|echo|foxtrot|golf|hotel|india|juliet|kilo|lima|mike|november|oscar|papa";
+        let many = alloc::format!("(?i)(?>{words})(?!s)");
+        let cases = [
+            (
+                r"(?>eventual|evening)(?!s)",
+                4,
+                &["evening", "eventual", "even", "EVENING"][..],
+            ),
+            (
+                r"(?i)(?>eventual|evening)(?!s)",
+                1,
+                &["EVENING", "eVeNtUaL", "evens", "even"],
+            ),
+            (
+                r"(?i)(?>café|ſtrasse)(?! x)",
+                0,
+                &["CAFÉ", "Strasse", "ſTRASSE", "STRASSE x"],
+            ),
+            (&many, 0, &["KILO", "\u{212A}ilo", "Papa", "papas", "pap"]),
+        ];
+        for (pattern, needle_len, texts) in cases {
+            let (Some(regex), Some(reference)) = build(pattern, false, None) else {
+                unreachable!("{pattern:?} compiles");
+            };
+            let filter = start_filter(&regex).expect(pattern);
+            let found = match &filter.candidates {
+                Candidates::Literal(prefilter) => prefilter.max_needle_len(),
+                Candidates::Bytes(_) => 0,
+            };
+            assert_eq!(found, needle_len, "{pattern:?}");
+            for text in texts {
+                let padded = alloc::format!("zz {text} {text}");
+                assert_eq!(
+                    observe!(regex, padded.as_str()),
+                    observe!(reference, padded.as_str()),
+                    "{pattern:?} {padded:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn second_bytes_keep_every_two_byte_start() {
+        // A candidate's next byte must continue some test: the second byte of
+        // a wide first character, or the first byte of the character after a
+        // one-byte one. A test that can match one byte disables the check.
+        let cases = [
+            (r"(?i)ka(?!x)", Some(true), "ka KA \u{212A}a \u{212A}A kb"),
+            (r"(?i)st(?!x)", Some(true), "st ST ſt ſT sx s"),
+            (r"(?i)é(?!x)", Some(true), "é É e éx"),
+            (r"(?i)σ\b", Some(true), "σ Σ ς s σa"),
+            (r"(?>ab|cd)(?!z)", Some(true), "ab cd ac abz a"),
+            (r"(?>a|cd)(?!z)", Some(false), "a cd ab c"),
+            (r"(?:ab|[xy])(?!z)", Some(false), "ab x y a"),
+            (r"(?i)k(?!x)", Some(false), "k K \u{212A} kx"),
+            (r"ab(?!c)", Some(false), "ab abc a"),
+        ];
+        for (pattern, checks_second, text) in cases {
+            for limit in [None, Some(0), Some(1), Some(2), Some(3), Some(5), Some(8)] {
+                let (Some(regex), Some(reference)) = build(pattern, false, limit) else {
+                    unreachable!("{pattern:?} compiles");
+                };
+                let seconds = start_filter(&regex).map(|filter| filter.seconds.is_some());
+                assert_eq!(seconds, checks_second, "{pattern:?}");
+                for start in 0..=text.len() {
+                    for end in start..=text.len() {
+                        let found = regex
+                            .find_input(RegexInput::new(text).range(start..end))
+                            .map(|m| m.map(|m| m.range()));
+                        let expected = reference
+                            .find_input(oracle::RegexInput::new(text).range(start..end))
+                            .map(|m| m.map(|m| m.range()));
+                        assert_eq!(
+                            alloc::format!("{found:?}"),
+                            alloc::format!("{expected:?}"),
+                            "{pattern:?} limit={limit:?} {text:?} {start}..{end}"
+                        );
+                    }
+                }
             }
         }
     }
