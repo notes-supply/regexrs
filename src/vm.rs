@@ -264,9 +264,9 @@ impl CaseiLiteral {
         CaseiLiteral { chars }
     }
 
-    /// The characters a match can begin with.
-    pub(crate) fn first_char(&self) -> Option<&[(char, char)]> {
-        self.chars.first().map(AsRef::as_ref)
+    /// The characters each literal position matches.
+    pub(crate) fn chars(&self) -> &[FoldRanges] {
+        &self.chars
     }
 
     /// If the literal matches at `ix`, returns the matched byte length (which
@@ -1069,9 +1069,11 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
     // Skipping is exact only where the VM would otherwise start an attempt at
     // every literal position: byte stepping, or whole-character stepping over
     // valid UTF-8, where each literal begins on a character boundary.
+    let text = haystack
+        .as_utf8()
+        .filter(|_| prog.bytes_mode != BytesMode::Ascii);
     let start_filter = prog.start_filter.as_ref().filter(|_| {
-        !input.is_anchored()
-            && (prog.bytes_mode == BytesMode::Ascii || haystack.as_utf8().is_some())
+        !input.is_anchored() && (prog.bytes_mode == BytesMode::Ascii || text.is_some())
     });
     #[cfg(feature = "std")]
     if option_flags & OPTION_TRACE != 0 {
@@ -1248,13 +1250,9 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                         let stop = candidate
                             .unwrap_or(usize::MAX)
                             .min(match_range.end.saturating_add(1));
-                        backtrack_count =
-                            backtrack_count.saturating_add(start_filter.skipped_cost(
-                                haystack.as_bytes(),
-                                ix,
-                                stop,
-                                prog.bytes_mode,
-                            ));
+                        backtrack_count = backtrack_count.saturating_add(
+                            start_filter.skipped_cost(haystack.as_bytes(), text, ix, stop),
+                        );
                         if backtrack_count > options.backtrack_limit {
                             return Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded));
                         }

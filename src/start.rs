@@ -4,24 +4,28 @@
 //!
 //! The unanchored preamble attempts a match at every position. When the
 //! program begins with a bounded tree of branches in which every path fails at
-//! a first-character test (a literal or class at the attempt position), an
-//! attempt at a position where none of those tests can succeed fails along
-//! every path: it performs a fixed number of failures, pushes only a bounded
-//! number of branches and cannot error. Such positions are skipped with a
-//! literal search, and each one is charged that number of backtracks, so
-//! matches and limit errors are those of the exhaustive scan.
+//! a first-character test (a literal, class or delegated sub-expression at the
+//! attempt position), an attempt at a position where none of those tests can
+//! succeed fails along every path: it performs a fixed number of failures,
+//! pushes only a bounded number of branches and cannot error. Such positions
+//! are skipped with a literal search, and each one is charged that number of
+//! backtracks, so matches and limit errors are those of the exhaustive scan.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use regex_automata::util::prefilter::Prefilter;
 use regex_automata::{MatchKind, Span};
+use regex_syntax::hir::Hir;
+use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
 use crate::BytesMode;
-use crate::vm::Insn;
+use crate::vm::{CharClassMatcher, Insn};
 
 /// Instructions examined before giving up, which also bounds the branches a
 /// skipped attempt can push.
 const BUDGET: usize = 64;
+
+/// Longest delegate literal prefix extracted; longer prefixes add little
+/// selectivity but grow case-insensitive cross products.
+const DELEGATE_LITERAL_LEN: usize = 4;
 
 /// Candidate positions for unanchored attempts and the cost of the others.
 #[derive(Debug)]
@@ -35,63 +39,131 @@ pub(crate) struct StartFilter {
 enum Candidates {
     /// memchr or memmem through regex-automata.
     Literal(Prefilter),
-    /// More first bytes than memchr handles, or no memchr support. For these
-    /// `Prefilter::new` would build Teddy at many times the construction
-    /// cost; this is regex-automata's own byte-set strategy, which it does not
-    /// expose.
-    Bytes(Box<[bool; 256]>),
+    /// More first bytes than memchr handles, or no memchr support, as a bit
+    /// set. This is regex-automata's own byte-set strategy, which it does not
+    /// expose; `Prefilter::new` would build Teddy at many times the cost.
+    Bytes(ByteSet),
+}
+
+/// A set of bytes, one bit each.
+#[derive(Clone, Copy, Debug, Default)]
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    fn insert(&mut self, byte: u8) {
+        self.0[usize::from(byte >> 6)] |= 1 << (byte & 63);
+    }
+
+    fn contains(&self, byte: u8) -> bool {
+        self.0[usize::from(byte >> 6)] & (1 << (byte & 63)) != 0
+    }
+
+    fn len(&self) -> u32 {
+        self.0.iter().map(|word| word.count_ones()).sum()
+    }
+}
+
+/// The literal every candidate must begin with, while all tests are exact
+/// literals.
+enum Common {
+    /// No literal test seen yet.
+    Unknown,
+    Prefix(alloc::vec::Vec<u8>),
+    /// A test without a literal prefix was seen.
+    None,
+}
+
+impl Common {
+    fn narrow(&mut self, literal: alloc::vec::Vec<u8>) {
+        match self {
+            Common::Unknown => *self = Common::Prefix(literal),
+            Common::Prefix(prefix) => {
+                let shared = prefix
+                    .iter()
+                    .zip(&literal)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                prefix.truncate(shared);
+            }
+            Common::None => {}
+        }
+    }
+}
+
+/// Append the bytes every match of a literal test begins with; `Some(true)`
+/// when they are the whole test, `None` for any other instruction.
+fn exact_prefix(insn: &Insn, needle: &mut alloc::vec::Vec<u8>) -> Option<bool> {
+    match insn {
+        Insn::Lit(literal) => {
+            needle.extend_from_slice(literal.as_bytes());
+            Some(true)
+        }
+        Insn::LitCasei(literal) => {
+            for folds in literal.chars() {
+                let &[(lo, hi)] = folds.as_ref() else {
+                    return Some(false);
+                };
+                if lo != hi {
+                    return Some(false);
+                }
+                needle.extend_from_slice(lo.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 impl StartFilter {
     /// Analyze the program whose first instruction after the unanchored
-    /// preamble is `start`. `None` when skipping cannot be shown to be exact,
-    /// or when too many first bytes remain possible for skipping to pay off.
-    pub(crate) fn new(body: &[Insn], start: usize) -> Option<Self> {
+    /// preamble is `start`. `delegates` holds the `Hir` each delegate engine
+    /// was built from, by instruction index. `None` when skipping cannot be
+    /// shown to be exact, or when too many first bytes remain possible for
+    /// skipping to pay off.
+    pub(crate) fn new(
+        body: &[Insn],
+        start: usize,
+        delegates: &[(usize, Hir)],
+        bytes_mode: BytesMode,
+    ) -> Option<Self> {
         let mut walk = Walk {
             budget: BUDGET,
-            first_bytes: [false; 256],
-            literals: Some(Vec::new()),
+            first_bytes: ByteSet::default(),
+            common: Common::Unknown,
+            delegates,
         };
-        let path = Path {
+        let start_path = Path {
             at_start: true,
-            start_slots: Vec::new(),
+            start_slots: 0,
         };
-        let cost = walk.failures(body, start, path)?;
-        let first_bytes: Vec<u8> = (0..=u8::MAX)
-            .filter(|&byte| walk.first_bytes[usize::from(byte)])
-            .collect();
-        if first_bytes.len() > 128 {
+        let cost = walk.failures(body, start, start_path)?;
+        let first_bytes = walk.first_bytes;
+        // Whole-character stepping never visits a continuation byte, and
+        // 0x80..=0xBF is exactly the third word of the set.
+        let continuation = first_bytes.0[2] != 0;
+        if first_bytes.len() > 128 || (continuation && bytes_mode != BytesMode::Ascii) {
             return None;
         }
-        let common = walk
-            .literals
-            .as_deref()
-            .and_then(|literals| literals.split_first())
-            .map(|(first, rest)| {
-                rest.iter().fold(first.as_slice(), |common, literal| {
-                    let shared = common
-                        .iter()
-                        .zip(literal)
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    &common[..shared]
-                })
-            })
-            .unwrap_or_default();
-        let literal = if common.len() >= 2 {
-            Prefilter::new(MatchKind::LeftmostFirst, &[common])
-        } else if !first_bytes.is_empty() && first_bytes.len() <= 3 {
-            Prefilter::new(
-                MatchKind::LeftmostFirst,
-                &first_bytes.chunks(1).collect::<Vec<_>>(),
-            )
-        } else {
-            None
+        let literal = match walk.common {
+            Common::Prefix(prefix) if prefix.len() >= 2 => {
+                Prefilter::new(MatchKind::LeftmostFirst, &[prefix])
+            }
+            _ if (1..=3).contains(&first_bytes.len()) => {
+                let mut needles = [[0u8; 1]; 3];
+                let mut count = 0;
+                for (word_index, &word) in first_bytes.0.iter().enumerate() {
+                    let mut bits = word;
+                    while bits != 0 {
+                        needles[count] = [(word_index * 64) as u8 + bits.trailing_zeros() as u8];
+                        count += 1;
+                        bits &= bits - 1;
+                    }
+                }
+                Prefilter::new(MatchKind::LeftmostFirst, &needles[..count])
+            }
+            _ => None,
         };
-        let candidates = literal.map_or_else(
-            || Candidates::Bytes(Box::new(walk.first_bytes)),
-            Candidates::Literal,
-        );
+        let candidates = literal.map_or(Candidates::Bytes(first_bytes), Candidates::Literal);
         Some(StartFilter { candidates, cost })
     }
 
@@ -103,58 +175,78 @@ impl StartFilter {
                 .map(|span| span.start),
             Candidates::Bytes(set) => haystack[start..]
                 .iter()
-                .position(|&byte| set[usize::from(byte)])
+                .position(|&byte| set.contains(byte))
                 .map(|offset| start + offset),
         }
     }
 
     /// Backtracks the exhaustive scan performs at the attempt positions in
-    /// `from..stop`, where `stop` may be one past the end of `haystack`.
-    /// Outside ASCII mode the scan steps whole characters of valid UTF-8.
+    /// `from..stop`, where `stop` may be one past the end of `haystack`. With
+    /// `text`, the scan steps whole characters of that valid UTF-8; without
+    /// it, single bytes.
     pub(crate) fn skipped_cost(
         &self,
         haystack: &[u8],
+        text: Option<&str>,
         from: usize,
         stop: usize,
-        bytes_mode: BytesMode,
     ) -> usize {
         let end = stop.min(haystack.len());
-        let positions = match bytes_mode {
-            BytesMode::Ascii => end - from,
-            BytesMode::Unicode | BytesMode::UnicodeBytes => haystack[from..end]
-                .iter()
-                .filter(|&&byte| (byte as i8) >= -0x40)
-                .count(),
+        let positions = match text {
+            None => end - from,
+            // A ranged search can end inside a character; count its
+            // boundaries directly then.
+            Some(text) => text.get(from..end).map_or_else(
+                || {
+                    haystack[from..end]
+                        .iter()
+                        .filter(|&&byte| (byte as i8) >= -0x40)
+                        .count()
+                },
+                |part| part.chars().count(),
+            ),
         } + usize::from(stop > haystack.len());
         positions.saturating_mul(self.cost)
     }
 }
 
-struct Walk {
+struct Walk<'a> {
     budget: usize,
-    first_bytes: [bool; 256],
-    /// Every leaf's literal while all leaves are exact literals.
-    literals: Option<Vec<Vec<u8>>>,
+    first_bytes: ByteSet,
+    common: Common,
+    delegates: &'a [(usize, Hir)],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Path {
     /// Whether the input position is still the attempt start.
     at_start: bool,
-    /// Save slots currently holding the attempt start.
-    start_slots: Vec<usize>,
+    /// Save slots below 64 currently holding the attempt start.
+    start_slots: u64,
 }
 
 impl Path {
     fn save(&mut self, slot: usize, at_start: bool) {
-        self.start_slots.retain(|&saved| saved != slot);
-        if at_start {
-            self.start_slots.push(slot);
+        if let Some(bit) = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| 1u64.checked_shl(slot))
+        {
+            self.start_slots &= !bit;
+            if at_start {
+                self.start_slots |= bit;
+            }
         }
+    }
+
+    fn holds_start(&self, slot: usize) -> bool {
+        u32::try_from(slot)
+            .ok()
+            .and_then(|slot| 1u64.checked_shl(slot))
+            .is_some_and(|bit| self.start_slots & bit != 0)
     }
 }
 
-impl Walk {
+impl Walk<'_> {
     /// Failures performed from `pc` at a non-candidate position, collecting
     /// the first-character tests that define the candidates. `None` when the
     /// count could depend on the text or the path could succeed.
@@ -175,48 +267,65 @@ impl Walk {
                 self.failures(body, pc + 1, path)
             }
             Insn::Restore(slot) => {
-                path.at_start = path.start_slots.contains(slot);
+                path.at_start = path.holds_start(*slot);
                 self.failures(body, pc + 1, path)
             }
             Insn::BeginAtomic => self.failures(body, pc + 1, path),
             Insn::Jmp(target) => self.failures(body, *target, path),
             Insn::Split(first, second) => {
-                let first = self.failures(body, *first, path.clone())?;
+                let first = self.failures(body, *first, path)?;
                 Some(first + self.failures(body, *second, path)?)
             }
             Insn::Fail => Some(1),
-            Insn::Lit(literal) if path.at_start => {
-                // Adjacent literals form one needle; a straight line of them
-                // fails once wherever the whole needle does not occur.
-                let mut needle = literal.as_bytes().to_vec();
-                let mut next = pc + 1;
-                while let Some(Insn::Lit(more)) = body.get(next) {
-                    needle.extend_from_slice(more.as_bytes());
+            Insn::Lit(_) | Insn::LitCasei(_) if path.at_start => {
+                // A straight line of literal tests fails once wherever its
+                // exact prefix (literal text, then case-insensitive
+                // characters without case variants) does not occur.
+                let mut needle = alloc::vec::Vec::new();
+                let mut next = pc;
+                while let Some(true) = body
+                    .get(next)
+                    .and_then(|insn| exact_prefix(insn, &mut needle))
+                {
                     next += 1;
                 }
-                self.first_bytes[usize::from(*needle.first()?)] = true;
-                if let Some(literals) = &mut self.literals {
-                    literals.push(needle);
+                match (needle.first(), insn) {
+                    (Some(&first), _) => {
+                        self.first_bytes.insert(first);
+                        self.common.narrow(needle);
+                    }
+                    // A case-insensitive literal starting with a cased
+                    // character: its folds fix the first bytes.
+                    (None, Insn::LitCasei(literal)) => self.insert_chars(literal.chars().first()?),
+                    (None, _) => return None,
                 }
                 Some(1)
             }
-            Insn::LitCasei(literal) if path.at_start => {
-                self.mark_chars(literal.first_char()?);
+            Insn::CharClass(CharClassMatcher::Codepoint { ranges, .. }) if path.at_start => {
+                self.insert_chars(ranges);
                 Some(1)
             }
-            Insn::CharClass(class) if path.at_start => {
-                match class {
-                    crate::vm::CharClassMatcher::Codepoint { ranges, .. } => {
-                        self.mark_chars(ranges);
+            Insn::CharClass(CharClassMatcher::Byte { ranges, .. }) if path.at_start => {
+                self.common = Common::None;
+                for &(lo, hi) in ranges.iter() {
+                    for byte in lo..=hi {
+                        self.first_bytes.insert(byte);
                     }
-                    crate::vm::CharClassMatcher::Byte { ranges, .. } => {
-                        self.literals = None;
-                        for &(lo, hi) in ranges.iter() {
-                            for byte in lo..=hi {
-                                self.first_bytes[usize::from(byte)] = true;
-                            }
-                        }
-                    }
+                }
+                Some(1)
+            }
+            Insn::Delegate(_) if path.at_start => {
+                // The engine is searched anchored here, so it fails unless
+                // the text starts with one of its prefixes. An empty prefix
+                // or an unbounded set rejects the filter.
+                let (_, hir) = self.delegates.iter().find(|(at, _)| *at == pc)?;
+                let prefixes = Extractor::new()
+                    .kind(ExtractKind::Prefix)
+                    .limit_literal_len(DELEGATE_LITERAL_LEN)
+                    .extract(hir);
+                for literal in prefixes.literals()? {
+                    self.first_bytes.insert(*literal.as_bytes().first()?);
+                    self.common.narrow(literal.as_bytes().to_vec());
                 }
                 Some(1)
             }
@@ -244,16 +353,16 @@ impl Walk {
     }
 
     /// Record the first UTF-8 bytes of the characters in `ranges`.
-    fn mark_chars(&mut self, ranges: &[(char, char)]) {
-        self.literals = None;
+    fn insert_chars(&mut self, ranges: &[(char, char)]) {
+        self.common = Common::None;
         let lead = |c: char| c.encode_utf8(&mut [0; 4]).as_bytes()[0];
         for &(lo, hi) in ranges {
             for byte in u32::from(lo)..=u32::from(hi).min(0x7F) {
-                self.first_bytes[byte as usize] = true;
+                self.first_bytes.insert(byte as u8);
             }
             if hi >= '\u{80}' {
                 for byte in lead(lo.max('\u{80}'))..=lead(hi) {
-                    self.first_bytes[usize::from(byte)] = true;
+                    self.first_bytes.insert(byte);
                 }
             }
         }
@@ -427,6 +536,17 @@ mod tests {
             r"(?=((a|aa)+)\2$)z",
             r"\b(?:a|b)(?!c)",
             r"(?<=a)(?:b|é)\1?",
+            r"(?:ab|cd)(?!x)",
+            r"(ab|é)\1",
+            r"(?i)(?:ka|sa)(?=a)",
+            r"(?i)(?>ß|σ)\b",
+            r"(?:\bab|k)(?!x)",
+            r"(?:|ab)(?!x)",
+            r"(?:a*)(?!x)b",
+            r"(?>event|incident) \d+:",
+            r"(?i)731(?!x)",
+            r"(?i)#1k(?=a)",
+            r"(?i)(?<=a)1-ſ\b",
         ];
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut patterns: Vec<String> = fixed.iter().map(|p| String::from(*p)).collect();
@@ -526,8 +646,11 @@ mod tests {
             (r"(?<=x)ab(?!c)", 1),
             (r"((a|ab)+)\1", 2),
             (r"(?:absent|missing)(\d+): key-\1", 2),
+            (r"(?:ab|cd)(?!x)", 1),
+            (r"(?>event|incident) \d+:", 1),
+            (r"(?i)#1k(?!x)", 1),
         ];
-        let text = "zz ab xab cd abab zz é#1 ab";
+        let text = "zz ab xab cd abab zz é#1 ab €x";
         for (pattern, cost) in patterns {
             assert_eq!(
                 start_filter(&Regex::new(pattern).unwrap()).map(|filter| filter.cost),
@@ -543,24 +666,50 @@ mod tests {
                     observe!(reference, text),
                     "{pattern:?} limit={limit}"
                 );
-                let ranged = |end| RegexInput::new(text).range(3..end);
-                for end in [9, text.len()] {
+                // Range ends at a boundary, inside a character and at the
+                // haystack end; the oracle has no start filter.
+                // Ending on the euro sign's first continuation byte leaves the
+                // next attempt position inside the character.
+                let mid_char = text.find('€').unwrap() + 1;
+                for end in [9, text.find('é').unwrap() + 1, mid_char, text.len()] {
+                    let ranged = regex
+                        .find_input(RegexInput::new(text).range(3..end))
+                        .map(|m| m.map(|m| m.range()));
+                    let expected = reference
+                        .find_input(oracle::RegexInput::new(text).range(3..end))
+                        .map(|m| m.map(|m| m.range()));
                     assert_eq!(
-                        alloc::format!(
-                            "{:?}",
-                            regex.find_input(ranged(end)).map(|m| m.map(|m| m.range()))
-                        ),
-                        alloc::format!(
-                            "{:?}",
-                            RegexBuilder::new(pattern)
-                                .backtrack_limit(limit)
-                                .build()
-                                .unwrap()
-                                .find_input(ranged(end))
-                                .map(|m| m.map(|m| m.range()))
-                        ),
+                        alloc::format!("{ranged:?}"),
+                        alloc::format!("{expected:?}"),
+                        "{pattern:?} limit={limit} end={end}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn caseless_needles_keep_every_case_variant() {
+        // Only characters whose fold class is themselves join a needle; a
+        // contiguous fold range (DŽ, Dž, dž) or a wider partner (KELVIN SIGN
+        // for k) must stay a set of first bytes.
+        let cases = [
+            (r"(?i)1ǅ(?!x)", ["1ǆa", "1Ǆa", "1ǅa", "1dža"]),
+            (r"(?i)#k(?!b)", ["#ka", "#Ka", "#\u{212A}a", "#kb"]),
+            (r"(?i)7ſ1\b", ["7s1", "7S1", "7ſ1", "7ſ1x"]),
+        ];
+        for (pattern, texts) in cases {
+            let (Some(regex), Some(reference)) = build(pattern, false, None) else {
+                unreachable!("{pattern:?} compiles");
+            };
+            assert!(start_filter(&regex).is_some(), "{pattern:?}");
+            for text in texts {
+                let padded = alloc::format!("zz {text} {text}");
+                assert_eq!(
+                    observe!(regex, padded.as_str()),
+                    observe!(reference, padded.as_str()),
+                    "{pattern:?} {padded:?}"
+                );
             }
         }
     }
