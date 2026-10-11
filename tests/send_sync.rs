@@ -1,4 +1,4 @@
-use regexrs::{Captures, Matches, Regex, RegexSet, RegexSetMatch};
+use regexrs::{CaptureLocations, Captures, Matches, Regex, RegexSet, RegexSetMatch, Searcher};
 
 #[cfg(feature = "std")]
 use std::sync::Arc;
@@ -20,6 +20,13 @@ fn test_regex_is_sync() {
 #[test]
 fn test_matches_is_send() {
     assert_send::<Matches<'static, 'static, str>>();
+}
+
+#[test]
+fn test_searcher_and_capture_locations_are_send() {
+    assert_send::<Searcher<'static>>();
+    assert_send::<CaptureLocations>();
+    assert_sync::<CaptureLocations>();
 }
 
 #[test]

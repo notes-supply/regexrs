@@ -1043,6 +1043,26 @@ pub(crate) fn run_cached<S: HaystackInput + ?Sized>(
     })
 }
 
+/// Run the program, copying the first `slots` save slots of a match into `dst`
+/// and returning whether there was one. `dst` is left empty on a miss or error,
+/// so stale spans from an earlier search are never reported.
+pub(crate) fn run_into<S: HaystackInput + ?Sized>(
+    prog: &Prog,
+    input: &RegexInput<'_, S>,
+    option_flags: u32,
+    options: &HardRegexRuntimeOptions,
+    scratch: Option<&mut Scratch>,
+    (slots, dst): (usize, &mut Vec<usize>),
+) -> Result<bool> {
+    dst.clear();
+    let copy = |state: &State| dst.extend_from_slice(&state.saves[..slots.min(state.saves.len())]);
+    let found = match scratch {
+        Some(scratch) => run_in_scratch(prog, input, option_flags, options, scratch, copy),
+        None => run_with(prog, input, option_flags, options, copy),
+    }?;
+    Ok(found.is_some())
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn run_in_scratch<S: HaystackInput + ?Sized, T>(
     prog: &Prog,

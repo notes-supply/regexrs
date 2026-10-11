@@ -208,12 +208,24 @@ pub struct Match<'t> {
 #[derive(Debug)]
 pub struct Matches<'r, 't, S: input::Input + ?Sized> {
     re: &'r Regex,
-    input: RegexInput<'t, S>,
-    last_match: Option<usize>,
-    last_skipped_empty: bool,
+    state: IterState<'t, S>,
+    /// A [`Searcher`]'s exclusive scratch, when iterating through one.
+    cache: Option<&'r mut searcher::Cache>,
 }
 
 impl<'r, 't, S: input::Input + ?Sized> Matches<'r, 't, S> {
+    fn new(
+        re: &'r Regex,
+        input: RegexInput<'t, S>,
+        cache: Option<&'r mut searcher::Cache>,
+    ) -> Self {
+        Matches {
+            re,
+            state: IterState::new(input),
+            cache,
+        }
+    }
+
     /// Return the underlying regex.
     pub fn regex(&self) -> &'r Regex {
         self.re
@@ -221,20 +233,39 @@ impl<'r, 't, S: input::Input + ?Sized> Matches<'r, 't, S> {
 
     /// Return the text being searched.
     pub fn text(&self) -> &'t S {
-        self.input.haystack()
+        self.state.input.haystack()
     }
 
     /// Return the current search input configuration.
     pub fn input(&self) -> &RegexInput<'t, S> {
-        &self.input
+        &self.state.input
+    }
+}
+
+/// The position and empty-match bookkeeping shared by every match iterator.
+#[derive(Debug)]
+struct IterState<'t, S: input::Input + ?Sized> {
+    input: RegexInput<'t, S>,
+    last_match: Option<usize>,
+    last_skipped_empty: bool,
+}
+
+impl<'t, S: input::Input + ?Sized> IterState<'t, S> {
+    fn new(input: RegexInput<'t, S>) -> Self {
+        IterState {
+            input,
+            last_match: None,
+            last_skipped_empty: false,
+        }
     }
 
-    /// Adapted from the `regex` crate. Calls `find_from_pos`/`captures_from_pos` repeatedly.
-    /// Ignores empty matches immediately after a match.
-    /// Also passes a flag when skipping an empty match, so that \G wouldn't match at the new start position.
-    fn next_with<F, R>(&mut self, mut search: F) -> Option<Result<R>>
+    /// Adapted from the `regex` crate. Calls `search` repeatedly, ignoring empty
+    /// matches immediately after a match. Also passes a flag when skipping an
+    /// empty match, so that \G wouldn't match at the new start position.
+    /// After an error, the iterator is exhausted.
+    fn next_with<F, R, E>(&mut self, mut search: F) -> Option<core::result::Result<R, E>>
     where
-        F: FnMut(&Regex, &RegexInput<'t, S>, u32) -> Result<Option<(R, (usize, usize))>>,
+        F: FnMut(&RegexInput<'t, S>, u32) -> core::result::Result<Option<(R, (usize, usize))>, E>,
     {
         if self.input.is_done() {
             return None;
@@ -247,7 +278,7 @@ impl<'r, 't, S: input::Input + ?Sized> Matches<'r, 't, S> {
         };
 
         let pos = self.input.effective_start();
-        let (result, (match_start, match_end)) = match search(self.re, &self.input, option_flags) {
+        let (result, (match_start, match_end)) = match search(&self.input, option_flags) {
             Err(error) => {
                 // Stop on first error: If an error is encountered, return it, and set the "last match position"
                 // to the string length, so that the next next() call will return None, to prevent an infinite loop.
@@ -289,9 +320,10 @@ impl<'r, 't, S: input::Input + ?Sized> Iterator for Matches<'r, 't, S> {
     type Item = Result<S::Match<'t>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let text = self.input.haystack();
-        self.next_with(move |re, input, flags| {
-            re.find_input_raw(input, flags)
+        let Matches { re, state, cache } = self;
+        let text = state.input.haystack();
+        state.next_with(|input, flags| {
+            re.find_input_raw_cached(input, flags, cache.as_deref_mut())
                 .map(|opt| opt.map(|(s, e)| (text.make_match(s, e), (s, e))))
         })
     }
@@ -310,7 +342,7 @@ pub struct CaptureMatches<'r, 't, S: input::Input + ?Sized>(Matches<'r, 't, S>);
 impl<'r, 't, S: input::Input + ?Sized> CaptureMatches<'r, 't, S> {
     /// Return the text being searched.
     pub fn text(&self) -> &'t S {
-        self.0.input.haystack()
+        self.0.text()
     }
 
     /// Return the underlying regex.
@@ -323,8 +355,9 @@ impl<'r, 't, S: input::Input + ?Sized> Iterator for CaptureMatches<'r, 't, S> {
     type Item = Result<Captures<'t, S>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next_with(move |re, input, flags| {
-            let captures = re.captures_input_with_option_flags(input, flags)?;
+        let Matches { re, state, cache } = &mut self.0;
+        state.next_with(|input, flags| {
+            let captures = re.captures_input_cached(input, flags, cache.as_deref_mut())?;
             Ok(captures.map(|c| {
                 let (start, end) = c
                     .inner
@@ -347,7 +380,7 @@ pub struct Captures<'t, S: input::Input + ?Sized = str> {
     input: &'t S,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum CapturesImpl {
     Wrap {
         locations: RaCaptures,
@@ -401,6 +434,53 @@ impl CapturesImpl {
 pub struct SubCaptureMatches<'c, 't, S: input::Input + ?Sized> {
     data: &'c Captures<'t, S>,
     i: usize,
+}
+
+/// Caller-owned storage for the capture spans of one search, filled by
+/// [`Searcher::captures_read`] without allocating a [`Captures`] snapshot.
+///
+/// Create it with [`Regex::capture_locations`]. A search overwrites the
+/// previous contents: after a match every group's span is available, and after
+/// a miss or an error every group reads as `None`. Spans are byte offsets into
+/// the haystack of the most recent search; the locations do not borrow it.
+#[derive(Clone, Debug)]
+pub struct CaptureLocations {
+    slots: CapturesImpl,
+    groups: usize,
+    /// Shared with the creating regex and its clones; identifies compatible slots.
+    named_groups: Arc<NamedGroups>,
+}
+
+#[allow(clippy::len_without_is_empty)] // follow regex's API; there is always group 0
+impl CaptureLocations {
+    /// The start and end byte offsets of group `i` in the last search, or
+    /// `None` if that search did not match, the group did not participate or
+    /// `i` is not a group. Group 0 is the overall match.
+    pub fn get(&self, i: usize) -> Option<(usize, usize)> {
+        if i < self.groups {
+            self.slots.get_span(i)
+        } else {
+            None
+        }
+    }
+
+    /// The span of the group named `name`; see [`CaptureLocations::get`].
+    pub fn name(&self, name: &str) -> Option<(usize, usize)> {
+        self.named_groups.get(name).and_then(|&i| self.get(i))
+    }
+
+    /// The number of groups, including group 0, whether or not the last search
+    /// matched.
+    pub fn len(&self) -> usize {
+        self.groups
+    }
+
+    fn clear(&mut self) {
+        match &mut self.slots {
+            CapturesImpl::Wrap { locations, .. } => locations.set_pattern(None),
+            CapturesImpl::Fancy { saves } => saves.clear(),
+        }
+    }
 }
 
 /// An iterator over all substrings delimited by a regex.
@@ -1458,12 +1538,7 @@ impl Regex {
         &'r self,
         input: RegexInput<'t, S>,
     ) -> Matches<'r, 't, S> {
-        Matches {
-            re: self,
-            input,
-            last_match: None,
-            last_skipped_empty: false,
-        }
+        Matches::new(self, input, None)
     }
 
     /// Find the first match in the input.
@@ -1840,6 +1915,88 @@ impl Regex {
                 ..
             } => inner.captures_len() - if *explicit_capture_group_0 { 1 } else { 0 },
             RegexImpl::Fancy { n_groups, .. } => *n_groups,
+        }
+    }
+
+    /// Create empty caller-owned capture storage for this regex, to be filled
+    /// by [`Searcher::captures_read`].
+    pub fn capture_locations(&self) -> CaptureLocations {
+        let slots = match &self.inner {
+            RegexImpl::Wrap {
+                inner,
+                explicit_capture_group_0,
+                ..
+            } => CapturesImpl::Wrap {
+                locations: inner.create_captures(),
+                explicit_capture_group_0: *explicit_capture_group_0,
+            },
+            RegexImpl::Fancy { n_groups, .. } => CapturesImpl::Fancy {
+                saves: Vec::with_capacity(n_groups * 2),
+            },
+        };
+        CaptureLocations {
+            slots,
+            groups: self.captures_len(),
+            named_groups: Arc::clone(&self.named_groups),
+        }
+    }
+
+    /// Fill `locations` from one search, returning whether it matched. Storage
+    /// from another regex is replaced first; misses and errors clear it.
+    pub(crate) fn captures_read_cached<S: input::Input + ?Sized>(
+        &self,
+        input: &RegexInput<'_, S>,
+        locations: &mut CaptureLocations,
+        cache: Option<&mut searcher::Cache>,
+    ) -> Result<bool> {
+        if !Arc::ptr_eq(&locations.named_groups, &self.named_groups) {
+            *locations = self.capture_locations();
+        }
+        if input.is_done() {
+            locations.clear();
+            return Ok(false);
+        }
+        match (&self.inner, &mut locations.slots) {
+            (RegexImpl::Wrap { inner, .. }, CapturesImpl::Wrap { locations, .. }) => {
+                let mut delegated_input = ra_input(input);
+                if input.is_anchored() {
+                    delegated_input = delegated_input.anchored(RaAnchored::Yes);
+                }
+                match cache.and_then(searcher::Cache::regular) {
+                    Some((cache, _)) => {
+                        inner.search_captures_with(cache, &delegated_input, locations)
+                    }
+                    None => inner.search_captures(&delegated_input, locations),
+                }
+                Ok(locations.is_match())
+            }
+            (
+                RegexImpl::Fancy {
+                    prog,
+                    n_groups,
+                    options,
+                    ..
+                },
+                CapturesImpl::Fancy { saves },
+            ) => {
+                let option_flags = if options.find_not_empty {
+                    OPTION_FIND_NOT_EMPTY
+                } else {
+                    0
+                };
+                let scratch = cache.and_then(searcher::Cache::rich);
+                vm::run_into(
+                    prog,
+                    input,
+                    option_flags,
+                    options,
+                    scratch,
+                    (n_groups * 2, saves),
+                )
+            }
+            // Clones of one regex share its named groups, so their storage
+            // always has the matching representation.
+            _ => unreachable!("capture locations belong to this regex"),
         }
     }
 
