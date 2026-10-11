@@ -4,6 +4,14 @@ bounded backtracker is disabled), against `Regex` on the same patterns and
 the regex crate. `\b` runs on the backtracking VM in `Regex` but on automata
 in `RegularRegex`; the log regex shows the cost of forgoing bounded
 backtracking for captures.
+
+The families below cover dense class runs, quoted fields, literal sets and
+alternation, Unicode text, finite repeats, anchors, greedy and lazy runs,
+regular constructs that look rich, and captured records. regexrs-searcher
+times retained captures and per-line booleans. As in the planning suite,
+`compile`, `fresh-MODEL`, `startup-MODEL` and the plain model keep
+construction, first search, both together and warmed matching apart, on a
+tiny store of one line, a small store of a hundred lines and whole haystacks.
 '''
 
 [[bench]]
@@ -49,4 +57,340 @@ regex = { path = "rebar/wild/unstructured-to-json.txt" }
 unicode = true
 haystack = '''2022/06/17 06:25:22 I4: [17936:140245395805952:(17998)]: (8fb074fc-c766-498b-b224-8b660126b2c0): Searching for query 'dummy query' {/src/master/mastersearchattrs.cc:MasterSearchAttributes():40}'''
 count = 1
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Dense class runs, including three-byte characters.
+[[bench]]
+model = "count-spans"
+name = "class-run-spans"
+regex = '[a-z]+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 432965
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count-spans"
+name = "class-run-cyrillic"
+regex = '\p{Cyrillic}+'
+unicode = true
+haystack = { path = "rebar/opensubtitles/ru-sampled.txt" }
+count = 1356606
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count-spans"
+name = "class-run-han"
+regex = '\p{Han}+'
+unicode = true
+haystack = { path = "rebar/opensubtitles/zh-sampled.txt" }
+count = 674844
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Quoted fields: owned and retained captures, and per-line booleans.
+[[bench]]
+model = "count-captures"
+name = "quoted-captures"
+regex = '"([^"]*)"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 5114
+engines = ["regexrs", "regexrs-searcher", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "grep"
+name = "quoted-lines"
+regex = '"[^"]*"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 1326
+engines = ["regexrs", "regexrs-searcher", "regexrs-regular", "regex"]
+
+# Ambiguous literal sets and alternation, which keep their engines.
+[[bench]]
+model = "count"
+name = "names-casei"
+regex = '(?i)holmes|watson|lestrade'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 586
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "names-bounded"
+regex = '\b(?:Holmes|Watson)\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 542
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Unicode text: word boundaries outside ASCII and case folding.
+[[bench]]
+model = "count"
+name = "bounded-words-cyrillic"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/opensubtitles/ru-sampled.txt" }
+count = 145465
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "casei-cyrillic"
+regex = '(?i)что'
+unicode = true
+haystack = { path = "rebar/opensubtitles/ru-sampled.txt" }
+count = 3974
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Finite repeats.
+[[bench]]
+model = "count"
+name = "log-dates"
+regex = '\d{4}/\d{2}/\d{2}'
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 100
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "log-uuids"
+regex = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 100
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Anchors: whole lines as short records, and multi-line mode.
+[[bench]]
+model = "grep"
+name = "line-words"
+regex = '^\w+$'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 3
+engines = ["regexrs", "regexrs-searcher", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "multiline-words"
+regex = '(?m)^\w+\r?$'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 3
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "line-capitals"
+regex = '(?m)^[A-Z]\w*'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 978
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Greedy and lazy runs.
+[[bench]]
+model = "count"
+name = "lazy-chars"
+regex = '\w+?'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 447654
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "lazy-quoted"
+regex = '"[^"]*?"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 2557
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Regular constructs that look rich: word boundaries around runs and folded literals.
+[[bench]]
+model = "count"
+name = "capital-words"
+regex = '\b[A-Z][a-z]+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 9347
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "the-casei"
+regex = '(?i)\bthe\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 5810
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+# Captured records.
+[[bench]]
+model = "count-captures"
+name = "log-times"
+regex = '(\d{2}):(\d{2}):(\d{2})'
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 400
+engines = ["regexrs", "regexrs-searcher", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "grep-captures"
+name = "log-records"
+regex = '^(\d{4}/\d{2}/\d{2}) (\d{2}:\d{2}:\d{2}) (\w+):'
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 400
+engines = ["regexrs", "regexrs-searcher", "regexrs-regular", "regex"]
+
+# Construction, first search, construction plus first search, and warmed
+# matching, on a tiny store (one line), a small store (a hundred lines) and
+# the whole haystack.
+[[bench]]
+model = "compile"
+name = "words-compile"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count"
+name = "words-startup-tiny"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1205, line-end = 1206 }
+count = 12
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "fresh-count"
+name = "words-fresh-small"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count"
+name = "words-startup-small"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "fresh-count"
+name = "words-fresh-full"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 109214
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "words-warm"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 109214
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "compile"
+name = "bounded-words-compile"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count"
+name = "bounded-words-startup-tiny"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1205, line-end = 1206 }
+count = 12
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "fresh-count"
+name = "bounded-words-fresh-small"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count"
+name = "bounded-words-startup-small"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 873
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "compile"
+name = "quoted-captures-compile"
+regex = '"([^"]*)"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 15
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count-captures"
+name = "quoted-captures-startup-small"
+regex = '"([^"]*)"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 30
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "fresh-count-captures"
+name = "quoted-captures-fresh-full"
+regex = '"([^"]*)"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 5114
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "compile"
+name = "fn-names-compile"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 100 }
+count = 4
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "startup-count-captures"
+name = "fn-names-startup-small"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 100 }
+count = 8
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "fresh-count-captures"
+name = "fn-names-fresh-full"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 24164
 engines = ["regexrs", "regexrs-regular", "regex"]

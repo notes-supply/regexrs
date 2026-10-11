@@ -90,7 +90,7 @@ echo "$out/results.csv"
 """
 
 [tasks."bench:rebar:revision"]
-description = "Build this runner against another regexrs source, or verify such a build: build SOURCE LABEL | verify LABEL"
+description = "Build this runner against another regexrs source, or verify such a build: build SOURCE LABEL | verify LABEL [FILTER]"
 depends = ["bench:rebar:build"]
 dir = "{{config_root}}/benchmarks"
 run = "bash revision.sh"

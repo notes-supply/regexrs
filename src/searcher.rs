@@ -3,12 +3,14 @@
 use crate::regular_route::Automata;
 use crate::{
     CaptureLocations, CaptureMatches, Captures, Input, Matches, Regex, RegexImpl, RegexInput,
-    Result, vm,
+    Result, WrapEngine, vm,
 };
 use alloc::boxed::Box;
 use regex_automata::{hybrid, meta, util::captures::Captures as RaCaptures};
 
 pub(crate) enum Cache {
+    /// A linear plan searches without working memory.
+    Plan,
     Regular {
         cache: Box<meta::Cache>,
         captures: RaCaptures,
@@ -31,6 +33,7 @@ pub(crate) struct RouteCache {
 impl core::fmt::Debug for Cache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
+            Self::Plan => "Cache::Plan",
             Self::Regular { .. } => "Cache::Regular",
             Self::Rich { .. } => "Cache::Rich",
         })
@@ -41,7 +44,7 @@ impl Cache {
     pub(crate) fn regular(&mut self) -> Option<(&mut meta::Cache, &mut RaCaptures)> {
         match self {
             Self::Regular { cache, captures } => Some((cache.as_mut(), captures)),
-            Self::Rich { .. } => None,
+            Self::Plan | Self::Rich { .. } => None,
         }
     }
 
@@ -50,7 +53,7 @@ impl Cache {
     pub(crate) fn route(&mut self, automata: &Automata) -> Option<&mut hybrid::regex::Cache> {
         match self {
             Self::Rich { route, .. } => Some(Self::route_cache(route, automata).dfa.as_mut()),
-            Self::Regular { .. } => None,
+            Self::Plan | Self::Regular { .. } => None,
         }
     }
 
@@ -82,7 +85,7 @@ impl Cache {
     pub(crate) fn rich(&mut self) -> Option<&mut vm::Scratch> {
         match self {
             Self::Rich { scratch, .. } => Some(scratch),
-            Self::Regular { .. } => None,
+            Self::Plan | Self::Regular { .. } => None,
         }
     }
 }
@@ -135,10 +138,17 @@ impl core::fmt::Debug for Searcher<'_> {
 impl<'r> Searcher<'r> {
     pub(crate) fn new(regex: &'r Regex) -> Self {
         let cache = match &regex.inner {
-            RegexImpl::Wrap { inner, .. } => Cache::Regular {
+            RegexImpl::Wrap {
+                engine: WrapEngine::Meta(inner),
+                ..
+            } => Cache::Regular {
                 cache: Box::new(inner.create_cache()),
                 captures: inner.create_captures(),
             },
+            RegexImpl::Wrap {
+                engine: WrapEngine::Plan(_),
+                ..
+            } => Cache::Plan,
             RegexImpl::Fancy { .. } => Cache::Rich {
                 scratch: vm::new_scratch(),
                 route: None,
@@ -166,7 +176,14 @@ impl<'r> Searcher<'r> {
     /// Test a ranged or anchored search input with the original matching rules.
     pub fn is_match_input<S: Input + ?Sized>(&mut self, input: RegexInput<'_, S>) -> Result<bool> {
         match &self.regex.inner {
-            RegexImpl::Wrap { inner, .. } => {
+            RegexImpl::Wrap {
+                engine: WrapEngine::Plan(_),
+                ..
+            } => self.regex.is_match_input(input),
+            RegexImpl::Wrap {
+                engine: WrapEngine::Meta(inner),
+                ..
+            } => {
                 if input.is_done() {
                     return Ok(false);
                 }

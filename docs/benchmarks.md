@@ -119,7 +119,17 @@ All rows use Unicode mode.
   words before `!`, Rust raw strings and method calls.
   A whole-text search for the miss `\b(\w+) \1 \1\b` exceeds the default
   backtrack limit in regexrs and fancy-regex alike, so that row is per line.
-- `regular.toml`: `RegularRegex` against `Regex` and the regex crate.
+- `regular.toml`: `RegularRegex` against `Regex` and the regex crate, with
+  regexrs-searcher for retained captures and per-line booleans. Families cover:
+  - dense class runs (ASCII, Cyrillic and Han)
+  - quoted fields, literal sets and alternation
+  - Unicode word boundaries and case folding
+  - finite repeats (log dates and UUIDs), anchors and multi-line lines
+  - greedy and lazy runs, word-bounded runs and folded literals
+  - captured log records
+
+  Each family also has `compile`, `fresh-MODEL`, `startup-MODEL` and warmed rows
+  on a one-line store, a hundred-line store and whole haystacks.
 - `scratch.toml`: `Searcher` and `CaptureLocations` against plain calls.
 - `edge.toml`: small checked-in fixtures for empty matches at UTF-8
   boundaries, unmatched versus empty groups, and case folds of different
@@ -136,8 +146,8 @@ All rows use Unicode mode.
   controls, where fancy delegates the whole pattern and seek does nothing.
   regexrs-regular, regex and resharp only appear where their semantics match.
 
-The suite has 76 definitions and 351 engine rows; the 219 `planning/` rows can
-be selected or excluded with Rebar's `-f`/`-F '^planning/'`.
+The suite has 112 definitions and 464 engine rows. The 219 `planning/` rows
+and the 128 `regular/` rows can be selected or excluded with Rebar's `-f`/`-F`.
 
 ### Comparing revisions
 
@@ -151,6 +161,7 @@ mise run bench:rebar:revision build /tmp/base 9ebb13d
 mise run bench:rebar:revision build "$PWD" candidate
 mise run bench:rebar:revision verify 9ebb13d
 mise run bench:rebar:revision verify candidate
+mise run bench:rebar:revision verify candidate '^regular/'   # any row filter
 cd benchmarks
 taskset -c 2 target/release/rebar measure -d target/planning/9ebb13d/suite \
   -f '^planning/' > base.csv
@@ -167,7 +178,7 @@ Alternate the revision order across repeated runs.
 
 - From the pinned Rebar checkout, not redistributed here:
   - `sherlock.txt`, *The Adventures of Sherlock Holmes* from Project Gutenberg, public domain.
-  - `opensubtitles/ru-sampled.txt`, a sample of the OPUS OpenSubtitles 2018 corpus.
+  - `opensubtitles/ru-sampled.txt` and `opensubtitles/zh-sampled.txt`, samples of the OPUS OpenSubtitles 2018 corpus.
   - `rust-src-tools-3b0d4813.txt`, Rust project source, MIT/Apache-2.0.
   - `wild/unstructured-to-json.log` and its regex, from a public regex discussion; see Rebar's `curated/11-unstructured-to-json.toml`.
 - Checked in: `haystacks/synthetic/` holds three small hand-written fixtures.

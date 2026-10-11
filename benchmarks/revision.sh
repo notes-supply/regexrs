@@ -4,8 +4,10 @@
 #
 #   revision.sh build SOURCE LABEL   build this checkout's runner against the
 #                                    regexrs source tree SOURCE
-#   revision.sh verify LABEL         verify LABEL's planning rows, then check
-#                                    their counts
+#   revision.sh verify LABEL [FILTER]
+#                                    verify LABEL's rows matching FILTER
+#                                    (default ^planning/), then check their
+#                                    counts
 #
 # SOURCE can come from `git archive REV | tar -x -C DIR`. A build leaves the
 # runner binary and a Rebar suite directory for it in target/planning/LABEL,
@@ -39,16 +41,17 @@ build)
 verify)
     suite=target/planning/$2/suite
     runner=target/planning/$2/regexrs-rebar-runner
+    filter=${3:-^planning/}
     rows=0
     while IFS=, read -r name _model engine _version; do
         "$rebar" klv -d "$suite" "$name" | "$runner" "$engine" --verify
         rows=$((rows + 1))
-    done < <("$rebar" measure -d "$suite" --list -f '^planning/')
+    done < <("$rebar" measure -d "$suite" --list -f "$filter")
     printf 'Verified spans and captures for %s rows.\n' "$rows"
-    "$rebar" measure -d "$suite" -f '^planning/' -t
+    "$rebar" measure -d "$suite" -f "$filter" -t
     ;;
 *)
-    echo "usage: revision.sh build SOURCE LABEL | revision.sh verify LABEL" >&2
+    echo "usage: revision.sh build SOURCE LABEL | revision.sh verify LABEL [FILTER]" >&2
     exit 2
     ;;
 esac

@@ -10,14 +10,13 @@ use core::convert::Infallible;
 use core::fmt;
 use core::str::FromStr;
 
-use regex_automata::meta::Regex as RaRegex;
-
 use crate::compile::{CompileOptions, DelegateUsage, compile_inner, compile_inner_from_hir};
 use crate::parse::NamedGroups;
 use crate::{
     Assertion, BytesMode, CaptureNames, Captures, CapturesImpl, CompileError, Error, Expr, Input,
-    IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, capture_names_of,
-    ra_input, replacen_with, to_hir,
+    IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, WrapEngine,
+    capture_names_of, plan_captures_into, plan_find, plan_is_match, ra_input, replacen_with,
+    to_hir,
 };
 
 /// A compiled expression from the regular subset of the syntax, searched
@@ -84,7 +83,8 @@ use crate::{
 /// ```
 #[derive(Clone)]
 pub struct RegularRegex {
-    inner: RaRegex,
+    /// The meta engine, or a linear plan, which never backtracks either.
+    engine: WrapEngine,
     pattern: String,
     /// The pattern in regex-automata syntax with word boundaries removed. A
     /// `RegexSet` member converted from this expression uses it to find
@@ -140,8 +140,9 @@ impl RegularRegex {
         let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
         let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
         let usage = DelegateUsage::regular_only();
-        let inner = match to_hir::expr_to_hir(&tree.expr, &mut hir_ctx) {
-            Some(hir) => compile_inner_from_hir(&hir, &compile_options, usage)?,
+        let hir = to_hir::expr_to_hir(&tree.expr, &mut hir_ctx);
+        let engine = WrapEngine::new(hir.as_ref(), &compile_options, usage, || match &hir {
+            Some(hir) => compile_inner_from_hir(hir, &compile_options, usage),
             // Translation only fails for input the engine rejects, whose own
             // error is the useful one. Word boundaries have no faithful string
             // form, so they never take this path.
@@ -153,11 +154,11 @@ impl RegularRegex {
                     )
                     .into());
                 }
-                inner
+                Ok(inner)
             }
-        };
+        })?;
         Ok(RegularRegex {
-            inner,
+            engine,
             pattern,
             set_pattern,
             named_groups: Arc::new(tree.named_groups),
@@ -176,7 +177,11 @@ impl RegularRegex {
 
     /// Whether the expression matches within a ranged or anchored input.
     pub fn is_match_input<S: Input + ?Sized>(&self, input: RegexInput<'_, S>) -> bool {
-        !input.is_done() && self.inner.is_match(ra_input(&input))
+        !input.is_done()
+            && match &self.engine {
+                WrapEngine::Plan(plan) => plan_is_match(plan, &input),
+                WrapEngine::Meta(inner) => inner.is_match(ra_input(&input)),
+            }
     }
 
     /// The leftmost-first match in `haystack`.
@@ -227,9 +232,11 @@ impl RegularRegex {
         if input.is_done() {
             return None;
         }
-        let mut locations = self.inner.create_captures();
-        self.inner
-            .search_captures(&ra_input(&input), &mut locations);
+        let mut locations = self.engine.create_captures();
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_captures_into(plan, &input, &mut locations),
+            WrapEngine::Meta(inner) => inner.search_captures(&ra_input(&input), &mut locations),
+        }
         locations.is_match().then(|| Captures {
             inner: CapturesImpl::Wrap {
                 locations,
@@ -258,7 +265,7 @@ impl RegularRegex {
 
     /// The number of capture groups, including the implicit group 0.
     pub fn captures_len(&self) -> usize {
-        self.inner.captures_len()
+        self.engine.captures_len()
     }
 
     /// The names of the capture groups, in group order; `None` for unnamed
@@ -298,9 +305,12 @@ impl RegularRegex {
         if input.is_done() {
             return None;
         }
-        self.inner
-            .search(&ra_input(input))
-            .map(|found| (found.start(), found.end()))
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_find(plan, input, None),
+            WrapEngine::Meta(inner) => inner
+                .search(&ra_input(input))
+                .map(|found| (found.start(), found.end())),
+        }
     }
 }
 
@@ -349,7 +359,7 @@ impl From<RegularRegex> for Regex {
     fn from(regex: RegularRegex) -> Regex {
         Regex {
             inner: RegexImpl::Wrap {
-                inner: regex.inner,
+                engine: regex.engine,
                 pattern: regex.pattern,
                 explicit_capture_group_0: false,
                 delegated_pattern: regex.set_pattern,

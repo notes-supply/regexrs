@@ -33,6 +33,26 @@ not inherently faster than `regex-automata`, and enabling Fancy's existing seek
 option changes many apparent gaps. Compare configured engines, hit-heavy and
 miss-heavy inputs, and compilation cost separately.
 
+Regular patterns whose matches follow one deterministic path are searched by
+a linear plan instead of an automaton. These are sequences of literals and
+single-character runs with captures, where no run of variable length is
+followed by a character it could also take. Assertions may stand only at the
+ends, and assertions after a run must fail wherever the run could stop early.
+Examples are `\w+`, `"[^"]*"`, `\bfn\s+(\w+)`, `\b\w+\b`, `^\d+$` and
+`[0-9a-f]{8}-[0-9a-f]{4}`.
+
+The plan finds candidates with memmem, a literal at a fixed offset, a
+`regex-automata` prefilter, memchr or a word-at-a-time byte-range test. It then
+matches each run maximally (or minimally for a lazy run nothing can fail after)
+and skips past runs that cannot match, so work stays linear. Captures, ranges,
+anchoring, `Searcher` and `CaptureLocations` give the meta engine's results with
+no reverse search, cache or pool.
+
+`Regex` and `RegularRegex` then keep no meta engine for the pattern. The engine
+is still built once and dropped under explicit size limits, or for a pattern
+large enough that the default limits might reject it, so compile errors are
+unchanged.
+
 Patterns whose only construct beyond the regular subset is a word boundary
 (`\b`, `\B`, `\<`, `\>` and the `\b{...}` forms) are compiled for the portable
 VM and also as `regex-automata` lazy DFAs. The DFAs answer a search when they
@@ -49,6 +69,10 @@ unbounded repetition the VM runs over an expression that can match empty, such
 as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
 do, and automata can report other captures or spans. The automata are built on
 the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
+A word-boundary pattern with a linear plan uses it in place of the automata
+wherever they would answer, that is where every byte they would read is ASCII
+under Unicode word boundaries. The automata are then only built for a search
+that reaches other text, which keeps the VM's own results and errors there.
 
 Unanchored portable searches, including `find`, captures, iteration and
 replacement, skip start positions where the program's leading literal or class
