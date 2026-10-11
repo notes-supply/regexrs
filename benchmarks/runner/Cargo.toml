@@ -1,0 +1,30 @@
+[package]
+name = "regexrs-rebar-runner"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Rebar BYOB runner for regexrs and current Rust competitors (development only)"
+
+# Not part of the regexrs workspace or package.
+[workspace]
+
+[features]
+# Adds the `regexrs-native` engine (Linux x86-64 only).
+native = ["regexrs/native"]
+
+[dependencies]
+anyhow = "1"
+fancy-regex = "=0.19.2"
+regex = "=1.13.1"
+regexrs = { path = "../.." }
+resharp = "=0.7.5"
+# Rebar's shared KLV reader and timer, from the pinned checkout `mise run
+# bench:rebar:fetch` creates.
+klv = { path = "../.rebar/shared/klv" }
+timer = { path = "../.rebar/shared/timer" }
+
+[profile.release]
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"

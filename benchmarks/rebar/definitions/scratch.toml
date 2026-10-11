@@ -1,0 +1,52 @@
+analysis = '''
+Supplement for per-worker scratch: `regexrs-searcher` keeps one `Searcher`
+and one `CaptureLocations` across iterations, against plain `Regex` calls
+(pooled scratch, owned captures). The custom `first-captures-per-line` model
+runs one capture search per line and counts participating groups of its
+first match; the regex crate uses its own `captures_read` there.
+'''
+
+[[bench]]
+model = "first-captures-per-line"
+name = "doubled-words-records"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 30
+engines = ["regexrs", "regexrs-searcher"]
+
+[[bench]]
+model = "first-captures-per-line"
+name = "log-records"
+regex = { path = "rebar/wild/unstructured-to-json.txt" }
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 600
+engines = ["regexrs", "regexrs-searcher", "regex"]
+
+[[bench]]
+model = "grep"
+name = "doubled-words-lines"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 15
+engines = ["regexrs", "regexrs-searcher"]
+
+[[bench]]
+model = "grep"
+name = "rust-fn-lines"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 12066
+engines = ["regexrs", "regexrs-searcher", "regex"]
+
+[[bench]]
+model = "count"
+name = "titled-names"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 269
+engines = ["regexrs", "regexrs-searcher"]

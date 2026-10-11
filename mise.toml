@@ -41,3 +41,56 @@ run = "cargo publish --locked --all-features --no-verify --registry crates-io"
 [tasks.bench]
 description = "Parity-gated backreference comparison against Rust competitors"
 run = "cargo run --locked --release --example competition --features native -- bench 1 1000000 7"
+
+# Rebar benchmark suite (development only; see docs/benchmarks.md).
+
+[tasks."bench:rebar:fetch"]
+description = "Check out the pinned Rebar harness and corpora into benchmarks/.rebar"
+dir = "{{config_root}}/benchmarks"
+run = """
+set -eu
+rev=463d00f31887e84c38467805b9e3122c314b9521
+[ -d .rebar/.git ] || git clone --quiet --no-checkout https://github.com/BurntSushi/rebar .rebar
+git -C .rebar cat-file -e "$rev^{commit}" 2>/dev/null || git -C .rebar fetch --quiet origin
+git -C .rebar checkout --quiet --detach "$rev"
+test "$(git -C .rebar rev-parse HEAD)" = "$rev"
+ln -sfn ../../.rebar/benchmarks/haystacks rebar/haystacks/rebar
+mkdir -p rebar/regexes
+ln -sfn ../../.rebar/benchmarks/regexes rebar/regexes/rebar
+"""
+
+[tasks."bench:rebar:build"]
+description = "Build the pinned Rebar CLI and the runner"
+depends = ["bench:rebar:fetch"]
+dir = "{{config_root}}/benchmarks"
+env = { CARGO_TARGET_DIR = "{{config_root}}/benchmarks/target" }
+run = [
+  "cargo build --locked --release --manifest-path .rebar/Cargo.toml",
+  "cargo build --locked --release --features native --manifest-path runner/Cargo.toml",
+]
+
+[tasks."bench:rebar:verify"]
+description = "Check spans, captures and counts of every row before timing"
+depends = ["bench:rebar:build"]
+dir = "{{config_root}}/benchmarks"
+env = { CARGO_TARGET_DIR = "{{config_root}}/benchmarks/target" }
+run = ["cargo test --locked --release --features native --manifest-path runner/Cargo.toml", "bash verify.sh"]
+
+[tasks."bench:rebar:measure"]
+description = "Measure every verified row into .benchmark-results/rebar"
+depends = ["bench:rebar:verify"]
+dir = "{{config_root}}/benchmarks"
+run = """
+set -eu
+out="../.benchmark-results/rebar/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+mkdir -p "$out"
+{ git rev-parse HEAD; git status --porcelain; rustc -V; uname -srm; } > "$out/source.txt"
+target/release/rebar measure -d rebar > "$out/results.csv"
+echo "$out/results.csv"
+"""
+
+[tasks."bench:rebar:smoke"]
+description = "Short run that exercises the harness; not for performance claims"
+depends = ["bench:rebar:verify"]
+dir = "{{config_root}}/benchmarks"
+run = "target/release/rebar measure -d rebar --max-time 50ms --max-warmup-time 10ms --max-iters 50 --max-warmup-iters 5"

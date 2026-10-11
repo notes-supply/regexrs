@@ -1,0 +1,86 @@
+# Engine configurations for `rebar -d benchmarks/rebar`. Each runs the same
+# runner binary, built by `mise run bench:rebar:build`; paths are relative to
+# this directory. Defaults: regexrs (native code disabled), regex, fancy.
+# Tuned or API-specific: regexrs-native, regexrs-searcher, regexrs-regular,
+# fancy-seek. resharp is leftmost-longest and only listed where verified
+# equivalent.
+
+[[engine]]
+name = "regexrs"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs"]
+
+[[engine]]
+name = "regexrs-native"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-native", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-native"]
+
+[[engine]]
+name = "regexrs-searcher"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-searcher", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-searcher"]
+
+[[engine]]
+name = "regexrs-regular"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-regular", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-regular"]
+
+[[engine]]
+name = "regex"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regex", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regex"]
+
+[[engine]]
+name = "fancy"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["fancy", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["fancy"]
+
+[[engine]]
+name = "fancy-seek"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["fancy-seek", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["fancy-seek"]
+
+[[engine]]
+name = "resharp"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["resharp", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["resharp"]

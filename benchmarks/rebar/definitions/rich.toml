@@ -1,0 +1,80 @@
+analysis = '''
+Rich patterns (backreferences, lookaround) on real text. regexrs runs its
+portable engine by default; regexrs-native (boolean searches only) and
+fancy-seek are tuned configurations, reported separately. resharp only
+appears on lookaround rows where verification shows leftmost-first spans.
+'''
+
+[[bench]]
+model = "count"
+name = "doubled-words"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 15
+engines = ["regexrs", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "grep"
+name = "doubled-words-lines"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 15
+engines = ["regexrs", "regexrs-native", "fancy", "fancy-seek"]
+
+# A whole-haystack search for this miss exceeds the default backtrack limit
+# (1,000,000) in regexrs and Fancy Regex alike, so it is measured per line.
+[[bench]]
+model = "grep"
+name = "tripled-words-miss"
+regex = '\b(\w+) \1 \1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 0
+engines = ["regexrs", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "count"
+name = "titled-names"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 269
+engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count"
+name = "exclamations"
+regex = '\w+(?=!)'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 344
+engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count-spans"
+name = "rust-raw-strings"
+regex = 'r(#+)"(?s:.*?)"\1'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 244281
+engines = ["regexrs", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "count"
+name = "rust-method-calls"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 19349
+engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "compile-doubled-words"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 15
+engines = ["regexrs", "fancy"]

@@ -9,7 +9,7 @@ repository = "https://github.com/notes-supply/regexrs"
 documentation = "https://docs.rs/regexrs"
 categories = ["text-processing"]
 keywords = ["regex", "backreferences", "lookaround", "unicode"]
-exclude = ["/work/", "/target/", "/.github/"]
+exclude = ["/work/", "/target/", "/.github/", "/benchmarks/"]
 
 [package.metadata.docs.rs]
 all-features = true

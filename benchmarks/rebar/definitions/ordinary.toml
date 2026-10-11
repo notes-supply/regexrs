@@ -1,0 +1,120 @@
+analysis = '''
+Ordinary (regular) patterns on real text, with default configurations.
+Haystacks come from the pinned Rebar checkout: `sherlock.txt` (Project
+Gutenberg, public domain), `opensubtitles/ru-sampled.txt` (OPUS
+OpenSubtitles 2018 sample), `rust-src-tools-3b0d4813.txt` (Rust project
+source, MIT/Apache-2.0) and `wild/unstructured-to-json.log` with its
+real-world extraction regex (see Rebar's `curated/11-unstructured-to-json`).
+resharp is leftmost-longest and only listed where verification shows the
+same spans as the leftmost-first engines.
+'''
+
+[[bench]]
+model = "count"
+name = "literal-sherlock"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 91
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "literal-casei"
+regex = 'Sherlock Holmes'
+unicode = true
+case-insensitive = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 96
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "literal-miss"
+regex = 'zqxjkw'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 0
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "names-alternation"
+regex = 'Holmes|Watson|Lestrade|Moriarty|Adler'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 595
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count-spans"
+name = "words-dense"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 447669
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count-spans"
+name = "dialogue"
+regex = '"[^"]*"'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 296502
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "words-cyrillic"
+regex = '\w+'
+unicode = true
+haystack = { path = "rebar/opensubtitles/ru-sampled.txt" }
+count = 145465
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "grep"
+name = "rust-keywords"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 41033
+engines = ["regexrs", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count-captures"
+name = "rust-fn-names"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 24164
+engines = ["regexrs", "regex", "fancy"]
+
+[[bench]]
+model = "grep-captures"
+name = "log-extract"
+regex = { path = "rebar/wild/unstructured-to-json.txt" }
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 600
+engines = ["regexrs", "regex", "fancy"]
+
+[[bench]]
+model = "compile"
+name = "compile-log-extract"
+regex = { path = "rebar/wild/unstructured-to-json.txt" }
+unicode = true
+haystack = '''2022/06/17 06:25:22 I4: [17936:140245395805952:(17998)]: (8fb074fc-c766-498b-b224-8b660126b2c0): Searching for query 'dummy query' {/src/master/mastersearchattrs.cc:MasterSearchAttributes():40}'''
+count = 1
+engines = ["regexrs", "regex", "fancy"]
+
+[[bench]]
+model = "compile"
+name = "compile-names-casei"
+regex = 'Holmes|Watson|Lestrade|Moriarty|Adler'
+unicode = true
+case-insensitive = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 602
+engines = ["regexrs", "regex", "fancy", "resharp"]

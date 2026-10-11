@@ -1,2 +1,7 @@
 /target/
 /work/
+/.benchmark-results/
+/benchmarks/.rebar/
+/benchmarks/target/
+/benchmarks/rebar/haystacks/rebar
+/benchmarks/rebar/regexes/rebar

@@ -1,0 +1,52 @@
+analysis = '''
+Supplement for `RegularRegex`, which never backtracks (regex-automata's
+bounded backtracker is disabled), against `Regex` on the same patterns and
+the regex crate. `\b` runs on the backtracking VM in `Regex` but on automata
+in `RegularRegex`; the log regex shows the cost of forgoing bounded
+backtracking for captures.
+'''
+
+[[bench]]
+model = "count"
+name = "literal"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 91
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count"
+name = "bounded-words"
+regex = '\b\w+\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 109214
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "count-captures"
+name = "rust-fn-names"
+regex = '\bfn\s+(\w+)'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 24164
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "grep-captures"
+name = "log-extract"
+regex = { path = "rebar/wild/unstructured-to-json.txt" }
+unicode = true
+haystack = { path = "rebar/wild/unstructured-to-json.log" }
+count = 600
+engines = ["regexrs", "regexrs-regular", "regex"]
+
+[[bench]]
+model = "compile"
+name = "compile-log-extract"
+regex = { path = "rebar/wild/unstructured-to-json.txt" }
+unicode = true
+haystack = '''2022/06/17 06:25:22 I4: [17936:140245395805952:(17998)]: (8fb074fc-c766-498b-b224-8b660126b2c0): Searching for query 'dummy query' {/src/master/mastersearchattrs.cc:MasterSearchAttributes():40}'''
+count = 1
+engines = ["regexrs", "regexrs-regular", "regex"]
