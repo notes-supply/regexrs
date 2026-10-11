@@ -12,6 +12,12 @@
 //! backtracks, so matches and limit errors are those of the exhaustive scan.
 //! When every test needs at least two bytes, a candidate's second byte must
 //! also be one some test can begin with.
+//!
+//! A program that begins with a fixed-width lookbehind whose body is a set of
+//! literals of one byte length fails inside the lookbehind, once, wherever
+//! none of them ends at the attempt position. Candidates are then the ends of
+//! their occurrences, which are usually far rarer than the first characters
+//! the rest of the program tests.
 
 use regex_automata::util::prefilter::Prefilter;
 use regex_automata::{MatchKind, Span};
@@ -28,6 +34,9 @@ const BUDGET: usize = 64;
 /// Longest delegate literal prefix extracted for a shared needle; longer
 /// prefixes add little selectivity but grow case-insensitive cross products.
 const DELEGATE_LITERAL_LEN: usize = 4;
+
+/// Most literals a leading lookbehind's body may expand to.
+const BEHIND_LITERALS: usize = 64;
 
 /// Candidate positions for unanchored attempts and the cost of the others.
 #[derive(Debug)]
@@ -47,6 +56,13 @@ enum Candidates {
     /// set. This is regex-automata's own byte-set strategy, which it does not
     /// expose; `Prefilter::new` would build Teddy at many times the cost.
     Bytes(ByteSet),
+    /// The ends of occurrences of a leading lookbehind's literals, all `len`
+    /// bytes long, at which the next byte is in `firsts` when that is known.
+    Behind {
+        literals: Prefilter,
+        len: usize,
+        firsts: Option<ByteSet>,
+    },
 }
 
 /// A set of bytes, one bit each.
@@ -141,12 +157,34 @@ impl StartFilter {
             at_start: true,
             start_slots: 0,
         };
-        let cost = walk.failures(body, start, start_path)?;
+        let cost = walk.failures(body, start, start_path);
         let first_bytes = walk.first_bytes;
         // Whole-character stepping never visits a continuation byte, and
         // 0x80..=0xBF is exactly the third word of the set.
         let continuation = first_bytes.0[2] != 0;
-        if first_bytes.len() > 128 || (continuation && bytes_mode != BytesMode::Ascii) {
+        let firsts_usable =
+            first_bytes.len() <= 128 && (!continuation || bytes_mode == BytesMode::Ascii);
+        let shared_prefix = matches!(&walk.common, Common::Prefix(prefix) if prefix.len() >= 2);
+        // A lookbehind's literals are preferred unless the walk found a
+        // needle every candidate starts with. A walk through the lookbehind
+        // costs one failure, as the lookbehind alone does.
+        if !(cost.is_some() && firsts_usable && shared_prefix)
+            && let Some((literals, len)) = behind_literals(body, start, delegates, bytes_mode)
+            && let Some(literals) = Prefilter::new(MatchKind::LeftmostFirst, &literals)
+        {
+            let firsts = (cost == Some(1) && firsts_usable).then_some(first_bytes);
+            return Some(StartFilter {
+                candidates: Candidates::Behind {
+                    literals,
+                    len,
+                    firsts,
+                },
+                seconds: None,
+                cost: 1,
+            });
+        }
+        let cost = cost?;
+        if !firsts_usable {
             return None;
         }
         // A needle already tests the second byte; a set nearly every byte is
@@ -191,6 +229,26 @@ impl StartFilter {
                     .iter()
                     .position(|&byte| set.contains(byte))
                     .map(|offset| start + offset),
+                Candidates::Behind {
+                    literals,
+                    len,
+                    firsts,
+                } => {
+                    // An occurrence ending at `start` or later starts at most
+                    // `len` bytes earlier.
+                    let span = Span::from(start.saturating_sub(*len)..haystack.len());
+                    let end = literals.find(haystack, span)?.start + len;
+                    if end > haystack.len() {
+                        return None;
+                    }
+                    match firsts {
+                        Some(firsts) if !haystack.get(end).is_some_and(|&b| firsts.contains(b)) => {
+                            start = end + 1;
+                            continue;
+                        }
+                        _ => Some(end),
+                    }
+                }
             }?;
             match &self.seconds {
                 Some(seconds)
@@ -253,6 +311,120 @@ impl StartFilter {
         } + usize::from(stop > haystack.len());
         positions.saturating_mul(self.cost)
     }
+}
+
+/// The literals a leading fixed-width lookbehind requires to end at the
+/// attempt position, and their common byte length: the program saves the
+/// attempt start in a slot, steps back `n` characters, tests literals that are
+/// exactly the body's matches, each of `n` characters, and restores the slot.
+/// Saves before it neither fail nor push, and every test fails at most once,
+/// so an attempt where none of the literals ends fails exactly once.
+fn behind_literals(
+    body: &[Insn],
+    start: usize,
+    delegates: &[(usize, Hir)],
+    bytes_mode: BytesMode,
+) -> Option<(alloc::vec::Vec<alloc::vec::Vec<u8>>, usize)> {
+    let mut pc = start;
+    let (slot, chars) = loop {
+        match (body.get(pc)?, body.get(pc + 1)?) {
+            (Insn::Save(slot), Insn::GoBack(chars)) => break (*slot, *chars),
+            (Insn::Save(_) | Insn::Save0(_) | Insn::SaveCaptureGroupStart(_), _) => pc += 1,
+            _ => return None,
+        }
+    };
+    let mut literals = alloc::vec![alloc::vec::Vec::new()];
+    pc += 2;
+    loop {
+        let insn = body.get(pc)?;
+        match insn {
+            Insn::Restore(restored) if *restored == slot => break,
+            // Fails at most once and consumes nothing; the literals then
+            // include every text the body matches.
+            Insn::Assertion(_) => {}
+            Insn::Lit(literal) => {
+                for text in &mut literals {
+                    text.extend_from_slice(literal.as_bytes());
+                }
+            }
+            Insn::LitCasei(literal) => {
+                for folds in literal.chars() {
+                    literals = extend(&literals, &chars_of(folds)?)?;
+                }
+            }
+            Insn::CharClass(CharClassMatcher::Codepoint { ranges, .. }) => {
+                literals = extend(&literals, &chars_of(ranges)?)?;
+            }
+            Insn::CharClass(CharClassMatcher::Byte { ranges, .. }) => {
+                let mut bytes = alloc::vec::Vec::new();
+                for &(lo, hi) in ranges.iter() {
+                    if bytes.len() + usize::from(hi - lo) >= BEHIND_LITERALS {
+                        return None;
+                    }
+                    bytes.extend((lo..=hi).map(|byte| alloc::vec![byte]));
+                }
+                literals = extend(&literals, &bytes)?;
+            }
+            Insn::Delegate(_) => {
+                let (_, hir) = delegates.iter().find(|(at, _)| *at == pc)?;
+                let matches = Extractor::new().kind(ExtractKind::Prefix).extract(hir);
+                let texts = matches.literals().filter(|_| matches.is_exact())?;
+                let texts: alloc::vec::Vec<_> =
+                    texts.iter().map(|text| text.as_bytes().to_vec()).collect();
+                literals = extend(&literals, &texts)?;
+            }
+            _ => return None,
+        }
+        pc += 1;
+    }
+    let len = literals.first()?.len();
+    let width = |literal: &[u8]| match bytes_mode {
+        BytesMode::Ascii => Some(literal.len()),
+        _ => core::str::from_utf8(literal)
+            .ok()
+            .map(|text| text.chars().count()),
+    };
+    (len > 0
+        && literals
+            .iter()
+            .all(|literal| literal.len() == len && width(literal) == Some(chars)))
+    .then_some((literals, len))
+}
+
+/// The UTF-8 encodings of the characters in `ranges`, unless there are more
+/// than `BEHIND_LITERALS`.
+fn chars_of(ranges: &[(char, char)]) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    let mut chars = alloc::vec::Vec::new();
+    for &(lo, hi) in ranges {
+        for c in lo..=hi {
+            if chars.len() == BEHIND_LITERALS {
+                return None;
+            }
+            chars.push(c.encode_utf8(&mut [0; 4]).as_bytes().to_vec());
+        }
+    }
+    Some(chars)
+}
+
+/// Each of `literals` followed by each of `texts`, unless that makes more
+/// than `BEHIND_LITERALS`.
+fn extend(
+    literals: &[alloc::vec::Vec<u8>],
+    texts: &[alloc::vec::Vec<u8>],
+) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    if literals.len() * texts.len() > BEHIND_LITERALS {
+        return None;
+    }
+    Some(
+        literals
+            .iter()
+            .flat_map(|literal| {
+                texts
+                    .iter()
+                    .map(move |text| [literal.as_slice(), text].concat())
+            })
+            .collect(),
+    )
 }
 
 struct Walk<'a> {
@@ -759,6 +931,8 @@ mod tests {
             (r"(?:ab|cd)(?!x)", 1),
             (r"(?>event|incident) \d+:", 1),
             (r"(?i)#1k(?!x)", 1),
+            (r"(?<=x)[ab]b(?!c)", 1),
+            (r"(?<=é#)\d", 1),
         ];
         let text = "zz ab xab cd abab zz é#1 ab €x";
         for (pattern, cost) in patterns {
@@ -795,6 +969,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn leading_lookbehind_literals_select_candidates() {
+        // Candidates are the ends of the lookbehind's literals, then checked
+        // against the first bytes after it where the rest can be walked. A
+        // skipped position fails once inside the lookbehind.
+        let cases = [
+            (r"(?<=Mr\. |Dr\. )[A-Z]\w+", false),
+            (r"(?<=\.)[a-z][a-z0-9]*(?=\()", true),
+            (r"(?<=é)x", true),
+            (r"(?i)(?<=mr\. )\w", true),
+            (r"(?<=\bDr\. )\w", true),
+            (r"(?<=ab)(\w)\1", true),
+            (r"(?<=[.,(])[a-z]\w*", false),
+            (r"(?<=[éè] )x", true),
+        ];
+        let text = "Mr. Holmes, Dr. Watson; mR. x foo.bar(1) é x éx è xa Dr.Who abcc abdd";
+        for (pattern, checks_firsts) in cases {
+            let firsts =
+                start_filter(&Regex::new(pattern).unwrap()).and_then(|filter| {
+                    match &filter.candidates {
+                        Candidates::Behind { firsts, .. } => Some(firsts.is_some()),
+                        _ => None,
+                    }
+                });
+            assert_eq!(firsts, Some(checks_firsts), "{pattern:?}");
+            for limit in [None, Some(0), Some(1), Some(2), Some(5), Some(20), Some(80)] {
+                let (Some(regex), Some(reference)) = build(pattern, false, limit) else {
+                    unreachable!("{pattern:?} compiles");
+                };
+                assert_eq!(
+                    observe!(regex, text),
+                    observe!(reference, text),
+                    "{pattern:?} limit={limit:?}"
+                );
+                for start in (0..=text.len()).filter(|&at| text.is_char_boundary(at)) {
+                    for end in [start, text.len() - 9, text.len()] {
+                        let Some(end) = Some(end).filter(|&end| end >= start) else {
+                            continue;
+                        };
+                        let found = regex
+                            .find_input(RegexInput::new(text).range(start..end))
+                            .map(|m| m.map(|m| m.range()));
+                        let expected = reference
+                            .find_input(oracle::RegexInput::new(text).range(start..end))
+                            .map(|m| m.map(|m| m.range()));
+                        assert_eq!(
+                            alloc::format!("{found:?}"),
+                            alloc::format!("{expected:?}"),
+                            "{pattern:?} limit={limit:?} {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+        // Literals of different byte lengths, or a body that is not a finite
+        // set of literals, keep the ordinary walk.
+        for pattern in [r"(?i)(?<=k)a", r"(?<=\w)a", r"(?<=a|bc)d", r"(?<=[eé])x"] {
+            let behind = start_filter(&Regex::new(pattern).unwrap())
+                .is_some_and(|filter| matches!(filter.candidates, Candidates::Behind { .. }));
+            assert!(!behind, "{pattern:?}");
         }
     }
 
@@ -857,6 +1094,7 @@ mod tests {
             let found = match &filter.candidates {
                 Candidates::Literal(prefilter) => prefilter.max_needle_len(),
                 Candidates::Bytes(_) => 0,
+                Candidates::Behind { .. } => unreachable!("{pattern:?} has no lookbehind"),
             };
             assert_eq!(found, needle_len, "{pattern:?}");
             for text in texts {
@@ -1017,6 +1255,38 @@ mod tests {
             builds >= 100 && checks >= 20_000,
             "{builds} builds, {checks} checks"
         );
+    }
+
+    #[test]
+    fn lookbehind_literals_follow_every_bytes_mode() {
+        // Byte classes in ASCII mode, and invalid UTF-8 around the literals,
+        // which only ASCII mode skips over.
+        let haystack: &[u8] = b"\xFF.ab,\xE2cd.\xFFe .f\xC3\xA9g";
+        for pattern in [r"(?<=[.,])[a-z]+", r"(?<=\.)\w", r"(?<=\. )[a-z]"] {
+            for (mode, reference_mode) in [
+                (BytesMode::Unicode, oracle::BytesMode::Unicode),
+                (BytesMode::UnicodeBytes, oracle::BytesMode::UnicodeBytes),
+                (BytesMode::Ascii, oracle::BytesMode::Ascii),
+            ] {
+                let regex = RegexBuilder::new(pattern).bytes_mode(mode).build().unwrap();
+                let behind = start_filter(&regex)
+                    .is_some_and(|filter| matches!(filter.candidates, Candidates::Behind { .. }));
+                assert!(behind, "{pattern:?} {mode:?}");
+                let reference = oracle::RegexBuilder::new(pattern)
+                    .bytes_mode(reference_mode)
+                    .build()
+                    .unwrap();
+                let spans: Vec<_> = regex
+                    .find_iter(haystack)
+                    .map(|m| m.unwrap().range())
+                    .collect();
+                let expected: Vec<_> = reference
+                    .find_iter(haystack)
+                    .map(|m| m.unwrap().range())
+                    .collect();
+                assert_eq!(spans, expected, "{pattern:?} {mode:?}");
+            }
+        }
     }
 
     #[test]

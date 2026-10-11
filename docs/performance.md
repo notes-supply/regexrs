@@ -51,8 +51,11 @@ the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
 Unanchored portable searches, including `find`, captures, iteration and
 replacement, skip start positions where the program's leading literal or class
 tests cannot succeed: memmem or memchr via `regex-automata`, or a first-byte
-table. Each skipped position is charged the backtracks its failing attempt
-would have performed, so matches and limit errors are unchanged. Positions are
+table. A leading fixed-width lookbehind over a set of literals of one byte
+length, as in `(?<=Mr\. |Dr\. )[A-Z]\w+`, instead limits attempts to where one
+of its literals ends, found with `regex-automata`'s literal searchers. Each
+skipped position is charged the backtracks its failing attempt would have
+performed, so matches and limit errors are unchanged. Positions are
 only skipped when that cost is fixed, so patterns led by a delegated
 alternation, `.`, an assertion before alternatives or another construct whose
 failure cost varies still try every position, as do byte haystacks outside
