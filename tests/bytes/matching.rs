@@ -388,6 +388,34 @@ fn bytes_hard_mode_absent_repeater_lookahead_with_high_bytes() {
     assert_eq!(mat.as_bytes(), b"\xFF\xC0\xE0end");
 }
 
+// --- Truncated UTF-8 at the end of the haystack ---
+
+/// A lead byte at the end of the haystack can imply more bytes than remain. The
+/// VM must not step over it to a position past the end, where an assertion or a
+/// delegate search would index out of bounds. fancy-regex 0.19 panics on the
+/// first and third patterns; the other results equal it.
+#[test]
+fn bytes_unicode_hard_mode_truncated_trailing_character() {
+    type Case = (&'static str, &'static [u8], Option<(usize, usize)>);
+    let cases: [Case; 5] = [
+        (r"(?s)\b.\b", b"\xC3 a\xFF", Some((2, 3))),
+        (r"(?s)(?>.)\b", b"a\xF0\x9F", Some((0, 1))),
+        (r"(?~x)\b", b"ab\xE2", Some((0, 2))),
+        (r"(?s)a(?=.)", b"a\xF0", None),
+        (r"(?m)^\b\w|\b$", b"ab\xFFab", Some((0, 1))),
+    ];
+    for mode in [BytesMode::Unicode, BytesMode::UnicodeBytes] {
+        for (pattern, haystack, expected) in cases {
+            let re = RegexBuilder::new(pattern).bytes_mode(mode).build().unwrap();
+            let found: Vec<_> = re
+                .find_iter(haystack)
+                .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
+                .collect();
+            assert_eq!(found, Vec::from_iter(expected), "{pattern} {mode:?}");
+        }
+    }
+}
+
 // --- Explicit \R tests in Ascii bytes mode ---
 
 /// \R should compile and work in Ascii bytes mode (non-Unicode newline set).

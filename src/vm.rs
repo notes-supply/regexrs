@@ -825,6 +825,16 @@ fn advance_one<S: HaystackInput + ?Sized>(s: &S, ix: usize, bytes_mode: BytesMod
     }
 }
 
+/// The end of the character at `ix`, a position inside the haystack, or `None` when
+/// invalid input ends with a sequence whose first byte implies more bytes than remain.
+/// Such a truncated character cannot be consumed: stepping over it would leave the
+/// haystack, where every later step could only fail or index out of bounds.
+#[inline]
+fn char_end<S: HaystackInput + ?Sized>(s: &S, ix: usize, bytes_mode: BytesMode) -> Option<usize> {
+    let end = ix + advance_one(s, ix, bytes_mode);
+    (end <= s.len()).then_some(end)
+}
+
 /// Returns the previous position before `ix`, respecting the bytes mode.
 /// In `Ascii` mode, simply returns `ix - 1`. In `Unicode`/`UnicodeBytes` mode,
 /// skips backward over UTF-8 continuation bytes.
@@ -1143,15 +1153,20 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     return Ok(Some(extract(state)));
                 }
                 Insn::Any => {
-                    if ix < haystack.len() {
-                        ix += advance_one(haystack, ix, prog.bytes_mode);
+                    if ix < haystack.len()
+                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
+                    {
+                        ix = end;
                     } else {
                         break 'fail;
                     }
                 }
                 Insn::AnyNoNL => {
-                    if ix < haystack.len() && haystack.as_bytes()[ix] != b'\n' {
-                        ix += advance_one(haystack, ix, prog.bytes_mode);
+                    if ix < haystack.len()
+                        && haystack.as_bytes()[ix] != b'\n'
+                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
+                    {
+                        ix = end;
                     } else {
                         break 'fail;
                     }
@@ -1160,8 +1175,9 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     if ix < haystack.len()
                         && haystack.as_bytes()[ix] != b'\r'
                         && haystack.as_bytes()[ix] != b'\n'
+                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
                     {
-                        ix += advance_one(haystack, ix, prog.bytes_mode);
+                        ix = end;
                     } else {
                         break 'fail;
                     }
@@ -1545,14 +1561,17 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                         // Delegate matches at current position - we've reached the boundary
                         // Continue to next instruction without consuming any characters
                         // Fall through via pc += 1 below
-                    } else if ix < haystack.len() {
+                    } else if ix < haystack.len()
+                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
+                    {
                         // Try advancing one character and checking again
                         state.push(pc + 1, ix)?;
-                        ix += advance_one(haystack, ix, prog.bytes_mode);
+                        ix = end;
                         // Stay at same pc to check delegate match at new position
                         continue;
                     } else {
-                        // Reached end of string - delegate never matched, so we succeed
+                        // Reached end of string, or a truncated character that cannot
+                        // be consumed - delegate never matched, so we succeed
                         // Fall through via pc += 1 below
                     }
                 }
