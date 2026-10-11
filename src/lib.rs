@@ -79,7 +79,7 @@ use crate::compile::{CompileOptions, compile};
 use crate::optimize::optimize;
 use crate::parse::{ExprTree, NamedGroups, Parser};
 use crate::parse_flags::*;
-use crate::plan::{LinearPlan, NFA_UNIT_BUDGET, PlanInput};
+use crate::plan::{NFA_UNIT_BUDGET, Plan, PlanInput};
 use crate::regular_route::{Automata, RegularRoute, RouteEngine};
 use crate::vm::{OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH, Prog};
 
@@ -209,13 +209,13 @@ enum RegexImpl {
 pub(crate) enum WrapEngine {
     /// regex-automata's meta engine.
     Meta(RaRegex),
-    /// A pattern whose matches follow one deterministic path: its linear plan
+    /// A pattern whose matches follow one deterministic path: its plan
     /// gives the meta engine's results, so that engine is not kept.
-    Plan(Arc<LinearPlan>),
+    Plan(Arc<Plan>),
 }
 
 impl WrapEngine {
-    /// The linear plan for `hir` where it has one, else the meta engine
+    /// The plan for `hir` where it has one, else the meta engine
     /// `build` returns. The meta engine is still built, and dropped, wherever
     /// explicit size limits or the size of the pattern could make building it
     /// fail, so compiling reports exactly the errors it did.
@@ -225,7 +225,7 @@ impl WrapEngine {
         usage: compile::DelegateUsage,
         build: impl FnOnce() -> Result<RaRegex>,
     ) -> Result<WrapEngine> {
-        let Some(plan) = hir.and_then(|hir| LinearPlan::new(hir, usage.prefilter())) else {
+        let Some(plan) = hir.and_then(|hir| Plan::new(hir, usage.prefilter())) else {
             return build().map(WrapEngine::Meta);
         };
         let default_limits =
@@ -1649,7 +1649,7 @@ impl Regex {
     ///   the automata would not.
     ///
     /// The route's lazy DFAs can still give up on non-ASCII text, leaving the
-    /// search to the VM; its linear plan, if any, answers only where they
+    /// search to the VM; its plan, if any, answers only where they
     /// would not. The route's engine is decided and built here on first use.
     pub(crate) fn regular_route<S: input::Input + ?Sized>(
         &self,
@@ -2332,6 +2332,22 @@ impl Regex {
         capture_names_of(&self.named_groups, self.captures_len())
     }
 
+    /// Whether searches run on a plan: the whole pattern's, or the route's of
+    /// a pattern that needs the VM only for word boundaries, for the searches
+    /// the route takes. For tests and diagnostics, not part of the supported
+    /// interface.
+    #[doc(hidden)]
+    pub fn planned(&self) -> bool {
+        match &self.inner {
+            RegexImpl::Wrap { engine, .. } => matches!(engine, WrapEngine::Plan(_)),
+            RegexImpl::Fancy {
+                regular: Some(route),
+                ..
+            } => route.engine().plan().is_some(),
+            RegexImpl::Fancy { .. } => false,
+        }
+    }
+
     // for debugging only
     #[doc(hidden)]
     pub fn debug_print(&self, writer: &mut Formatter<'_>) -> fmt::Result {
@@ -2854,7 +2870,7 @@ fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInp
     ra_input
 }
 
-/// Where a linear plan searches `input`, which must not be done: the same
+/// Where a plan searches `input`, which must not be done: the same
 /// span and anchoring as [`ra_input`].
 fn plan_input<'h, S: input::Input + ?Sized>(input: &RegexInput<'h, S>) -> PlanInput<'h> {
     let haystack = input.haystack();
@@ -2867,23 +2883,23 @@ fn plan_input<'h, S: input::Input + ?Sized>(input: &RegexInput<'h, S>) -> PlanIn
     }
 }
 
-/// A linear plan's leftmost-first span in `input`, which must not be done.
+/// A plan's leftmost-first span in `input`, which must not be done.
 fn plan_find<S: input::Input + ?Sized>(
-    plan: &LinearPlan,
+    plan: &Plan,
     input: &RegexInput<'_, S>,
     slots: Option<&mut [Option<NonMaxUsize>]>,
 ) -> Option<(usize, usize)> {
     plan.find(&plan_input(input), slots)
 }
 
-/// Whether a linear plan matches in `input`, which must not be done.
-fn plan_is_match<S: input::Input + ?Sized>(plan: &LinearPlan, input: &RegexInput<'_, S>) -> bool {
+/// Whether a plan matches in `input`, which must not be done.
+fn plan_is_match<S: input::Input + ?Sized>(plan: &Plan, input: &RegexInput<'_, S>) -> bool {
     plan.is_match(&plan_input(input))
 }
 
-/// Fill regex-automata capture storage from a linear plan's search.
+/// Fill regex-automata capture storage from a plan's search.
 fn plan_captures_into<S: input::Input + ?Sized>(
-    plan: &LinearPlan,
+    plan: &Plan,
     input: &RegexInput<'_, S>,
     locations: &mut RaCaptures,
 ) {
@@ -4214,10 +4230,13 @@ mod tests {
         assert_eq!(find("aaaaé"), (true, true));
     }
 
-    /// A route's linear plan answers exactly the searches its automata would
-    /// answer: with Unicode word boundaries, those reading only ASCII bytes.
+    /// A route's plan answers every search on valid UTF-8, where its Unicode
+    /// word boundaries are the VM's, including text where the automata would
+    /// give up. In ASCII mode it answers only the searches the automata would:
+    /// those reading only ASCII bytes, without alternatives or groups, which
+    /// can read past the match.
     #[test]
-    fn regular_route_plan_defers_where_the_automata_give_up() {
+    fn regular_route_plan_answers_on_utf8_and_defers_in_ascii_mode() {
         let answered = |pattern: &str, text: &str| {
             let regex = Regex::new(pattern).unwrap();
             let input = RegexInput::new(text);
@@ -4225,24 +4244,27 @@ mod tests {
             plan.find::<[usize]>(&crate::plan_input(&input), None)
         };
         assert_eq!(answered(r"\b\w+\b", "ab cd"), Some(Some((0, 2))));
-        // The automata may read one byte past the match; that byte is checked too.
-        assert_eq!(answered(r"\b\w+\b", "ab  é"), Some(Some((0, 2))));
-        assert_eq!(answered(r"\b\w+\b", "ab é"), None);
-        assert_eq!(answered(r"\b\w+\b", "ab\u{e9}"), None);
-        assert_eq!(answered(r"\b\w+!", "\u{e9}\u{e9}"), None);
-        assert_eq!(answered(r"\b\w+!", "ab cd"), Some(None));
-        // Word boundaries stay Unicode's in ASCII mode, so the same holds.
-        let ascii = RegexBuilder::new(r"\bfn\b")
-            .bytes_mode(crate::BytesMode::Ascii)
-            .build()
-            .unwrap();
-        let answered = |text: &[u8]| {
+        assert_eq!(answered(r"\b\w+\b", "ab é"), Some(Some((0, 2))));
+        assert_eq!(answered(r"\b\w+\b", "ab\u{e9}"), Some(Some((0, 4))));
+        assert_eq!(answered(r"\b\w+\b", "\u{e9}\u{e9} x"), Some(Some((0, 4))));
+        assert_eq!(answered(r"\b\w+!", "\u{e9}\u{e9}"), Some(None));
+        assert_eq!(answered(r"\b(?:fn|let)\b", "é let"), Some(Some((3, 6))));
+        // Word boundaries stay Unicode's in ASCII mode, where the VM steps
+        // one byte at a time.
+        let ascii = |pattern: &str, text: &[u8]| {
+            let regex = RegexBuilder::new(pattern)
+                .bytes_mode(crate::BytesMode::Ascii)
+                .build()
+                .unwrap();
             let input = RegexInput::new(text);
-            let plan = ascii.regular_route(&input).unwrap().plan().unwrap();
+            let plan = regex.regular_route(&input).unwrap().plan().unwrap();
             plan.find::<[usize]>(&crate::plan_input(&input), None)
         };
-        assert_eq!(answered(b"x fn  \xFF"), Some(Some((2, 4))));
-        assert_eq!(answered(b"\xFF fn"), None);
+        // The automata may read one byte past the match; that byte is checked too.
+        assert_eq!(ascii(r"\bfn\b", b"x fn  \xFF"), Some(Some((2, 4))));
+        assert_eq!(ascii(r"\bfn\b", b"x fn \xFF"), None);
+        assert_eq!(ascii(r"\bfn\b", b"\xFF fn"), None);
+        assert_eq!(ascii(r"\b(?:fn|let)\b", b"x fn  "), None);
     }
 
     #[test]

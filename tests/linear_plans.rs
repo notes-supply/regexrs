@@ -1,8 +1,10 @@
-//! Linear plans search patterns whose matches follow one deterministic path,
-//! without the meta engine or the word-boundary route's automata. Every
-//! search API must give the regex crate's answers. The counterexamples are
-//! shapes where a maximal or minimal run, or skipping past a failed run,
-//! would differ from leftmost-first matching, so they must keep an engine.
+//! Plans search patterns whose matches follow one deterministic path, which
+//! the next character decides, without the meta engine or the word-boundary
+//! route's automata. Every search API must give the regex crate's answers.
+//! The counterexamples are shapes where a maximal or minimal run, choosing an
+//! alternative or repetition by the next character, or skipping past a
+//! failed run would differ from leftmost-first matching, or where attempts
+//! could rescan unbounded text, so they must keep an engine.
 
 use regex_automata::meta::Regex as Meta;
 use regex_automata::{Anchored, Input};
@@ -61,13 +63,49 @@ const PATTERNS: &[&str] = &[
     r"\b\w+\b",
     r"[a-z]+\b",
     r"\d+\b",
+    // Ordered alternatives the next character chooses between.
+    "Holmes|Watson|Lestrade",
+    r"\b(?:fn|let|mut|impl|struct|pub)\b",
+    "(?i)holmes|watson",
+    "(a)|(b)c|(d)",
+    "x(?:y|(z))w",
+    // Optional and repeated groups, greedy and lazy, with captures.
+    "colou?r",
+    "(a)?(b*)",
+    r"(\d+)(?:\.(\d+))?",
+    r"\w+(?:\.\w+)*",
+    "(?:ab)+",
+    "(?:ab)+?",
+    "(?:ab){2,3}",
+    "x(?:ab)*?y",
+    "(?:(a)|(b))+",
+    "(?:a(b)?)+",
+    "((?:ab)*)(c?)",
+    r"(?:\.(\w))*",
+    "(?:foo|bar)(?:baz)?",
+    r"(?:-(\d+)){1,3}",
+    // Patterns that can match nothing.
+    r"\w*",
+    "(?:ab)*",
+    "a?",
     // Counterexamples, which must not take a plan.
     r"\w+\B",
     r"\w+s",
     r"(?m)[^a]+$",
     "[a-z]+?x",
     r"\d+$",
+    "ab|ac",
+    "(a|ab)c",
+    "(?:ab)*a",
+    "(?:a|)b",
+    // Attempts could rescan unbounded repetitions holding other starts.
+    "(?:a(b)?)+c",
+    r"\b(?:ab)+\b",
 ];
+
+/// The patterns above that must take a plan, through `Regex` and
+/// `RegularRegex` alike; the counterexamples after them must not.
+const PLANNED: usize = PATTERNS.len() - 11;
 
 const TEXTS: &[&str] = &[
     "",
@@ -101,6 +139,17 @@ const TEXTS: &[&str] = &[
     "aaaabc abababc bbbc abc ababc",
     "a\n\nb x\na\nb",
     "aa\n\nb",
+    "colour color colouur",
+    "1.2 3. 4.5.6 .7 8..9",
+    "a.b.c a. .b x.y.",
+    "abababx abx ab aba",
+    "xababy xy xaby xabay",
+    "foobaz barbaz foo bar baz fooba",
+    "-1-2-3-4 -5 - -6-",
+    "Holmes Watson Lestrade Holm HOLMES watson",
+    "let mut x; fn impl pub structs pub(crate)",
+    "aabacb abcabc bc ac",
+    "xyw xzw xw xyzw",
 ];
 
 fn oracle_captures(
@@ -143,6 +192,25 @@ fn points(text: &str) -> Vec<usize> {
     points.sort_unstable();
     points.dedup();
     points
+}
+
+/// The comparisons below check the plans themselves, not an engine they
+/// could defer to.
+#[test]
+fn admitted_families_take_plans() {
+    for (index, pattern) in PATTERNS.iter().enumerate() {
+        let planned = index < PLANNED;
+        assert_eq!(
+            Regex::new(pattern).unwrap().planned(),
+            planned,
+            "Regex {pattern:?}"
+        );
+        assert_eq!(
+            RegularRegex::new(pattern).unwrap().planned(),
+            planned,
+            "RegularRegex {pattern:?}"
+        );
+    }
 }
 
 #[test]
@@ -356,4 +424,32 @@ fn word_boundary_plans_keep_vm_errors() {
         regex.find(&hit).unwrap().map(|m| m.range()),
         Some(text.len() + 1..hit.len())
     );
+}
+
+/// A pattern that can match nothing, on invalid UTF-8 in ASCII mode. The
+/// meta engine panicked here inside regex-automata ("reverse search must
+/// match if forward search does") before the pattern took a plan; the plan
+/// reports the regex crate's match. A corrected byte-mode defect, not a
+/// change of parity.
+#[test]
+fn nullable_plans_answer_where_the_engine_panicked() {
+    let text: &[u8] = b"\x80\xC3";
+    let builder = || {
+        let mut builder = RegexBuilder::new(".*");
+        builder.bytes_mode(BytesMode::Ascii);
+        builder
+    };
+    let regex = builder().build().unwrap();
+    let regular = builder().build_regular().unwrap();
+    assert!(regex.planned() && regular.planned());
+    let found: Vec<(usize, usize)> = regex
+        .find_iter(text)
+        .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
+        .collect();
+    assert_eq!(found, [(0, 2)]);
+    let found: Vec<(usize, usize)> = regular
+        .find_iter(text)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    assert_eq!(found, [(0, 2)]);
 }

@@ -1,8 +1,8 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
 //! Expressions restricted to the regular subset of the syntax, searched
-//! without backtracking: by a linear plan where the pattern's matches follow
-//! one deterministic path, and otherwise by regex-automata's automata and
-//! PikeVM.
+//! without backtracking: by a one-pass plan where the next character decides
+//! every choice the pattern makes, and otherwise by regex-automata's automata
+//! and PikeVM.
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -58,12 +58,18 @@ use crate::{
 ///
 /// # Complexity
 ///
-/// A pattern whose matches follow one deterministic path is searched by a
-/// linear plan: a sequence of literals and single-character runs, where no
-/// run can take a character that what follows it needs, as in `\w+`,
-/// `"[^"]*"` or `\bfn\s+(\w+)`. The plan scans forward from each candidate
-/// start once, skipping past runs that cannot match, so a search, and a whole
-/// iteration, takes time linear in the haystack for a given pattern.
+/// A pattern whose every choice the next character decides is searched by a
+/// one-pass plan: literals, character runs, alternatives and optional or
+/// repeated groups where the characters that can start each alternative,
+/// each further run character and each further repetition differ from those
+/// that can follow instead, as in `\w+`, `"[^"]*"`, `\bfn\s+(\w+)`,
+/// `Holmes|Watson` or `(\d+)(?:\.(\d+))?`. An attempt reads forward from
+/// a candidate start once and never returns to an earlier position or
+/// alternative: where the rest of the pattern could match nothing, a greedy
+/// repetition remembers that position as the match to report if it cannot
+/// continue, as a one-pass DFA does. Attempts may fail only after a bounded
+/// stretch of text where other attempts could start, so a search, and a
+/// whole iteration, takes time linear in the haystack for a given pattern.
 ///
 /// Any other pattern uses regex-automata's meta regex with its bounded
 /// backtracker disabled, leaving DFAs, a one-pass DFA and the PikeVM. One
@@ -95,7 +101,7 @@ use crate::{
 /// ```
 #[derive(Clone)]
 pub struct RegularRegex {
-    /// The meta engine, or a linear plan, which never backtracks either.
+    /// The meta engine, or a plan, which never backtracks either.
     engine: WrapEngine,
     pattern: String,
     /// The pattern in regex-automata syntax with word boundaries removed. A
@@ -121,6 +127,13 @@ pub struct RegularMatches<'r, 't, S: Input + ?Sized> {
 pub struct RegularCaptureMatches<'r, 't, S: Input + ?Sized>(RegularMatches<'r, 't, S>);
 
 impl RegularRegex {
+    /// Whether searches run on a plan rather than the meta engine. For tests
+    /// and diagnostics, not part of the supported interface.
+    #[doc(hidden)]
+    pub fn planned(&self) -> bool {
+        matches!(self.engine, WrapEngine::Plan(_))
+    }
+
     /// Compile `pattern` with default options.
     ///
     /// # Errors

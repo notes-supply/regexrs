@@ -1,4 +1,4 @@
-//! Construction keeps 0.1.5's size limits. A pattern that a linear plan
+//! Construction keeps 0.1.5's size limits. A pattern that a plan
 //! could search without the meta engine is still accepted or rejected
 //! exactly where that engine's NFA size limit decides, with the same error,
 //! by `Regex::new` and `RegularRegex::new` alike.

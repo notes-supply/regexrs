@@ -90,7 +90,7 @@ A gap between the two kinds reflects the API choice, not engine speed.
 | `regexrs-native` | `Regex` with the `native` feature; boolean searches only |
 | `regexrs-searcher` | `Regex` through one reused `Searcher` and `CaptureLocations` |
 | `regexrs-seek` | `Regex` with its opt-in seek prefilter, `seek(true)`, and native code disabled; the same methods as `regexrs` |
-| `regexrs-regular` | `RegularRegex`: no backtracking; a linear plan, or regex-automata with its bounded backtracker disabled |
+| `regexrs-regular` | `RegularRegex`: no backtracking; a plan, or regex-automata with its bounded backtracker disabled |
 | `regex` | regex 1.13.1, defaults |
 | `fancy` | fancy-regex 0.19.2, defaults |
 | `fancy-seek` | fancy-regex with its opt-in seek prefilter |

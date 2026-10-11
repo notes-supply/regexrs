@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use regex_automata::{hybrid, meta, util::captures::Captures as RaCaptures};
 
 pub(crate) enum Cache {
-    /// A linear plan searches without working memory.
+    /// A plan searches without working memory.
     Plan,
     Regular {
         cache: Box<meta::Cache>,

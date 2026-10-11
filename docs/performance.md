@@ -33,20 +33,36 @@ not inherently faster than `regex-automata`, and enabling Fancy's existing seek
 option changes many apparent gaps. Compare configured engines, hit-heavy and
 miss-heavy inputs, and compilation cost separately.
 
-Regular patterns whose matches follow one deterministic path are searched by
-a linear plan instead of an automaton. These are sequences of literals and
-single-character runs with captures, where no run of variable length is
-followed by a character it could also take. Assertions may stand only at the
-ends, and assertions after a run must fail wherever the run could stop early.
-Examples are `\w+`, `"[^"]*"`, `\bfn\s+(\w+)`, `\b\w+\b`, `^\d+$` and
-`[0-9a-f]{8}-[0-9a-f]{4}`.
+Regular patterns whose every choice the next character decides are searched
+by a one-pass plan instead of an automaton. A plan is a program of literals,
+character runs, ordered alternatives and optional or repeated groups, with
+captures anywhere. It is admitted where the characters that can start each
+alternative, each further run character and each further repetition differ
+from those that can follow instead, and no alternative or repeated group can
+match nothing. Assertions may stand only at the ends; assertions after a run
+must fail wherever the run could stop early. Examples are `\w+`, `"[^"]*"`,
+`\bfn\s+(\w+)`, `^\d+$`, `[0-9a-f]{8}-[0-9a-f]{4}`, `Holmes|Watson|Lestrade`,
+`\b(?:fn|let|mut)\b`, `(a)?(b*)`, `(\d+)(?:\.(\d+))?` and `\w+(?:\.\w+)*`.
+
+An attempt reads forward only and never returns to an earlier position or
+alternative. Where the rest of the pattern could match nothing, a lazy
+repetition stops; a greedy one continues after recording the position, with
+the capture slots that what follows could change, as the match to report if it
+cannot continue. A one-pass DFA keeps its last match the same way. No search
+through a plan is handed to another engine. Attempts may fail only after
+reading a bounded number of bytes where other attempts could start; an
+unbounded first run, which a failed attempt skips, and runs or repetitions
+holding no character a match can start with do not count. Work therefore
+stays linear per search and per iteration. Patterns such as `(?:foo|bar)+qux`,
+whose attempts could rescan unbounded repetitions, keep their engine.
 
 The plan finds candidates with memmem, a literal at a fixed offset, a
-`regex-automata` prefilter, memchr or a word-at-a-time byte-range test. It then
-matches each run maximally (or minimally for a lazy run nothing can fail after)
-and skips past runs that cannot match, so work stays linear. Captures, ranges,
-anchoring, `Searcher` and `CaptureLocations` give the meta engine's results with
-no reverse search, cache or pool.
+`regex-automata` prefilter, memchr or a word-at-a-time byte-range test.
+Alternatives are chosen through a 256-entry table of first bytes. Runs match
+maximally (or minimally for a lazy run nothing can fail after), and a failed
+attempt skips past a first run that cannot match. Captures, ranges, anchoring,
+`Searcher` and `CaptureLocations` give the meta engine's results with no
+reverse search, cache or pool.
 
 `Regex` and `RegularRegex` then keep no meta engine for the pattern. The engine
 is still built once and dropped under explicit size limits, or when a bound
@@ -71,10 +87,15 @@ unbounded repetition the VM runs over an expression that can match empty, such
 as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
 do, and automata can report other captures or spans. The automata are built on
 the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
-A word-boundary pattern with a linear plan uses it in place of the automata
-wherever they would answer, that is where every byte they would read is ASCII
-under Unicode word boundaries. The automata are then only built for a search
-that reaches other text, which keeps the VM's own results and errors there.
+A word-boundary pattern with a plan uses it in place of the automata for
+every search on text, including non-ASCII text where the lazy DFAs would give
+up and leave the search to the VM. Unicode word boundaries there are the same
+assertions the VM tests. Routes exist only under the default backtrack limit,
+whose limit errors the route already recovered. Only an unrecovered VM error
+on such text, such as a backtrack stack overflow, can therefore become the
+correct answer instead. In ASCII mode, where the VM classifies single bytes, a
+plan answers only searches that read ASCII alone, and patterns with
+alternatives or groups leave those searches to the automata.
 
 Unanchored portable searches, including `find`, captures, iteration and
 replacement, skip start positions where the program's leading literal or class

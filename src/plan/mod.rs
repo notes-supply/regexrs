@@ -1,24 +1,35 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
-//! Linear plans: forward search for regular patterns whose matches follow one
-//! deterministic path.
+//! Plans: one-pass forward search for regular patterns whose matches follow
+//! one deterministic path from each start.
 //!
-//! A plan is a sequence of literals and single-character runs, with capture
-//! boundaries anywhere and look-around assertions only at its ends, such that
-//! at most one way of matching exists from any start position: a run of
-//! variable length is never followed by a character it could also consume,
-//! and assertions after a run that could stop early fail wherever it would.
-//! The leftmost-first match is then the first candidate position where the
-//! sequence matches anchored, and greedy and lazy priorities coincide with
-//! maximal or minimal runs. No reverse search, automaton state or cache is
-//! needed. Patterns outside this shape keep their regex-automata engine.
+//! A plan is a program of literals, single-character runs, ordered
+//! alternations and optional or repeated groups, with capture boundaries
+//! anywhere and look-around assertions only at its ends. It is admitted only
+//! where the next character decides every choice. The characters that can
+//! begin each alternative, each further character of a run and each further
+//! repetition of a group are disjoint from those that can follow instead, and
+//! no alternative or repeated group can match nothing. Greedy and lazy
+//! priorities then differ only where the rest of the pattern can match
+//! nothing. There a lazy choice stops; a greedy one continues, after recording
+//! the position, and the capture slots that what follows could change, as the
+//! match to report if the continuation fails. That record is the last match a
+//! one-pass DFA keeps.
 //!
-//! Work stays linear in the haystack. An attempt that fails after an
-//! unbounded first run skips past that run, and a bounded first run is tried
+//! An attempt therefore reads forward only. It never returns to an earlier
+//! position or tries another alternative, and no search is handed to another
+//! engine. Assertions after a run or group stop the match only where its end
+//! is already decided. Patterns outside this shape keep their regex-automata
+//! engine, which no search through a plan consults.
+//!
+//! Work stays linear in the haystack. Candidate starts are tried left to
+//! right. Between an attempt's start, or the last match it recorded, and any
+//! point where it can fail, it reads at most [`RESCAN_BOUND`] bytes where
+//! another attempt could start. An unbounded first run, which a failed attempt
+//! skips, and unbounded runs or repetitions holding no character a match can
+//! start with do not count. So each byte is read by a bounded number of
+//! attempts, and the bytes read past a reported match obey the same bound,
+//! which keeps whole iterations linear as well. A bounded first run is tried
 //! once per maximal run of its class, from the starts that can reach its end.
-//! No later run that the attempt can fail after holds a character that can
-//! start a match, so only the bounded steps, which span at most
-//! [`RESCAN_BOUND`] bytes, can hold the start of another attempt that scans
-//! the same run again.
 //!
 //! Candidates come from the first literal, a literal at a fixed offset, a
 //! regex-automata prefilter, memchr over at most three bytes, a word-at-a-time
@@ -39,9 +50,9 @@ mod class;
 
 use class::{ByteRanges, Class, Stops, WORD_BYTE, bit128, char_boundary, class_units, has_byte};
 
-/// A regular pattern searched as one deterministic sequence of steps.
+/// A regular pattern searched as one deterministic program of steps.
 #[derive(Clone, Debug)]
-pub(crate) struct LinearPlan {
+pub(crate) struct Plan {
     steps: Box<[Step]>,
     /// Assertions tested where a candidate starts.
     leading: Box<[Look]>,
@@ -53,6 +64,9 @@ pub(crate) struct LinearPlan {
     required: Option<Box<memchr::memmem::Finder<'static>>>,
     /// A leading `\A`: only the search's start can begin a match.
     start_only: bool,
+    /// The pattern can match nothing, so a match starts wherever a search
+    /// does, unless it would end inside a character.
+    nullable: bool,
     /// The first consuming step is an unbounded run: an attempt that fails
     /// after it fails from every later start inside the same run.
     skip_first_run: bool,
@@ -64,9 +78,14 @@ pub(crate) struct LinearPlan {
     window: bool,
     /// How many steps decide whether a match exists. Every step after them
     /// can match nothing and no assertion follows, so a membership test stops
-    /// there, and without trailing assertions its last run only needs its
-    /// minimum.
+    /// there, and without trailing assertions its last run or group only
+    /// needs its minimum.
     decisive: usize,
+    /// The capture slots inside alternatives and groups, which a match need
+    /// not set: an attempt clears them first.
+    conditional: Box<[usize]>,
+    /// The program has an alternation or a group.
+    branching: bool,
     look_matcher: LookMatcher,
     /// The capture groups of the pattern, with their names.
     group_info: GroupInfo,
@@ -81,6 +100,10 @@ enum Step {
     Run(Run),
     /// Record the current position in this capture slot.
     Save(usize),
+    /// Ordered alternatives, of which the next character selects at most one.
+    Alt(Box<Alt>),
+    /// An optional or repeated group.
+    Group(Box<Group>),
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +112,7 @@ struct Run {
     min: usize,
     /// `usize::MAX` when unbounded.
     max: usize,
+    lazy: bool,
     /// Consume `min` characters only: a lazy run that nothing after it can
     /// fail. Every other run consumes as much as it can, which is also what a
     /// lazy run does when the next character must end it.
@@ -98,7 +122,41 @@ struct Run {
     stops: Option<Stops>,
 }
 
-/// The largest [`LinearPlan::nfa_units`] for which the meta engine's default
+#[derive(Clone, Debug)]
+struct Alt {
+    branches: Box<[Box<[Step]>]>,
+    /// The characters each branch starts with, pairwise disjoint.
+    firsts: Box<[Class]>,
+    /// The branch each byte selects, or [`NO_BRANCH`], when no two branches
+    /// start with the same byte.
+    by_byte: Option<Box<[u8; 256]>>,
+    /// The characters any branch starts with.
+    first: Class,
+}
+
+/// No branch of an alternation starts with this byte.
+const NO_BRANCH: u8 = u8::MAX;
+
+#[derive(Clone, Debug)]
+struct Group {
+    body: Box<[Step]>,
+    min: usize,
+    /// `usize::MAX` when unbounded.
+    max: usize,
+    greedy: bool,
+    /// The characters the body starts with.
+    first: Class,
+    /// The rest of the pattern can match nothing after each repetition from
+    /// the minimum on: a greedy group records each such position before
+    /// repeating, and a lazy one stops there.
+    tail: bool,
+    /// The slots that what follows a recorded position could change.
+    snapshot: Box<[usize]>,
+    /// The slots the rest of the pattern sets when it matches nothing.
+    completion: Box<[usize]>,
+}
+
+/// The largest [`Plan::nfa_units`] for which the meta engine's default
 /// NFA size limit certainly accepts the pattern, so its engine need not be
 /// built to find out. Against that limit, a unit of any component costs at
 /// most about 66 bytes (astral classes), so a pattern within the budget needs
@@ -107,9 +165,13 @@ struct Run {
 /// (optional characters) and 327,000 (captures, assertions, literal bytes).
 pub(crate) const NFA_UNIT_BUDGET: usize = 8192;
 
-/// The most bytes a plan's bounded steps may span when an attempt can fail,
-/// so each position is scanned by at most this many attempts.
+/// The most bytes where another attempt could start that an attempt may
+/// read, since it started or last recorded a match, before it fails; each
+/// position is then read by at most about this many attempts.
 const RESCAN_BOUND: usize = 64;
+
+/// The most capture slots a recorded match keeps.
+const SNAPSHOT: usize = 16;
 
 #[derive(Clone, Debug)]
 enum Candidates {
@@ -123,7 +185,7 @@ enum Candidates {
     Ranges(ByteRanges, Class),
     /// Every match holds this literal this many bytes after its start.
     Offset(Box<memchr::memmem::Finder<'static>>, usize),
-    /// The plan starts with a run of this class.
+    /// Every match starts with a character of this class.
     Class(Class),
 }
 
@@ -153,15 +215,84 @@ fn nfa_bound(hir: &Hir) -> usize {
         .fold(own, usize::saturating_add)
 }
 
-/// A flattened HIR element before admission.
-enum Item {
+/// A pattern element before admission.
+enum Node {
     Look(Look),
     Literal(Vec<u8>),
-    Run(Run, bool),
+    Run(Run),
     Save(usize),
+    Alt(Vec<Vec<Node>>),
+    Group {
+        body: Vec<Node>,
+        min: usize,
+        max: usize,
+        greedy: bool,
+    },
+}
+
+impl Run {
+    fn new(class: Class, min: usize, max: usize, greedy: bool) -> Run {
+        let stops = if max == usize::MAX {
+            class.stops()
+        } else {
+            None
+        };
+        Run {
+            class,
+            min,
+            max,
+            lazy: !greedy,
+            shortest: false,
+            stops,
+        }
+    }
 }
 
 impl Step {
+    /// The step for `node`, or `None` for an assertion or a shape the
+    /// program cannot take.
+    fn from_node(node: Node) -> Option<Step> {
+        Some(match node {
+            Node::Look(_) => return None,
+            Node::Literal(bytes) => Step::Literal(bytes.into_boxed_slice()),
+            Node::Run(run) => Step::Run(run),
+            Node::Save(slot) => Step::Save(slot),
+            Node::Alt(branches) => {
+                let branches = branches
+                    .into_iter()
+                    .map(|branch| Some(Step::sequence(branch)?.into_boxed_slice()))
+                    .collect::<Option<Vec<_>>>()?;
+                Step::Alt(Box::new(Alt::new(branches.into_boxed_slice())?))
+            }
+            Node::Group {
+                body,
+                min,
+                max,
+                greedy,
+            } => {
+                let body = Step::sequence(body)?;
+                // Every repetition consumes, so none can repeat forever.
+                let (Some(first), false) = starts(&body)? else {
+                    return None;
+                };
+                Step::Group(Box::new(Group {
+                    body: body.into_boxed_slice(),
+                    min,
+                    max,
+                    greedy,
+                    first,
+                    tail: false,
+                    snapshot: Box::new([]),
+                    completion: Box::new([]),
+                }))
+            }
+        })
+    }
+
+    fn sequence(nodes: Vec<Node>) -> Option<Vec<Step>> {
+        nodes.into_iter().map(Step::from_node).collect()
+    }
+
     /// The characters the step's first consumed character can be.
     fn first(&self) -> Option<Class> {
         match self {
@@ -171,25 +302,119 @@ impl Step {
             }
             Step::Run(run) => Some(run.class.clone()),
             Step::Save(_) => None,
+            Step::Alt(alt) => Some(alt.first.clone()),
+            Step::Group(group) => Some(group.first.clone()),
         }
     }
 
-    fn min_len(&self) -> usize {
+    /// Whether the step must consume a character.
+    fn consumes(&self) -> bool {
         match self {
-            Step::Literal(_) => 1,
-            Step::Run(run) => run.min,
-            Step::Save(_) => 0,
+            Step::Literal(_) | Step::Alt(_) => true,
+            Step::Run(run) => run.min > 0,
+            Step::Save(_) => false,
+            Step::Group(group) => group.min > 0,
         }
     }
+}
 
-    /// The most bytes the step consumes, when bounded.
-    fn max_len(&self) -> Option<usize> {
-        match self {
-            Step::Literal(bytes) => Some(bytes.len()),
-            Step::Run(run) if run.max == usize::MAX => None,
-            Step::Run(run) => Some(run.max.saturating_mul(run.class.max_len())),
-            Step::Save(_) => Some(0),
+/// The characters `steps` can start with, if any, and whether they can match
+/// nothing; `None` when those characters do not fit one class.
+fn starts(steps: &[Step]) -> Option<(Option<Class>, bool)> {
+    let mut first: Option<Class> = None;
+    for step in steps {
+        if let Some(class) = step.first() {
+            first = Some(match first {
+                Some(first) => first.union(&class)?,
+                None => class,
+            });
         }
+        if step.consumes() {
+            return Some((first, false));
+        }
+    }
+    Some((first, true))
+}
+
+/// Every capture slot `steps` save, at any depth.
+fn saves(steps: &[Step], slots: &mut Vec<usize>) {
+    for step in steps {
+        match step {
+            Step::Save(slot) => slots.push(*slot),
+            Step::Alt(alt) => {
+                for branch in &*alt.branches {
+                    saves(branch, slots);
+                }
+            }
+            Step::Group(group) => saves(&group.body, slots),
+            Step::Literal(_) | Step::Run(_) => {}
+        }
+    }
+}
+
+impl Alt {
+    /// Alternatives the next character chooses between, or `None` if one can
+    /// match nothing or two can start with the same character.
+    fn new(branches: Box<[Box<[Step]>]>) -> Option<Alt> {
+        let firsts = branches
+            .iter()
+            .map(|branch| match starts(branch)? {
+                (Some(first), false) => Some(first),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut table = Box::new([NO_BRANCH; 256]);
+        let mut by_byte = branches.len() < usize::from(NO_BRANCH);
+        for (index, first) in firsts.iter().enumerate() {
+            let bytes = first.first_bytes();
+            for b in 0..=255u8 {
+                if has_byte(&bytes, b) {
+                    by_byte &= table[usize::from(b)] == NO_BRANCH;
+                    table[usize::from(b)] = index as u8;
+                }
+            }
+        }
+        // Branches sharing a first byte need their characters compared, which
+        // only a few branches may.
+        if !by_byte {
+            if firsts.len() > 32 {
+                return None;
+            }
+            for (index, first) in firsts.iter().enumerate() {
+                if firsts[index + 1..]
+                    .iter()
+                    .any(|other| other.overlaps(first))
+                {
+                    return None;
+                }
+            }
+        }
+        let (head, rest) = firsts.split_first()?;
+        let first = rest
+            .iter()
+            .try_fold(head.clone(), |first, class| first.union(class))?;
+        Some(Alt {
+            branches,
+            firsts: firsts.into_boxed_slice(),
+            by_byte: by_byte.then_some(table),
+            first,
+        })
+    }
+
+    /// The branch the character at `at` selects.
+    #[inline]
+    fn branch(&self, haystack: &[u8], at: usize, end: usize) -> Option<&[Step]> {
+        let index = match &self.by_byte {
+            Some(table) => match table[usize::from(*haystack[..end].get(at)?)] {
+                NO_BRANCH => return None,
+                index => usize::from(index),
+            },
+            None => self
+                .firsts
+                .iter()
+                .position(|first| first.match_len(haystack, at, end).is_some())?,
+        };
+        Some(&self.branches[index])
     }
 }
 
@@ -237,118 +462,419 @@ fn ends_run(look: Look, run: &Run) -> bool {
     }
 }
 
-/// The classes that can follow the consuming step at `position`, up to the
-/// first step that cannot match nothing, and whether the match can end right
-/// after it.
-fn follow(steps: &[Step], consuming: &[usize], position: usize) -> Option<(Vec<Class>, bool)> {
-    let mut classes = Vec::new();
-    for &next in &consuming[position + 1..] {
-        classes.push(steps[next].first()?);
-        if steps[next].min_len() > 0 {
-            return Some((classes, false));
-        }
-    }
-    Some((classes, true))
-}
-
-/// Flatten `hir` into items, or `None` outside the linear shape.
+/// Flatten `hir` into nodes, or `None` outside the regular shapes a program
+/// can take.
 fn flatten(
     hir: &Hir,
-    items: &mut Vec<Item>,
+    nodes: &mut Vec<Node>,
     names: &mut Vec<(usize, Option<Box<str>>)>,
 ) -> Option<()> {
     match hir.kind() {
         HirKind::Empty => {}
-        HirKind::Literal(hir::Literal(bytes)) => match items.last_mut() {
-            Some(Item::Literal(previous)) => previous.extend_from_slice(bytes),
-            _ => items.push(Item::Literal(bytes.to_vec())),
+        HirKind::Literal(hir::Literal(bytes)) => match nodes.last_mut() {
+            Some(Node::Literal(previous)) => previous.extend_from_slice(bytes),
+            _ => nodes.push(Node::Literal(bytes.to_vec())),
         },
         HirKind::Class(class) => {
-            let run = Run {
-                class: Class::from_hir(class),
-                min: 1,
-                max: 1,
-                shortest: false,
-                stops: None,
-            };
-            items.push(Item::Run(run, true));
+            nodes.push(Node::Run(Run::new(Class::from_hir(class), 1, 1, true)));
         }
-        HirKind::Look(hir_look) => items.push(Item::Look(look(*hir_look))),
+        HirKind::Look(hir_look) => nodes.push(Node::Look(look(*hir_look))),
         HirKind::Repetition(repetition) => {
-            let class = match repetition.sub.kind() {
-                HirKind::Class(class) => Class::from_hir(class),
-                HirKind::Literal(hir::Literal(bytes)) => Class::from_literal(bytes)?,
-                _ => return None,
-            };
             let max = repetition.max.map_or(usize::MAX, |max| max as usize);
             if max == 0 {
                 return None;
             }
-            let stops = class.stops();
-            let run = Run {
-                class,
-                min: repetition.min as usize,
-                max,
-                shortest: false,
-                stops,
+            let (min, greedy) = (repetition.min as usize, repetition.greedy);
+            let class = match repetition.sub.kind() {
+                HirKind::Class(class) => Some(Class::from_hir(class)),
+                HirKind::Literal(hir::Literal(bytes)) => Class::from_literal(bytes),
+                _ => None,
             };
-            items.push(Item::Run(run, repetition.greedy));
+            match class {
+                Some(class) => nodes.push(Node::Run(Run::new(class, min, max, greedy))),
+                None => {
+                    let mut body = Vec::new();
+                    flatten(&repetition.sub, &mut body, names)?;
+                    nodes.push(Node::Group {
+                        body,
+                        min,
+                        max,
+                        greedy,
+                    });
+                }
+            }
         }
         HirKind::Capture(capture) => {
             let index = capture.index as usize;
             names.push((index, capture.name.clone()));
-            items.push(Item::Save(2 * index));
-            flatten(&capture.sub, items, names)?;
-            items.push(Item::Save(2 * index + 1));
+            nodes.push(Node::Save(2 * index));
+            flatten(&capture.sub, nodes, names)?;
+            nodes.push(Node::Save(2 * index + 1));
         }
         HirKind::Concat(subs) => {
             for sub in subs {
-                flatten(sub, items, names)?;
+                flatten(sub, nodes, names)?;
             }
         }
-        HirKind::Alternation(_) => return None,
+        HirKind::Alternation(subs) => {
+            let mut branches = Vec::with_capacity(subs.len());
+            for sub in subs {
+                let mut branch = Vec::new();
+                flatten(sub, &mut branch, names)?;
+                branches.push(branch);
+            }
+            nodes.push(Node::Alt(branches));
+        }
     }
     Some(())
 }
 
-impl LinearPlan {
-    /// The plan for `hir`, or `None` when its matches are not one
-    /// deterministic, linear path. With `prefilter`, a plan starting with a
-    /// short fixed sequence of classes looks for its prefixes with a
-    /// regex-automata prefilter, as the meta engine would.
-    pub(crate) fn new(hir: &Hir, prefilter: bool) -> Option<LinearPlan> {
+/// What can come after a step.
+#[derive(Clone)]
+struct Follow {
+    /// The characters that can come next, if any.
+    next: Option<Class>,
+    /// Whether the rest of the pattern can match nothing here: `None` where
+    /// that depends on how often an enclosing group has repeated.
+    end: Option<bool>,
+    /// The slots the rest of the pattern sets when it matches nothing, or
+    /// `None` for more than [`SNAPSHOT`].
+    completion: Option<Vec<usize>>,
+    /// The slots inside alternatives and groups in the rest of the pattern,
+    /// or `None` for more than [`SNAPSHOT`].
+    later: Option<Vec<usize>>,
+}
+
+impl Follow {
+    /// Whether a character of `class` could come next.
+    fn overlaps(&self, class: &Class) -> bool {
+        self.next.as_ref().is_some_and(|next| next.overlaps(class))
+    }
+
+    /// `class` can come next as well; `None` if the characters do not fit
+    /// one class.
+    fn add(&mut self, class: Class) -> Option<()> {
+        self.next = Some(match self.next.take() {
+            Some(next) => next.union(&class)?,
+            None => class,
+        });
+        Some(())
+    }
+}
+
+/// Add `slots` to a bounded list of slots.
+fn extend(list: &mut Option<Vec<usize>>, slots: impl IntoIterator<Item = usize>) {
+    if let Some(vec) = list {
+        vec.extend(slots);
+        if vec.len() > SNAPSHOT {
+            *list = None;
+        }
+    }
+}
+
+/// Admit `steps`, followed by `outer`, where the next character decides every
+/// choice: mark lazy runs that stop at their minimum and groups that record
+/// where they could stop. Returns what follows the step at `want`.
+fn admit(
+    steps: &mut [Step],
+    outer: &Follow,
+    trailing: &[Look],
+    want: Option<usize>,
+) -> Option<Option<Follow>> {
+    let mut wanted = None;
+    let mut follow = outer.clone();
+    for index in (0..steps.len()).rev() {
+        if want == Some(index) {
+            wanted = Some(follow.clone());
+        }
+        admit_step(&mut steps[index], &follow, trailing)?;
+        let step = &steps[index];
+        if let Step::Save(slot) = step {
+            extend(&mut follow.completion, [*slot]);
+            continue;
+        }
+        let mut nested = Vec::new();
+        saves(core::slice::from_ref(step), &mut nested);
+        extend(&mut follow.later, nested);
+        let first = step.first()?;
+        if step.consumes() {
+            follow = Follow {
+                next: Some(first),
+                end: Some(false),
+                completion: Some(Vec::new()),
+                later: Some(Vec::new()),
+            };
+        } else {
+            follow.add(first)?;
+        }
+    }
+    Some(wanted)
+}
+
+fn admit_step(step: &mut Step, follow: &Follow, trailing: &[Look]) -> Option<()> {
+    match step {
+        Step::Literal(_) | Step::Save(_) => {}
+        Step::Run(run) => {
+            if run.min != run.max {
+                if follow.overlaps(&run.class) {
+                    return None;
+                }
+                match follow.end {
+                    Some(true) => {
+                        if !trailing.is_empty() && !trailing.iter().any(|&look| ends_run(look, run))
+                        {
+                            return None;
+                        }
+                        run.shortest = run.lazy && trailing.is_empty();
+                    }
+                    None if run.lazy || !trailing.is_empty() => return None,
+                    _ => {}
+                }
+            }
+        }
+        Step::Alt(alt) => {
+            for branch in alt.branches.iter_mut() {
+                admit(branch, follow, trailing, None)?;
+            }
+        }
+        Step::Group(group) => {
+            let choice = group.min != group.max;
+            if choice && follow.overlaps(&group.first) {
+                return None;
+            }
+            let mut inner = follow.clone();
+            if group.max > 1 {
+                inner.add(group.first.clone())?;
+            }
+            let mut nested = Vec::new();
+            saves(&group.body, &mut nested);
+            extend(&mut inner.later, nested);
+            inner.end = match follow.end {
+                Some(true) if group.min <= 1 => Some(true),
+                Some(false) => Some(false),
+                _ => None,
+            };
+            let later = inner.later.clone();
+            admit(&mut group.body, &inner, trailing, None)?;
+            if choice {
+                match follow.end {
+                    Some(true) => {
+                        // A lazy group would stop wherever the assertions hold.
+                        if !group.greedy && !trailing.is_empty() {
+                            return None;
+                        }
+                        group.tail = true;
+                        group.snapshot = later?.into_boxed_slice();
+                        group.completion = follow.completion.clone()?.into_boxed_slice();
+                    }
+                    None => return None,
+                    Some(false) => {}
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// How a sequence changes an attempt's exposure: the bytes it has read where
+/// another attempt could start, since it started or last recorded a match.
+/// From exposure `x` it leaves at most `max(x + add, floor)`, and it reads at
+/// most [`RESCAN_BOUND`] such bytes before each point where it can fail as
+/// long as `x <= limit`. `usize::MAX` stands for unbounded.
+#[derive(Clone, Copy)]
+struct Exposure {
+    add: usize,
+    floor: usize,
+    limit: usize,
+}
+
+impl Exposure {
+    const NONE: Exposure = Exposure {
+        add: 0,
+        floor: 0,
+        limit: usize::MAX,
+    };
+
+    /// Reading `add` such bytes, with a point where the attempt can fail
+    /// after `fails_after` of them.
+    fn read(add: usize, fails_after: Option<usize>) -> Option<Exposure> {
+        let limit = match fails_after {
+            Some(read) => RESCAN_BOUND.checked_sub(read)?,
+            None => usize::MAX,
+        };
+        Some(Exposure {
+            add,
+            floor: 0,
+            limit,
+        })
+    }
+
+    /// `self`, then `next`.
+    fn then(self, next: Exposure) -> Option<Exposure> {
+        let limit = if next.limit == usize::MAX {
+            self.limit
+        } else if self.floor > next.limit {
+            return None;
+        } else {
+            self.limit.min(next.limit.checked_sub(self.add)?)
+        };
+        Some(Exposure {
+            add: self.add.saturating_add(next.add),
+            floor: self.floor.saturating_add(next.add).max(next.floor),
+            limit,
+        })
+    }
+
+    /// One of two alternatives.
+    fn or(self, other: Exposure) -> Exposure {
+        Exposure {
+            add: self.add.max(other.add),
+            floor: self.floor.max(other.floor),
+            limit: self.limit.min(other.limit),
+        }
+    }
+
+    /// `count` repetitions of `self`.
+    fn times(self, count: usize) -> Option<Exposure> {
+        let Some(more) = count.checked_sub(1) else {
+            return Some(Exposure::NONE);
+        };
+        let limit = if self.limit == usize::MAX {
+            usize::MAX
+        } else {
+            if more > 0 && self.floor.saturating_add(self.add.saturating_mul(more - 1)) > self.limit
+            {
+                return None;
+            }
+            self.limit.checked_sub(self.add.saturating_mul(more))?
+        };
+        Some(Exposure {
+            add: self.add.saturating_mul(count),
+            floor: self.floor.saturating_add(self.add.saturating_mul(more)),
+            limit,
+        })
+    }
+
+    /// Any number of repetitions of `self`.
+    fn repeated(self) -> Option<Exposure> {
+        if self.add == 0 {
+            // Every repetition after the first leaves the same exposure.
+            return self.times(2);
+        }
+        (self.limit == usize::MAX).then_some(Exposure {
+            add: usize::MAX,
+            floor: usize::MAX,
+            limit: usize::MAX,
+        })
+    }
+}
+
+/// What bounds rescans in a program.
+struct Rescan<'a> {
+    /// The characters a match can start with.
+    first: &'a Class,
+    /// Assertions follow the program, so a group records a match only where
+    /// they hold.
+    trailing: bool,
+    /// The top-level index of an unbounded first run a failure skips.
+    skip: Option<usize>,
+    /// The top-level index of a first literal the candidates confirm.
+    confirmed: Option<usize>,
+}
+
+impl Rescan<'_> {
+    /// The exposure of `steps`, at the top level when `top`, or `None` where
+    /// an attempt could read more than [`RESCAN_BOUND`] bytes where another
+    /// could start before failing.
+    fn sequence(&self, steps: &[Step], top: bool) -> Option<Exposure> {
+        steps
+            .iter()
+            .enumerate()
+            .try_fold(Exposure::NONE, |exposure, (index, step)| {
+                exposure.then(self.step(step, top.then_some(index))?)
+            })
+    }
+
+    fn step(&self, step: &Step, index: Option<usize>) -> Option<Exposure> {
+        match step {
+            Step::Save(_) => Some(Exposure::NONE),
+            Step::Literal(bytes) => {
+                let held = (0..bytes.len())
+                    .any(|at| self.first.match_len(bytes, at, bytes.len()).is_some());
+                let held = if held { bytes.len() } else { 0 };
+                let fails = index.is_none() || index != self.confirmed;
+                Exposure::read(held, fails.then_some(held))
+            }
+            Step::Run(run) => {
+                let held = run.class.overlaps(self.first);
+                let width = if held { run.class.max_len() } else { 0 };
+                let fails_after = (run.min > 0).then(|| run.min.saturating_mul(width));
+                let add = if run.max != usize::MAX {
+                    run.max.saturating_mul(width)
+                } else if !held || index.is_some() && index == self.skip {
+                    0
+                } else {
+                    usize::MAX
+                };
+                Exposure::read(add, fails_after)
+            }
+            Step::Alt(alt) => {
+                let mut branches: Option<Exposure> = None;
+                for branch in &*alt.branches {
+                    let exposure = self.sequence(branch, false)?;
+                    branches = Some(branches.map_or(exposure, |other| other.or(exposure)));
+                }
+                // Choosing a branch can fail on the first character.
+                Exposure::read(0, Some(0))?.then(branches?)
+            }
+            Step::Group(group) => {
+                let body = self.sequence(&group.body, false)?;
+                let further = if group.max == group.min {
+                    Exposure::NONE
+                } else if group.tail && !self.trailing {
+                    // Each further repetition starts at a recorded match.
+                    Exposure {
+                        add: 0,
+                        floor: body.add.max(body.floor),
+                        limit: usize::MAX,
+                    }
+                } else if group.max == usize::MAX {
+                    body.repeated()?
+                } else {
+                    body.times(group.max - group.min)?
+                };
+                body.times(group.min)?.then(further)
+            }
+        }
+    }
+}
+
+impl Plan {
+    /// The plan for `hir`, or `None` when its matches do not follow one
+    /// deterministic path the next character decides. With `prefilter`, a
+    /// plan starting with alternatives, a group or a short fixed sequence of
+    /// classes looks for its prefixes with a regex-automata prefilter, as the
+    /// meta engine would.
+    pub(crate) fn new(hir: &Hir, prefilter: bool) -> Option<Plan> {
         // Unicode word boundaries without their data tables: the engines
         // refuse to build, and the look-around matcher would panic.
         if hir.properties().look_set().contains_word_unicode() {
             LookSet::singleton(Look::WordUnicode).available().ok()?;
         }
-        let mut items = Vec::new();
+        let mut nodes = Vec::new();
         let mut names = Vec::new();
-        flatten(hir, &mut items, &mut names)?;
-        let consuming = |item: &Item| matches!(item, Item::Literal(_) | Item::Run(..));
-        let first = items.iter().position(consuming)?;
-        let last = items.iter().rposition(consuming)?;
+        flatten(hir, &mut nodes, &mut names)?;
+        let consuming = |node: &Node| !matches!(node, Node::Look(_) | Node::Save(_));
+        let first_node = nodes.iter().position(consuming)?;
+        let last_node = nodes.iter().rposition(consuming)?;
         let mut leading = Vec::new();
         let mut trailing = Vec::new();
         let mut steps = Vec::new();
-        let mut greedy = Vec::new();
-        for (index, item) in items.into_iter().enumerate() {
-            match item {
-                Item::Look(look) if index < first => leading.push(look),
-                Item::Look(look) if index > last => trailing.push(look),
-                Item::Look(_) => return None,
-                Item::Literal(bytes) => {
-                    steps.push(Step::Literal(bytes.into_boxed_slice()));
-                    greedy.push(true);
-                }
-                Item::Run(run, is_greedy) => {
-                    steps.push(Step::Run(run));
-                    greedy.push(is_greedy);
-                }
-                Item::Save(slot) => {
-                    steps.push(Step::Save(slot));
-                    greedy.push(true);
-                }
+        for (index, node) in nodes.into_iter().enumerate() {
+            match node {
+                Node::Look(look) if index < first_node => leading.push(look),
+                Node::Look(look) if index > last_node => trailing.push(look),
+                node => steps.push(Step::from_node(node)?),
             }
         }
         let start_only = leading.contains(&Look::Start);
@@ -356,63 +882,35 @@ impl LinearPlan {
         if trailing.contains(&Look::End) && !start_only {
             return None;
         }
-        let consuming: Vec<usize> = (0..steps.len())
-            .filter(|&i| !matches!(steps[i], Step::Save(_)))
-            .collect();
-        let (&first, &last) = (consuming.first()?, consuming.last()?);
-        if steps[first].min_len() == 0 {
-            return None;
-        }
-        let first_class = steps[first].first()?;
-        for (position, &index) in consuming.iter().enumerate() {
-            let Step::Run(run) = &steps[index] else {
-                continue;
-            };
-            if run.min == run.max {
-                continue;
-            }
-            let (follow, can_end) = follow(&steps, &consuming, position)?;
-            if follow.iter().any(|class| class.overlaps(&run.class)) {
-                return None;
-            }
-            if can_end && !trailing.is_empty() && !trailing.iter().any(|&look| ends_run(look, run))
-            {
-                return None;
-            }
-            let fails_after = !can_end || !trailing.is_empty();
-            if index != first && fails_after && run.class.overlaps(&first_class) {
-                return None;
-            }
-            let shortest = can_end && trailing.is_empty() && !greedy[index];
-            if let Step::Run(run) = &mut steps[index] {
-                run.shortest = shortest;
-            }
-        }
-        let can_fail = consuming.len() > 1
-            || !leading.is_empty()
-            || !trailing.is_empty()
-            || !matches!(steps[first], Step::Literal(_));
-        let rescan = consuming
+        let first = steps
             .iter()
-            .filter_map(|&index| steps[index].max_len())
-            .fold(0, usize::saturating_add);
-        if can_fail && rescan > RESCAN_BOUND {
+            .position(|step| !matches!(step, Step::Save(_)))?;
+        let (first_class, nullable) = starts(&steps)?;
+        let first_class = first_class?;
+        // Assertions would decide where a match that can be empty starts.
+        if nullable && (!leading.is_empty() || !trailing.is_empty()) {
             return None;
         }
+        let outer = Follow {
+            next: None,
+            end: Some(true),
+            completion: Some(Vec::new()),
+            later: Some(Vec::new()),
+        };
+        let first_follow = admit(&mut steps, &outer, &trailing, Some(first))??;
         let decisive = if trailing.is_empty() {
-            consuming
+            steps
                 .iter()
-                .rposition(|&index| steps[index].min_len() > 0)
-                .map_or(last, |position| consuming[position])
-                + 1
+                .rposition(Step::consumes)
+                .map_or(0, |index| index + 1)
         } else {
             steps.len()
         };
-        let required = consuming[1..]
+        let required = steps[first + 1..]
             .iter()
-            .filter_map(|&index| match &steps[index] {
+            .filter_map(|step| match step {
                 Step::Literal(bytes) => Some(bytes),
-                Step::Run(_) | Step::Save(_) => None,
+                _ => None,
             })
             // The last of the longest, like the suffix a reverse search uses.
             .max_by_key(|bytes| bytes.len())
@@ -421,8 +919,8 @@ impl LinearPlan {
         // from every match start, so its occurrences give the candidates.
         let mut offset = 0;
         let mut inner: Option<(usize, &[u8])> = None;
-        for &index in &consuming {
-            match &steps[index] {
+        for (index, step) in steps.iter().enumerate().skip(first) {
+            match step {
                 Step::Literal(bytes) => {
                     if index != first && inner.is_none_or(|(_, best)| bytes.len() > best.len()) {
                         inner = Some((offset, bytes));
@@ -432,7 +930,7 @@ impl LinearPlan {
                 Step::Run(run) if run.min == run.max && run.class.max_len() == 1 => {
                     offset += run.min;
                 }
-                Step::Run(_) | Step::Save(_) => break,
+                _ => break,
             }
         }
         let candidates = match (&steps[first], inner) {
@@ -440,43 +938,68 @@ impl LinearPlan {
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
             ),
-            (step, _) => match step {
-                Step::Literal(bytes) => {
-                    Candidates::Literal(Box::new(memchr::memmem::Finder::new(bytes).into_owned()))
+            (Step::Literal(bytes), _) => {
+                Candidates::Literal(Box::new(memchr::memmem::Finder::new(bytes).into_owned()))
+            }
+            (step, _) => {
+                let fixed = match step {
+                    Step::Run(run) => run.min == run.max,
+                    _ => true,
+                };
+                let prefilter = if prefilter && fixed && !nullable {
+                    Prefilter::from_hir_prefix(MatchKind::LeftmostFirst, hir)
+                        .filter(Prefilter::is_fast)
+                } else {
+                    None
+                };
+                let first_bytes = first_class.first_bytes();
+                let mut bytes = (0..=255u8).filter(|&b| has_byte(&first_bytes, b));
+                match (prefilter, Stops::of(&mut bytes)) {
+                    (Some(prefilter), _) => Candidates::Prefilter(prefilter),
+                    (None, Some(stops)) => Candidates::Bytes(stops),
+                    (None, None) => match ByteRanges::of(&first_bytes) {
+                        Some(ranges) => Candidates::Ranges(ranges, first_class.clone()),
+                        None => Candidates::Class(first_class.clone()),
+                    },
                 }
-                Step::Run(run) => {
-                    let prefilter = if prefilter && run.min == run.max {
-                        Prefilter::from_hir_prefix(MatchKind::LeftmostFirst, hir)
-                            .filter(Prefilter::is_fast)
-                    } else {
-                        None
-                    };
-                    let first_bytes = run.class.first_bytes();
-                    let mut bytes = (0..=255u8).filter(|&b| has_byte(&first_bytes, b));
-                    match (prefilter, Stops::of(&mut bytes)) {
-                        (Some(prefilter), _) => Candidates::Prefilter(prefilter),
-                        (None, Some(stops)) => Candidates::Bytes(stops),
-                        (None, None) => match ByteRanges::of(&first_bytes) {
-                            Some(ranges) => Candidates::Ranges(ranges, run.class.clone()),
-                            None => Candidates::Class(run.class.clone()),
-                        },
-                    }
-                }
-                Step::Save(_) => return None,
-            },
+            }
         };
         let skip_first_run = matches!(&steps[first], Step::Run(run) if run.max == usize::MAX);
+        let rescan = Rescan {
+            first: &first_class,
+            trailing: !trailing.is_empty(),
+            skip: skip_first_run.then_some(first),
+            confirmed: matches!(candidates, Candidates::Literal(_)).then_some(first),
+        };
+        // A search tries one start when only its start can begin a match.
+        if !start_only {
+            let exposure = rescan.sequence(&steps, true)?;
+            if !trailing.is_empty() {
+                // The assertions can fail where the last step ends.
+                exposure.then(Exposure::read(0, Some(0))?)?;
+            }
+        }
         let window = !matches!(candidates, Candidates::Offset(..))
             && match &steps[first] {
                 // Retrying shorter runs costs little more than a window.
-                Step::Run(run) if run.max != usize::MAX && run.max > 2 && !run.shortest => {
-                    let (follow, can_end) = follow(&steps, &consuming, 0)?;
+                Step::Run(run)
+                    if run.max != usize::MAX && run.max > 2 && run.min > 0 && !run.shortest =>
+                {
+                    let can_end = first_follow.end == Some(true);
                     (!can_end || !trailing.is_empty())
-                        && !follow.iter().any(|class| class.overlaps(&run.class))
+                        && !first_follow.overlaps(&run.class)
                         && (!can_end || trailing.iter().any(|&look| ends_run(look, run)))
                 }
-                Step::Literal(_) | Step::Run(_) | Step::Save(_) => false,
+                _ => false,
             };
+        let mut conditional = Vec::new();
+        let mut branching = false;
+        for step in &steps {
+            if matches!(step, Step::Alt(_) | Step::Group(_)) {
+                branching = true;
+                saves(core::slice::from_ref(step), &mut conditional);
+            }
+        }
         let nfa_units = nfa_bound(hir);
         let mut group_names = Vec::new();
         group_names.resize(hir.properties().explicit_captures_len() + 1, None);
@@ -484,17 +1007,20 @@ impl LinearPlan {
             *group_names.get_mut(index)? = name;
         }
         let group_info = GroupInfo::new([group_names]).ok()?;
-        Some(LinearPlan {
+        Some(Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
             trailing: trailing.into_boxed_slice(),
             candidates,
             required,
             start_only,
+            nullable,
             skip_first_run,
             first,
             window,
             decisive,
+            conditional: conditional.into_boxed_slice(),
+            branching,
             look_matcher: LookMatcher::new(),
             group_info,
             nfa_units,
@@ -504,6 +1030,12 @@ impl LinearPlan {
     /// [`nfa_bound`] of the pattern, compared with [`NFA_UNIT_BUDGET`].
     pub(crate) fn nfa_units(&self) -> usize {
         self.nfa_units
+    }
+
+    /// Whether the program has alternatives or groups, which can read past
+    /// the end of the match they report.
+    pub(crate) fn branching(&self) -> bool {
+        self.branching
     }
 
     /// Capture storage laid out as the meta engine's for the same pattern.
@@ -589,7 +1121,7 @@ impl LinearPlan {
                 .map_or(end, |offset| at + offset);
             return (stop, usize::from(stop > at));
         }
-        LinearPlan::take(run, haystack, at, end, run.max)
+        Plan::take(run, haystack, at, end, run.max)
     }
 
     /// The end of the run from `at` of at most `limit` members, and how many
@@ -677,10 +1209,118 @@ impl LinearPlan {
         }
     }
 
-    /// Match the steps anchored at `start`, recording capture slots when
+    /// Whether every trailing assertion holds at `at`.
+    #[inline]
+    fn trailing_hold(&self, haystack: &[u8], at: usize) -> bool {
+        self.trailing
+            .iter()
+            .all(|&look| self.look_at(look, haystack, at))
+    }
+
+    /// Match `steps` from `state.pos`.
+    #[inline]
+    fn sequence<'p, S: Slots + ?Sized>(
+        &'p self,
+        steps: &'p [Step],
+        input: &PlanInput<'_>,
+        state: &mut State<'p, '_, S>,
+        earliest: bool,
+    ) -> Result<(), Stop> {
+        for step in steps {
+            self.step(step, input, state, earliest)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn step<'p, S: Slots + ?Sized>(
+        &'p self,
+        step: &'p Step,
+        input: &PlanInput<'_>,
+        state: &mut State<'p, '_, S>,
+        earliest: bool,
+    ) -> Result<(), Stop> {
+        let (haystack, end) = (input.haystack, input.end);
+        match step {
+            Step::Literal(bytes) => {
+                if !haystack
+                    .get(state.pos..end)
+                    .is_some_and(|rest| rest.starts_with(bytes))
+                {
+                    return Err(Stop::Fail);
+                }
+                state.pos += bytes.len();
+            }
+            Step::Run(run) => {
+                let (stop, count) = if run.shortest {
+                    Plan::take(run, haystack, state.pos, end, run.min)
+                } else {
+                    Plan::scan(run, haystack, state.pos, end, input.utf8)
+                };
+                if count < run.min {
+                    return Err(Stop::Fail);
+                }
+                state.pos = stop;
+            }
+            Step::Save(slot) => {
+                if let Some(slots) = state.slots.as_deref_mut() {
+                    slots.set(*slot, state.pos);
+                }
+            }
+            Step::Alt(alt) => {
+                let branch = alt.branch(haystack, state.pos, end).ok_or(Stop::Fail)?;
+                self.sequence(branch, input, state, earliest)?;
+            }
+            Step::Group(group) => self.group(group, input, state, earliest, false)?,
+        }
+        Ok(())
+    }
+
+    /// Repeat `group` as the next character decides, at most its minimum
+    /// number of times when `decided`. Where the rest of the pattern could
+    /// match nothing, a greedy group records the position before repeating
+    /// and a lazy one stops.
+    fn group<'p, S: Slots + ?Sized>(
+        &'p self,
+        group: &'p Group,
+        input: &PlanInput<'_>,
+        state: &mut State<'p, '_, S>,
+        earliest: bool,
+        decided: bool,
+    ) -> Result<(), Stop> {
+        let (haystack, end) = (input.haystack, input.end);
+        let limit = if decided { group.min } else { group.max };
+        let mut count = 0;
+        while count < limit {
+            if count >= group.min {
+                if group.tail {
+                    if !group.greedy {
+                        break;
+                    }
+                    let ends = self.trailing_hold(haystack, state.pos);
+                    if ends && earliest {
+                        return Err(Stop::Found(state.pos));
+                    }
+                    if group.first.match_len(haystack, state.pos, end).is_none() {
+                        break;
+                    }
+                    if ends {
+                        state.record(group);
+                    }
+                } else if group.first.match_len(haystack, state.pos, end).is_none() {
+                    break;
+                }
+            }
+            self.sequence(&group.body, input, state, earliest)?;
+            count += 1;
+        }
+        Ok(())
+    }
+
+    /// Match the program anchored at `start`, recording capture slots when
     /// given. A membership test only runs the decisive steps. On failure,
     /// [`LOOK_MISS`] if a leading assertion failed, else where the first run
-    /// ended, or `start` when the first step is a literal.
+    /// ended, or `start` when the first step is not a run.
     #[inline]
     fn attempt<S: Slots + ?Sized>(
         &self,
@@ -697,55 +1337,57 @@ impl LinearPlan {
         {
             return Err(LOOK_MISS);
         }
+        if let Some(slots) = slots.as_deref_mut() {
+            for &slot in &*self.conditional {
+                slots.clear(slot);
+            }
+        }
         let steps = if earliest {
             &self.steps[..self.decisive]
         } else {
             &self.steps[..]
         };
-        let mut pos = start;
+        let mut state = State {
+            pos: start,
+            slots,
+            accept: None,
+            saved: None,
+        };
         let mut first_run_end = start;
+        let mut outcome = Ok(());
         for (index, step) in steps.iter().enumerate() {
-            match step {
-                Step::Literal(bytes) => {
-                    if !haystack
-                        .get(pos..end)
-                        .is_some_and(|rest| rest.starts_with(bytes))
-                    {
-                        return Err(first_run_end);
-                    }
-                    pos += bytes.len();
-                }
+            let decided = earliest && index + 1 == self.decisive && self.trailing.is_empty();
+            outcome = match step {
                 Step::Run(run) => {
-                    let decided =
-                        earliest && index + 1 == self.decisive && self.trailing.is_empty();
                     let (stop, count) = if run.shortest || decided {
-                        LinearPlan::take(run, haystack, pos, end, run.min)
+                        Plan::take(run, haystack, state.pos, end, run.min)
                     } else {
-                        LinearPlan::scan(run, haystack, pos, end, input.utf8)
+                        Plan::scan(run, haystack, state.pos, end, input.utf8)
                     };
                     if index == self.first {
                         first_run_end = stop;
                     }
+                    state.pos = stop;
                     if count < run.min {
-                        return Err(first_run_end);
-                    }
-                    pos = stop;
-                }
-                Step::Save(slot) => {
-                    if let Some(slots) = slots.as_deref_mut() {
-                        slots.set(*slot, pos);
+                        Err(Stop::Fail)
+                    } else {
+                        Ok(())
                     }
                 }
+                Step::Group(group) => self.group(group, input, &mut state, earliest, decided),
+                step => self.step(step, input, &mut state, earliest),
+            };
+            if outcome.is_err() {
+                break;
             }
         }
-        if !self
-            .trailing
-            .iter()
-            .all(|&look| self.look_at(look, haystack, pos))
-        {
-            return Err(first_run_end);
+        #[cfg(all(test, feature = "std"))]
+        tests::COVERED.with(|covered| covered.set(covered.get() + state.pos - start + 1));
+        match outcome {
+            Ok(()) if self.trailing_hold(haystack, state.pos) => Ok(state.pos),
+            Err(Stop::Found(at)) => Ok(at),
+            _ => state.fall_back().ok_or(first_run_end),
         }
-        Ok(pos)
     }
 
     /// The leftmost-first match among the starts inside the maximal run of
@@ -761,7 +1403,7 @@ impl LinearPlan {
             unreachable!("a window plan starts with a run");
         };
         let (haystack, end) = (input.haystack, input.end);
-        let (run_end, total) = LinearPlan::take(run, haystack, candidate, end, usize::MAX);
+        let (run_end, total) = Plan::take(run, haystack, candidate, end, usize::MAX);
         let resume = run_end.max(candidate + 1);
         // A start leaving more than `max` members after it stops before
         // another member, which nothing after the run can continue.
@@ -814,6 +1456,9 @@ impl LinearPlan {
         mut slots: Option<&mut S>,
     ) -> Option<(usize, usize)> {
         let start = input.start;
+        if self.nullable {
+            return self.search_empty(input, earliest, slots);
+        }
         if input.anchored || self.start_only {
             let found = self.attempt(input, start, earliest, slots);
             return found.ok().map(|match_end| (start, match_end));
@@ -845,6 +1490,32 @@ impl LinearPlan {
         }
     }
 
+    /// `search` for a pattern that can match nothing, which matches where the
+    /// search starts. A match ending inside a character is not reported: as
+    /// the meta engine does, an unanchored search then starts again a byte
+    /// later.
+    #[inline(never)]
+    fn search_empty<S: Slots + ?Sized>(
+        &self,
+        input: &PlanInput<'_>,
+        earliest: bool,
+        mut slots: Option<&mut S>,
+    ) -> Option<(usize, usize)> {
+        let mut start = input.start;
+        loop {
+            let end = self
+                .attempt(input, start, earliest, slots.as_deref_mut())
+                .ok()?;
+            if char_boundary(input.haystack, end) {
+                return Some((start, end));
+            }
+            if input.anchored || start >= input.end {
+                return None;
+            }
+            start += 1;
+        }
+    }
+
     /// `search` for a plan whose first step is a bounded run, one maximal
     /// run of its class at a time.
     #[inline(never)]
@@ -866,6 +1537,68 @@ impl LinearPlan {
     }
 }
 
+/// How an attempt stopped short of the end of the program.
+enum Stop {
+    /// It cannot match from its start, unless it recorded a match before.
+    Fail,
+    /// A membership test reached a point where a match ends.
+    Found(usize),
+}
+
+/// A match an attempt reports if what follows fails: where a greedy group
+/// could have stopped repeating.
+struct Accept<'p> {
+    group: &'p Group,
+    at: usize,
+}
+
+/// An attempt in progress.
+struct State<'p, 's, S: Slots + ?Sized> {
+    pos: usize,
+    slots: Option<&'s mut S>,
+    accept: Option<Accept<'p>>,
+    /// The values of the recorded group's snapshot slots, `usize::MAX` for
+    /// none, when slots are recorded.
+    saved: Option<[usize; SNAPSHOT]>,
+}
+
+impl<'p, S: Slots + ?Sized> State<'p, '_, S> {
+    /// Record the current position as where `group` could stop.
+    #[inline]
+    fn record(&mut self, group: &'p Group) {
+        if let Some(slots) = self.slots.as_deref() {
+            let saved = self.saved.get_or_insert([usize::MAX; SNAPSHOT]);
+            for (value, &slot) in saved.iter_mut().zip(&*group.snapshot) {
+                *value = slots.get(slot).unwrap_or(usize::MAX);
+            }
+        }
+        self.accept = Some(Accept {
+            group,
+            at: self.pos,
+        });
+    }
+
+    /// The recorded match, with the slots restored to what they were and
+    /// those the rest of the pattern sets when it matches nothing.
+    fn fall_back(&mut self) -> Option<usize> {
+        let Accept { group, at } = self.accept.take()?;
+        if let Some(slots) = self.slots.as_deref_mut() {
+            if let Some(saved) = &self.saved {
+                for (&value, &slot) in saved.iter().zip(&*group.snapshot) {
+                    match value {
+                        usize::MAX => slots.clear(slot),
+                        value => slots.set(slot, value),
+                    }
+                }
+            }
+            for &slot in &*group.completion {
+                slots.set(slot, at);
+            }
+        }
+        Some(at)
+    }
+}
+
 /// An attempt's failure at a leading assertion, which says nothing about
 /// later starts.
 const LOOK_MISS: usize = usize::MAX;
@@ -884,31 +1617,58 @@ pub(crate) struct PlanInput<'h> {
 /// Capture slot storage a plan fills: regex-automata's, or the VM's layout.
 pub(crate) trait Slots {
     fn set(&mut self, slot: usize, at: usize);
+    fn get(&self, slot: usize) -> Option<usize>;
+    fn clear(&mut self, slot: usize);
 }
 
 impl Slots for [Option<NonMaxUsize>] {
     fn set(&mut self, slot: usize, at: usize) {
         self[slot] = NonMaxUsize::new(at);
     }
+
+    fn get(&self, slot: usize) -> Option<usize> {
+        self[slot].map(NonMaxUsize::get)
+    }
+
+    fn clear(&mut self, slot: usize) {
+        self[slot] = None;
+    }
 }
 
+/// `usize::MAX` marks a group that did not take part.
 impl Slots for [usize] {
     fn set(&mut self, slot: usize, at: usize) {
         self[slot] = at;
+    }
+
+    fn get(&self, slot: usize) -> Option<usize> {
+        Some(self[slot]).filter(|&at| at != usize::MAX)
+    }
+
+    fn clear(&mut self, slot: usize) {
+        self[slot] = usize::MAX;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LinearPlan, NFA_UNIT_BUDGET};
+    use super::{NFA_UNIT_BUDGET, Plan, PlanInput, RESCAN_BOUND};
 
-    fn plan(pattern: &str) -> Option<LinearPlan> {
-        LinearPlan::new(&regex_syntax::parse(pattern).unwrap(), true)
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        /// The bytes attempts have read past their starts, plus one each.
+        pub(super) static COVERED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    fn plan(pattern: &str) -> Option<Plan> {
+        Plan::new(&regex_syntax::parse(pattern).unwrap(), true)
     }
 
     /// Shapes the plan takes, and those it leaves to an engine: overlapping
-    /// follows, assertions a shorter run could satisfy, rescans beyond the
-    /// bound, and end anchors a reverse search finds sooner.
+    /// follows, assertions a shorter run could satisfy, choices the next
+    /// character cannot decide, alternatives or repetitions that can match
+    /// nothing, rescans beyond the bound, and end anchors a reverse search
+    /// finds sooner.
     #[test]
     fn admission_follows_shape_rules() {
         for pattern in [
@@ -922,6 +1682,19 @@ mod tests {
             r"\d{4}-\d{2}-\d{2}",
             "a{1,3}b*c",
             r"\w+:\s*\w+",
+            r"\w*",
+            "ab|cd",
+            "Holmes|Watson|Lestrade",
+            r"\b(?:fn|let|mut)\b",
+            "(?i)holmes|watson",
+            "(?:ab)+",
+            "(?:ab){2,}",
+            "colou?r",
+            "(a)?(b*)",
+            r"(\d+)(?:\.(\d+))?",
+            r"\w+(?:\.\w+)*",
+            "(?:foo|bar)(?:baz)?",
+            "x(?:ab)*?y",
         ] {
             assert!(plan(pattern).is_some(), "{pattern}");
         }
@@ -931,12 +1704,18 @@ mod tests {
             r"(?m)[^a]+$",
             "[a-z]+?x",
             r"\d+$",
-            r"\w*",
-            "ab|cd",
-            "(?:ab)+",
             "a{1,70}b",
             r"\w+-\w+-x",
             r"x[a-z]*\d",
+            "ab|ac",
+            "(a|ab)c",
+            "(?:a|)b",
+            "(?:a*)*",
+            "(?:ab)*a",
+            r"x(?:ab)*?\b",
+            "(?:foo|bar)+qux",
+            "a(?:ba)*c",
+            r"\b(?:ab)*",
         ] {
             assert!(plan(pattern).is_none(), "{pattern}");
         }
@@ -992,5 +1771,85 @@ mod tests {
         assert!(units(r#""[^"]*""#) <= NFA_UNIT_BUDGET);
         assert!(units(r"\w{8}") > NFA_UNIT_BUDGET);
         assert!(units(&"ab".repeat(5000)) > NFA_UNIT_BUDGET);
+    }
+
+    /// Every admitted program reads each byte a bounded number of times over
+    /// a whole iteration, on text built to make attempts fail late: repeated
+    /// partial matches. Patterns whose attempts could fail after unbounded
+    /// text holding other starts must have been rejected, which this checks
+    /// by running whichever of them a weaker admission would take.
+    #[cfg(feature = "std")]
+    #[test]
+    fn attempts_read_each_byte_a_bounded_number_of_times() {
+        use alloc::string::String;
+        let patterns = [
+            r"\w+",
+            r"\w+(?:\.\w+)*",
+            r"(\d+)(?:\.(\d+))?",
+            "(?:ab)+",
+            "(?:ab)+c",
+            "x(?:ab)*y",
+            "(?:foo|bar)+qux",
+            "(?:foo|bar)(?:baz)?",
+            "a(?:ba)*c",
+            r"\w+-\w+-x",
+            r"x[a-z]*\d",
+            "Holmes|Hound",
+            "(?:a|b)+c",
+            "(a)?(b*)",
+            r"[a-c]{1,40}d",
+            r"\w+(?:,\w+)*;",
+            r"(?:\w\.)+x",
+        ];
+        let fragments = [
+            "ab", "abab", "foo", "bar", "qu", "a.", "1.", "x", "ba", "-", "Ho", "c", "a,", "b",
+            "q", ".", " ", "1",
+        ];
+        let mut seed = 7u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for pattern in patterns {
+            let Some(plan) = plan(pattern) else {
+                continue;
+            };
+            for round in 0..40 {
+                let mut text = String::new();
+                let unit: String = (0..1 + round % 4)
+                    .map(|_| fragments[next(fragments.len())])
+                    .collect();
+                while text.len() < 4000 {
+                    if next(8) == 0 {
+                        text.push_str(fragments[next(fragments.len())]);
+                    } else {
+                        text.push_str(&unit);
+                    }
+                }
+                COVERED.with(|covered| covered.set(0));
+                let mut start = 0;
+                while start <= text.len() {
+                    let input = PlanInput {
+                        haystack: text.as_bytes(),
+                        start,
+                        end: text.len(),
+                        anchored: false,
+                        utf8: true,
+                    };
+                    match plan.find::<[usize]>(&input, None) {
+                        Some((_, end)) => start = if end > start { end } else { start + 1 },
+                        None => break,
+                    }
+                }
+                let covered = COVERED.with(core::cell::Cell::get);
+                assert!(
+                    covered <= (RESCAN_BOUND + 8) * (text.len() + 1),
+                    "{pattern}: {covered} bytes read for {} on {unit:?}",
+                    text.len()
+                );
+            }
+        }
     }
 }

@@ -7,9 +7,13 @@
 //! constructing a `Regex` stays as cheap as compiling its VM program.
 //!
 //! A pattern whose matches follow one deterministic path is searched by its
-//! linear plan instead, which needs neither automaton. The plan only answers
-//! where the lazy DFAs would also have answered, so whatever the VM would
-//! have reported elsewhere, including its resource errors, is unchanged.
+//! plan instead, which needs neither automaton. Routes exist only under the
+//! default backtrack limit, whose errors a route already recovers. On valid
+//! UTF-8 the plan answers every search, including those where the lazy DFAs
+//! would give up at a non-ASCII byte and leave the VM to run; Unicode word
+//! boundaries there are the same assertions the VM tests. Only in ASCII mode,
+//! where the VM classifies single bytes, does a plan answer just where the
+//! DFAs would have, reading ASCII alone.
 //!
 //! Otherwise spans come from regex-automata's lazy DFAs, configured as its
 //! meta engine configures them. With Unicode word boundaries they give up on reaching a
@@ -34,7 +38,7 @@ use regex_automata::{Input, MatchError, MatchKind};
 use regex_syntax::hir::{Hir, Look};
 
 use crate::compile::{self, CompileOptions, DelegateUsage};
-use crate::plan::{LinearPlan, NFA_UNIT_BUDGET, PlanInput, Slots};
+use crate::plan::{NFA_UNIT_BUDGET, Plan, PlanInput, Slots};
 
 type BuildFn = Box<dyn Fn() -> Option<Automata> + Send + Sync + UnwindSafe + RefUnwindSafe>;
 type MetaFn = Box<dyn Fn() -> Option<RaRegex> + Send + Sync + UnwindSafe + RefUnwindSafe>;
@@ -49,7 +53,7 @@ pub(crate) struct RegularRoute {
 
 /// How a route searches, decided on its first search.
 pub(crate) enum RouteEngine {
-    /// The pattern's linear plan, and the automata for the searches it leaves
+    /// The pattern's plan, and the automata for the searches it leaves
     /// to them, built on the first such search.
     Plan(RoutePlan, Lazy<Option<Automata>, BuildFn>),
     /// The automata, or `None` if they do not fit within the configured
@@ -58,8 +62,9 @@ pub(crate) enum RouteEngine {
 }
 
 pub(crate) struct RoutePlan {
-    plan: LinearPlan,
-    /// The automata give up at a non-ASCII byte: Unicode word boundaries.
+    plan: Plan,
+    /// Unicode word boundaries in ASCII mode: the plan answers only where
+    /// the automata, which give up at a non-ASCII byte, would have.
     ascii_only: bool,
 }
 
@@ -80,7 +85,7 @@ impl RegularRoute {
             let default_limits =
                 options.delegate_size_limit.is_none() && options.delegate_dfa_size_limit.is_none();
             let plan = default_limits
-                .then(|| RoutePlan::new(&hir, usage.prefilter()))
+                .then(|| RoutePlan::new(&hir, usage.prefilter(), ascii))
                 .flatten();
             let build: BuildFn = Box::new(move || Automata::new(&hir, &options, usage));
             match plan {
@@ -123,12 +128,12 @@ impl RouteEngine {
 
 impl RoutePlan {
     /// The plan for `hir`, when the automata it stands in for certainly fit
-    /// within the default limits.
-    fn new(hir: &Hir, prefilter: bool) -> Option<RoutePlan> {
-        let plan = LinearPlan::new(hir, prefilter)?;
+    /// within the default limits. `ascii` is ASCII mode.
+    fn new(hir: &Hir, prefilter: bool, ascii: bool) -> Option<RoutePlan> {
+        let plan = Plan::new(hir, prefilter)?;
         (plan.nfa_units() <= NFA_UNIT_BUDGET).then(|| RoutePlan {
             plan,
-            ascii_only: hir.properties().look_set().contains_word_unicode(),
+            ascii_only: ascii && hir.properties().look_set().contains_word_unicode(),
         })
     }
 
@@ -143,12 +148,19 @@ impl RoutePlan {
     }
 
     /// The leftmost-first span, filling `slots` when given, or `None` where
-    /// the automata could have given up.
+    /// the automata could have given up in ASCII mode.
     pub(crate) fn find<S: Slots + ?Sized>(
         &self,
         input: &PlanInput<'_>,
         slots: Option<&mut S>,
     ) -> Option<Option<(usize, usize)>> {
+        if !self.ascii_only {
+            return Some(self.plan.find(input, slots));
+        }
+        // Alternatives and groups can read past the match they report.
+        if self.plan.branching() {
+            return None;
+        }
         // Any match ends at least a byte past the start, so the checked
         // span always reaches three bytes past it: text that makes the
         // automata give up there needs no plan search.

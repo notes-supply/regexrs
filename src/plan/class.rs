@@ -122,6 +122,11 @@ impl ByteRanges {
     }
 }
 
+/// The most ranges from U+0800 a union of classes may merge, so that the
+/// unions admission accumulates along a pattern cost at most this much each.
+/// Unicode's `\w` has 749 such ranges.
+const UNION_RANGES: usize = 4096;
+
 /// `[0-9A-Za-z_]`.
 const ASCII_WORD: u128 =
     (0x3FF << b'0') | (0x3FF_FFFF << b'A') | (0x3FF_FFFF << b'a') | (1 << b'_');
@@ -249,6 +254,27 @@ impl CharSet {
         }
         let (c, len) = decode_wide(&haystack[at..end])?;
         range_contains(&self.wide, c).then_some(len)
+    }
+
+    fn union(&self, other: &CharSet) -> CharSet {
+        let mut ranges: Vec<(char, char)> = self.wide.iter().chain(&*other.wide).copied().collect();
+        ranges.sort_unstable();
+        let mut wide: Vec<(char, char)> = Vec::with_capacity(ranges.len());
+        for (lo, hi) in ranges {
+            match wide.last_mut() {
+                Some((_, end)) if u32::from(lo) <= u32::from(*end) + 1 => *end = (*end).max(hi),
+                _ => wide.push((lo, hi)),
+            }
+        }
+        let mut two = self.two;
+        for (bits, other) in two.iter_mut().zip(&other.two) {
+            *bits |= other;
+        }
+        CharSet {
+            ascii: self.ascii | other.ascii,
+            two,
+            wide: wide.into_boxed_slice(),
+        }
     }
 
     fn is_subset(&self, other: &CharSet) -> bool {
@@ -382,9 +408,10 @@ impl Class {
             Class::Bytes(set) => *set,
             Class::Chars(set) => {
                 let mut bytes = [set.ascii as u64, (set.ascii >> 64) as u64, 0, 0];
-                for index in 0..1920 {
-                    if (set.two[index >> 6] >> (index & 63)) & 1 == 1 {
-                        insert_byte(&mut bytes, 0xC0 | ((0x80 + index) >> 6) as u8);
+                // Each word of `two` holds the 64 characters of one lead byte.
+                for (lead, &bits) in (0xC2..=0xDFu8).zip(&set.two) {
+                    if bits != 0 {
+                        insert_byte(&mut bytes, lead);
                     }
                 }
                 let lead = |c: char| c.encode_utf8(&mut [0; 4]).as_bytes()[0];
@@ -394,6 +421,38 @@ impl Class {
                     }
                 }
                 bytes
+            }
+        }
+    }
+
+    /// The members of either class, unless one holds non-ASCII characters
+    /// and the other non-ASCII bytes, or together they hold more than
+    /// [`UNION_RANGES`] ranges from U+0800.
+    pub(super) fn union(&self, other: &Class) -> Option<Class> {
+        let ascii_bytes = |set: &[u64; 4]| u128::from(set[0]) | (u128::from(set[1]) << 64);
+        match (self, other) {
+            (Class::Chars(a), Class::Chars(b)) => (a.wide.len() + b.wide.len() <= UNION_RANGES)
+                .then(|| Class::Chars(Box::new(a.union(b)))),
+            (Class::Bytes(a), Class::Bytes(b)) => Some(Class::Bytes([
+                a[0] | b[0],
+                a[1] | b[1],
+                a[2] | b[2],
+                a[3] | b[3],
+            ])),
+            (Class::Chars(chars), Class::Bytes(bytes))
+            | (Class::Bytes(bytes), Class::Chars(chars)) => {
+                if bytes[2] | bytes[3] == 0 {
+                    let mut set = (**chars).clone();
+                    set.ascii |= ascii_bytes(bytes);
+                    Some(Class::Chars(Box::new(set)))
+                } else if !chars.has_non_ascii() {
+                    let mut set = *bytes;
+                    set[0] |= chars.ascii as u64;
+                    set[1] |= (chars.ascii >> 64) as u64;
+                    Some(Class::Bytes(set))
+                } else {
+                    None
+                }
             }
         }
     }
