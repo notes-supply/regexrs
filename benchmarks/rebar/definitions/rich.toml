@@ -1,8 +1,9 @@
 analysis = '''
 Rich patterns (backreferences, lookaround) on real text. regexrs runs its
-portable engine by default; regexrs-native (boolean searches only) and
-fancy-seek are tuned configurations, reported separately. resharp only
-appears on lookaround rows where verification shows leftmost-first spans.
+portable engine by default; regexrs-native (boolean searches only),
+regexrs-seek and fancy-seek are tuned configurations, reported separately.
+resharp only appears on lookaround rows where verification shows
+leftmost-first spans.
 '''
 
 [[bench]]
@@ -12,7 +13,7 @@ regex = '\b(\w+)\s+\1\b'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 15
-engines = ["regexrs", "fancy", "fancy-seek"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
 
 [[bench]]
 model = "grep"
@@ -21,7 +22,7 @@ regex = '\b(\w+)\s+\1\b'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 15
-engines = ["regexrs", "regexrs-native", "fancy", "fancy-seek"]
+engines = ["regexrs", "regexrs-native", "regexrs-seek", "fancy", "fancy-seek"]
 
 # A whole-haystack search for this miss exceeds the default backtrack limit
 # (1,000,000) in regexrs and Fancy Regex alike, so it is measured per line.
@@ -32,7 +33,7 @@ regex = '\b(\w+) \1 \1\b'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 0
-engines = ["regexrs", "fancy", "fancy-seek"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
 
 [[bench]]
 model = "count"
@@ -41,7 +42,7 @@ regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 269
-engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
 
 [[bench]]
 model = "count"
@@ -50,7 +51,7 @@ regex = '\w+(?=!)'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 344
-engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
 
 [[bench]]
 model = "count-spans"
@@ -59,7 +60,7 @@ regex = 'r(#+)"(?s:.*?)"\1'
 unicode = true
 haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
 count = 244281
-engines = ["regexrs", "fancy", "fancy-seek"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
 
 [[bench]]
 model = "count"
@@ -68,7 +69,7 @@ regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
 unicode = true
 haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
 count = 19349
-engines = ["regexrs", "fancy", "fancy-seek", "resharp"]
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
 
 [[bench]]
 model = "compile"
@@ -77,4 +78,4 @@ regex = '\b(\w+)\s+\1\b'
 unicode = true
 haystack = { path = "rebar/sherlock.txt" }
 count = 15
-engines = ["regexrs", "fancy"]
+engines = ["regexrs", "regexrs-seek", "fancy"]

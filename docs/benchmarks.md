@@ -64,8 +64,8 @@ Capture APIs differ by engine, and each row uses the engine's API as listed:
   `CaptureLocations`) and `regex` (`Regex::captures_read` into one
   `CaptureLocations`). Both create their storage once, outside the timed loop,
   and reuse it across records and iterations.
-- **Owned snapshots:** `regexrs`, `regexrs-regular` and `fancy` return an owned
-  `Captures` per record.
+- **Owned snapshots:** `regexrs`, `regexrs-seek`, `regexrs-regular`, `fancy`
+  and `fancy-seek` return an owned `Captures` per record.
 
 Compare reusable rows with reusable rows, and snapshot rows with snapshot rows.
 A gap between the two kinds reflects the API choice, not engine speed.
@@ -77,6 +77,7 @@ A gap between the two kinds reflects the API choice, not engine speed.
 | `regexrs` | default `Regex`, native code disabled (the default build) |
 | `regexrs-native` | `Regex` with the `native` feature; boolean searches only |
 | `regexrs-searcher` | `Regex` through one reused `Searcher` and `CaptureLocations` |
+| `regexrs-seek` | `Regex` with its opt-in seek prefilter, `seek(true)`, and native code disabled; the same methods as `regexrs` |
 | `regexrs-regular` | `RegularRegex`: no backtracking, regex-automata's bounded backtracker disabled |
 | `regex` | regex 1.13.1, defaults |
 | `fancy` | fancy-regex 0.19.2, defaults |
@@ -84,7 +85,9 @@ A gap between the two kinds reflects the API choice, not engine speed.
 | `resharp` | resharp 0.7.5, full Unicode classes, `^`/`$` at text boundaries |
 
 Defaults and tuned configurations are separate engines and must not be merged
-into one result. resharp is leftmost-longest: it is listed only on rows whose
+into one result. `regexrs-seek` is the counterpart of `fancy-seek`: seek stays
+opt-in because it can regress hit-heavy searches, and the default route is not
+chosen to improve a table. resharp is leftmost-longest: it is listed only on rows whose
 patterns avoid its syntax extensions (`_`, `&`, `~`) and where verification
 shows the same spans as leftmost-first engines. Where it differs, the row fails
 verification instead of being compared.
@@ -93,11 +96,13 @@ verification instead of being compared.
 
 All rows use Unicode mode.
 
-- `ordinary.toml`: regular patterns on real text, including literal hits,
+- `ordinary.toml`: regular patterns on real text, with `regexrs-seek` beside
+  the defaults, including literal hits,
   case-insensitive hits, a selective miss, a name alternation, dense words,
   dialogue spans, Cyrillic words, line-oriented keyword search, captured
   function names and the real-world log extraction regex.
-- `rich.toml`: backreferences and lookaround. These include doubled words
+- `rich.toml`: backreferences and lookaround, with `regexrs-seek` and
+  `fancy-seek` beside the defaults. These include doubled words
   (whole text and per line), a selective per-line miss, names after titles,
   words before `!`, Rust raw strings and method calls.
   A whole-text search for the miss `\b(\w+) \1 \1\b` exceeds the default
@@ -108,7 +113,7 @@ All rows use Unicode mode.
   boundaries, unmatched versus empty groups, and case folds of different
   UTF-8 widths.
 
-The suite has 33 definitions and 112 engine rows.
+The suite has 33 definitions and 132 engine rows.
 
 ### Provenance
 
@@ -191,6 +196,6 @@ taskset -c 2 target/release/rebar measure -d rebar -e '^regexrs$' \
   --max-time 200ms --max-warmup-time 50ms --max-iters 10000000 > regexrs.csv
 ```
 
-Use an available physical core on your own host. Repeat for all eight engine
-names and aggregate medians within each row; do not combine unrelated workloads
+Use an available physical core on your own host. Repeat for every engine name
+in the suite and aggregate medians within each row; do not combine unrelated workloads
 or use this host's timings as universal expectations.

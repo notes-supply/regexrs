@@ -22,6 +22,8 @@ enum Engine {
     RegexrsNative(regexrs::Regex),
     /// `regexrs::Regex` searched through one reused `Searcher`.
     RegexrsSearcher(regexrs::Regex),
+    /// `regexrs::Regex` with its opt-in seek prefilter, native code disabled.
+    RegexrsSeek(regexrs::Regex),
     /// `regexrs::RegularRegex`.
     RegexrsRegular(regexrs::RegularRegex),
     Regex(regex::Regex),
@@ -33,13 +35,15 @@ enum Engine {
     Resharp(Box<resharp::Regex>),
 }
 
-const ENGINES: &str = "regexrs, regexrs-native, regexrs-searcher, regexrs-regular, regex, \
-                       fancy, fancy-seek, resharp";
+const ENGINES: &str = "regexrs, regexrs-native, regexrs-searcher, regexrs-seek, \
+                       regexrs-regular, regex, fancy, fancy-seek, resharp";
 
 fn version(engine: &str) -> Result<&'static str> {
     Ok(match engine {
         // The checked-out source; `mise run bench:rebar:measure` records its commit.
-        "regexrs" | "regexrs-searcher" | "regexrs-regular" | "regexrs-native" => "workspace",
+        "regexrs" | "regexrs-searcher" | "regexrs-seek" | "regexrs-regular" | "regexrs-native" => {
+            "workspace"
+        }
         "regex" => "1.13.1",
         "fancy" | "fancy-seek" => "0.19.2",
         "resharp" => "0.7.5",
@@ -47,12 +51,17 @@ fn version(engine: &str) -> Result<&'static str> {
     })
 }
 
-fn regexrs_options(benchmark: &klv::Benchmark, native: bool) -> regexrs::RegexOptionsBuilder {
+fn regexrs_options(
+    benchmark: &klv::Benchmark,
+    native: bool,
+    seek: bool,
+) -> regexrs::RegexOptionsBuilder {
     let mut options = regexrs::RegexOptionsBuilder::new();
     options
         .unicode_mode(benchmark.regex.unicode)
         .case_insensitive(benchmark.regex.case_insensitive)
-        .native(native);
+        .native(native)
+        .seek(seek);
     options
 }
 
@@ -71,16 +80,21 @@ impl Engine {
         };
         let pattern = pattern.as_str();
         Ok(match engine {
-            "regexrs" => Engine::Regexrs(regexrs_options(benchmark, false).build(pattern.into())?),
-            "regexrs-searcher" => {
-                Engine::RegexrsSearcher(regexrs_options(benchmark, false).build(pattern.into())?)
+            "regexrs" => {
+                Engine::Regexrs(regexrs_options(benchmark, false, false).build(pattern.into())?)
+            }
+            "regexrs-searcher" => Engine::RegexrsSearcher(
+                regexrs_options(benchmark, false, false).build(pattern.into())?,
+            ),
+            "regexrs-seek" => {
+                Engine::RegexrsSeek(regexrs_options(benchmark, false, true).build(pattern.into())?)
             }
             "regexrs-regular" => Engine::RegexrsRegular(
-                regexrs_options(benchmark, false).build_regular(pattern.into())?,
+                regexrs_options(benchmark, false, false).build_regular(pattern.into())?,
             ),
-            "regexrs-native" if cfg!(feature = "native") => {
-                Engine::RegexrsNative(regexrs_options(benchmark, true).build(pattern.into())?)
-            }
+            "regexrs-native" if cfg!(feature = "native") => Engine::RegexrsNative(
+                regexrs_options(benchmark, true, false).build(pattern.into())?,
+            ),
             "regexrs-native" => bail!("regexrs-native requires the runner's `native` feature"),
             "regex" => Engine::Regex(
                 regex::RegexBuilder::new(pattern)
@@ -229,7 +243,13 @@ impl<'a> Workload<'a> {
                     visit((m.start(), m.end()));
                 }
             }
-            (Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSearcher(re), _) => {
+            (
+                Engine::Regexrs(re)
+                | Engine::RegexrsNative(re)
+                | Engine::RegexrsSearcher(re)
+                | Engine::RegexrsSeek(re),
+                _,
+            ) => {
                 for m in re.find_iter(text) {
                     let m = m?;
                     visit((m.start(), m.end()));
@@ -262,7 +282,13 @@ impl<'a> Workload<'a> {
                     visit(&captures?);
                 }
             }
-            (Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSearcher(re), _) => {
+            (
+                Engine::Regexrs(re)
+                | Engine::RegexrsNative(re)
+                | Engine::RegexrsSearcher(re)
+                | Engine::RegexrsSeek(re),
+                _,
+            ) => {
                 for captures in re.captures_iter(text) {
                     visit(&captures?);
                 }
@@ -284,9 +310,13 @@ impl<'a> Workload<'a> {
     fn is_match(&mut self, line: &str) -> Result<bool> {
         Ok(match (self.engine, self.searcher.as_mut()) {
             (Engine::RegexrsSearcher(_), Some(search)) => search.is_match(line)?,
-            (Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSearcher(re), _) => {
-                re.is_match(line)?
-            }
+            (
+                Engine::Regexrs(re)
+                | Engine::RegexrsNative(re)
+                | Engine::RegexrsSearcher(re)
+                | Engine::RegexrsSeek(re),
+                _,
+            ) => re.is_match(line)?,
             (Engine::RegexrsRegular(re), _) => re.is_match(line),
             (Engine::Regex(re), _) => re.is_match(line),
             (Engine::Fancy(re) | Engine::FancySeek(re), _) => re.is_match(line)?,
@@ -309,7 +339,10 @@ impl<'a> Workload<'a> {
                     read(found.then_some(&*locations as &dyn Groups))
                 }
                 (
-                    Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSearcher(re),
+                    Engine::Regexrs(re)
+                    | Engine::RegexrsNative(re)
+                    | Engine::RegexrsSearcher(re)
+                    | Engine::RegexrsSeek(re),
                     ..,
                 ) => read(re.captures(line)?.as_ref().map(|c| c as &dyn Groups)),
                 (Engine::RegexrsRegular(re), ..) => {
@@ -561,9 +594,10 @@ mod tests {
         }
     }
 
-    const ENGINE_NAMES: [&str; 6] = [
+    const ENGINE_NAMES: [&str; 7] = [
         "regexrs",
         "regexrs-searcher",
+        "regexrs-seek",
         "regexrs-regular",
         "regex",
         "fancy",
@@ -698,6 +732,24 @@ ba bab
             }
         }
         Ok(())
+    }
+
+    /// The seek row runs the default row's methods on a regex whose program
+    /// starts with the seek prefilter; the default row's never does.
+    #[test]
+    fn regexrs_seek_enables_only_the_seek_prefilter() -> Result<()> {
+        let b = benchmark(r"\b(\w+)\s+\1\b", "count", "the the cat");
+        let program = |engine| -> Result<String> {
+            Ok(match Engine::compile(engine, &b)? {
+                Engine::Regexrs(re) | Engine::RegexrsSeek(re) => {
+                    regexrs::DebugRegex(&re).to_string()
+                }
+                _ => unreachable!(),
+            })
+        };
+        assert!(program("regexrs-seek")?.contains("Seek"));
+        assert!(!program("regexrs")?.contains("Seek"));
+        verify("regexrs-seek", &b)
     }
 
     #[test]

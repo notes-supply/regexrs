@@ -1,9 +1,9 @@
 # Engine configurations for `rebar -d benchmarks/rebar`. Each runs the same
 # runner binary, built by `mise run bench:rebar:build`; paths are relative to
 # this directory. Defaults: regexrs (native code disabled), regex, fancy.
-# Tuned or API-specific: regexrs-native, regexrs-searcher, regexrs-regular,
-# fancy-seek. resharp is leftmost-longest and only listed where verified
-# equivalent.
+# Tuned or API-specific: regexrs-native, regexrs-searcher, regexrs-seek,
+# regexrs-regular, fancy-seek. resharp is leftmost-longest and only listed
+# where verified equivalent.
 
 [[engine]]
 name = "regexrs"
@@ -34,6 +34,16 @@ args = ["regexrs-searcher", "--version"]
 [engine.run]
 bin = "./target/release/regexrs-rebar-runner"
 args = ["regexrs-searcher"]
+
+[[engine]]
+name = "regexrs-seek"
+cwd = ".."
+[engine.version]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-seek", "--version"]
+[engine.run]
+bin = "./target/release/regexrs-rebar-runner"
+args = ["regexrs-seek"]
 
 [[engine]]
 name = "regexrs-regular"
