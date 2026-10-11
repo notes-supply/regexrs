@@ -1,7 +1,7 @@
 mod common;
 
 use matches::assert_matches;
-use regexrs::{BytesMode, Match, RegexBuilder, RegexInput};
+use regexrs::{BytesMode, Match, Regex, RegexBuilder, RegexInput};
 use std::ops::Range;
 
 #[test]
@@ -1405,4 +1405,30 @@ fn seek_find_iter_matches_identical_to_default() {
         .map(|m| (m.start(), m.end()))
         .collect();
     assert_eq!(default_matches, seek_matches);
+}
+
+/// Anchored boolean searches agree with anchored `find` on every route,
+/// including ordinary patterns delegated whole to regex-automata.
+#[test]
+fn anchored_is_match_agrees_with_find() {
+    for pattern in ["b", "(b)", "b+", r"\w(?=b)", r"(\w)\1", "", r"\bb"] {
+        let regex = Regex::new(pattern).unwrap();
+        let mut search = regex.searcher();
+        for text in ["ab", "b", "bb", ""] {
+            for start in 0..=text.len() {
+                let input = RegexInput::new(text).from_pos(start).anchored(true);
+                let found = regex.find_input(input.clone()).unwrap().is_some();
+                assert_eq!(
+                    regex.is_match_input(input.clone()).unwrap(),
+                    found,
+                    "{pattern} {text:?} {start}"
+                );
+                assert_eq!(
+                    search.is_match_input(input).unwrap(),
+                    found,
+                    "searcher {pattern} {text:?} {start}"
+                );
+            }
+        }
+    }
 }

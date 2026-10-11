@@ -1620,10 +1620,7 @@ impl Regex {
                 explicit_capture_group_0,
                 ..
             } => {
-                let mut delegated_input = ra_input(input);
-                if input.is_anchored() {
-                    delegated_input = delegated_input.anchored(RaAnchored::Yes);
-                }
+                let delegated_input = ra_input(input);
                 let result = if !*explicit_capture_group_0 {
                     let result = match cache.and_then(searcher::Cache::regular) {
                         Some((cache, _)) => inner.search_with(cache, &delegated_input),
@@ -1842,10 +1839,7 @@ impl Regex {
                 // find_not_empty patterns are always compiled as Fancy, so find_not_empty is
                 // always false here.
                 let explicit = *explicit_capture_group_0;
-                let mut delegated_input = ra_input(input);
-                if input.is_anchored() {
-                    delegated_input = delegated_input.anchored(RaAnchored::Yes);
-                }
+                let delegated_input = ra_input(input);
                 let locations = match cache.and_then(searcher::Cache::regular) {
                     Some((cache, locations)) => {
                         inner.search_captures_with(cache, &delegated_input, locations);
@@ -1958,10 +1952,7 @@ impl Regex {
         }
         match (&self.inner, &mut locations.slots) {
             (RegexImpl::Wrap { inner, .. }, CapturesImpl::Wrap { locations, .. }) => {
-                let mut delegated_input = ra_input(input);
-                if input.is_anchored() {
-                    delegated_input = delegated_input.anchored(RaAnchored::Yes);
-                }
+                let delegated_input = ra_input(input);
                 match cache.and_then(searcher::Cache::regular) {
                     Some((cache, _)) => {
                         inner.search_captures_with(cache, &delegated_input, locations)
@@ -2340,9 +2331,14 @@ impl fmt::Display for DebugRegex<'_> {
     }
 }
 
+/// The `regex-automata` input for a search: same haystack, range, start and
+/// anchoring, so every entry point of an ordinary pattern agrees.
 fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInput<'a> {
     let mut ra_input = RaInput::new(input.haystack().as_bytes()).range(input.get_range());
     ra_input.set_start(input.effective_start());
+    if input.is_anchored() {
+        ra_input.set_anchored(RaAnchored::Yes);
+    }
     ra_input
 }
 
