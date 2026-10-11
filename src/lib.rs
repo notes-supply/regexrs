@@ -190,6 +190,9 @@ enum RegexImpl {
         n_groups: usize,
         /// The original pattern which the regex was constructed from
         pattern: String,
+        /// The parse flags the pattern was compiled with, to derive its seek
+        /// approximation again when the program does not carry one.
+        flags: u32,
         options: HardRegexRuntimeOptions,
         /// For a pattern that needs the VM only for word boundaries, the same
         /// pattern as automata, used where `Regex::regular_route` shows the
@@ -950,6 +953,12 @@ impl RegexOptionsBuilder {
     /// The seek pattern is always a conservative over-approximation — it may report false-positive
     /// positions but will never skip a true match.
     ///
+    /// A seek is combined with the start positions the pattern's leading tests allow. When the
+    /// pattern starts with a lookbehind over literals, which the seek pattern drops, those
+    /// literals propose the candidates and the seek pattern confirms them. With an explicit
+    /// [`backtrack_limit`](Self::backtrack_limit) the seek always proposes them, so limit errors
+    /// are exactly those of seeking alone.
+    ///
     /// When `yes` is `true`, uses the default [`seek_pattern_is_useful`] filter to decide
     /// whether the derived pattern is worth using. When `false`, disables seek entirely.
     ///
@@ -1318,7 +1327,8 @@ impl Regex {
     }
 
     pub(crate) fn new_options(pattern: String, options: &RegexOptions) -> Result<Regex> {
-        let mut tree = Expr::parse_tree_with_flags(&pattern, options.compute_flags())?;
+        let flags = options.compute_flags();
+        let mut tree = Expr::parse_tree_with_flags(&pattern, flags)?;
         // Lower the already-parsed original tree before capture-boundary rewrites.
         // Emission happens only after the portable compiler validates everything.
         #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
@@ -1343,34 +1353,12 @@ impl Regex {
             None
         };
 
-        let find_not_empty = options.hard_regex_runtime_options.find_not_empty;
-        let disallow_empty_match_at_eof_after_newline = options
-            .hard_regex_runtime_options
-            .disallow_empty_match_at_eof_after_newline;
-        let allow_input_assertion_overrides = options
-            .hard_regex_runtime_options
-            .allow_input_assertion_overrides;
-
-        let requires_capture_group_fixup = if find_not_empty {
-            // if the find_not_empty flag is set, we skip optimizations
-            // partially because we have to go though the VM anyway
-            // partially because having the last instruction of the expression not have
-            // ix be at the end of capture group 0 ruins our empty match checking logic.
-            false
-        } else {
-            // try to optimize the expression tree so that a hard pattern could become easy
-            // with a fixup of the capture groups
-            optimize(&mut tree)
-        };
-        let info = analyze(
-            &tree,
-            AnalyzeContext {
-                explicit_capture_group_0: requires_capture_group_fixup,
-                find_not_empty,
-                disallow_empty_match_at_eof_after_newline,
-                allow_input_assertion_overrides,
-            },
-        )?;
+        let runtime = &options.hard_regex_runtime_options;
+        let find_not_empty = runtime.find_not_empty;
+        let disallow_empty_match_at_eof_after_newline =
+            runtime.disallow_empty_match_at_eof_after_newline;
+        let (requires_capture_group_fixup, context) = prepare_tree(&mut tree, runtime);
+        let info = analyze(&tree, context)?;
 
         if find_not_empty && info.const_size && info.min_size == 0 {
             return Err(CompileError::PatternCanNeverMatch.into());
@@ -1440,6 +1428,7 @@ impl Regex {
                     && !matches!(options.bytes_mode, BytesMode::Ascii),
                 delegate_size_limit: options.delegate_size_limit,
                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+                explicit_backtrack_limit: options.explicit_backtrack_limit,
             },
         )?;
         let n_groups = info.end_group();
@@ -1459,6 +1448,7 @@ impl Regex {
                 n_groups,
                 options: options.hard_regex_runtime_options,
                 pattern,
+                flags,
                 regular,
             },
             named_groups: Arc::new(tree.named_groups),
@@ -2063,12 +2053,29 @@ impl Regex {
         }
     }
 
-    pub(crate) fn seek_pattern(&self) -> &str {
+    /// A regular over-approximation of the pattern, as `RegexSet` membership
+    /// tests use. A program only keeps the seek approximation it seeks with, so
+    /// any other is derived again from the pattern, exactly as compiling did.
+    pub(crate) fn seek_pattern(&self) -> Result<Cow<'_, str>> {
         match &self.inner {
             RegexImpl::Wrap {
                 delegated_pattern, ..
-            } => delegated_pattern,
-            RegexImpl::Fancy { prog, .. } => &prog.seek_pattern,
+            } => Ok(Cow::Borrowed(delegated_pattern)),
+            RegexImpl::Fancy {
+                prog,
+                pattern,
+                flags,
+                options,
+                ..
+            } => match prog.seek_pattern() {
+                Some(seek_pattern) => Ok(Cow::Borrowed(seek_pattern)),
+                None => {
+                    let mut tree = Expr::parse_tree_with_flags(pattern, *flags)?;
+                    let (_, context) = prepare_tree(&mut tree, options);
+                    let info = analyze(&tree, context)?;
+                    Ok(Cow::Owned(compile::seek_pattern_of(&info)))
+                }
+            },
         }
     }
 
@@ -2479,6 +2486,30 @@ impl fmt::Display for DebugRegex<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.debug_print(f)
     }
+}
+
+/// Optimize a parsed tree as compiling does and return whether capture group
+/// zero needs fixing up, with the matching analysis context.
+fn prepare_tree(tree: &mut ExprTree, runtime: &HardRegexRuntimeOptions) -> (bool, AnalyzeContext) {
+    let requires_capture_group_fixup = if runtime.find_not_empty {
+        // if the find_not_empty flag is set, we skip optimizations
+        // partially because we have to go though the VM anyway
+        // partially because having the last instruction of the expression not have
+        // ix be at the end of capture group 0 ruins our empty match checking logic.
+        false
+    } else {
+        // try to optimize the expression tree so that a hard pattern could become easy
+        // with a fixup of the capture groups
+        optimize(tree)
+    };
+    let context = AnalyzeContext {
+        explicit_capture_group_0: requires_capture_group_fixup,
+        find_not_empty: runtime.find_not_empty,
+        disallow_empty_match_at_eof_after_newline: runtime
+            .disallow_empty_match_at_eof_after_newline,
+        allow_input_assertion_overrides: runtime.allow_input_assertion_overrides,
+    };
+    (requires_capture_group_fixup, context)
 }
 
 /// A route to automata for a pattern whose only constructs outside the
@@ -3861,6 +3892,84 @@ mod tests {
             } => route.automata().is_some(),
             _ => false,
         }
+    }
+
+    fn fancy_prog(regex: &Regex) -> &crate::vm::Prog {
+        match &regex.inner {
+            RegexImpl::Fancy { prog, .. } => prog,
+            RegexImpl::Wrap { .. } => unreachable!("expected a VM program"),
+        }
+    }
+
+    /// A program only carries the seek approximation it seeks with. Any other
+    /// is derived again on demand; both equal what 0.1.4 stored for every
+    /// regex.
+    #[test]
+    fn seek_approximation_is_only_built_for_a_seek() {
+        for (pattern, released) in [
+            (r"(abc)\1", "(?:abc)(?:abc)"),
+            (r"(?<=Mr\. |Dr\. )[A-Z]\w+", r"[A-Z]\w+"),
+            (r"\g<1>-(a+)\1", "a+-a+a+"),
+            (r"(?i)(?<n>a+)\k<n>(?=b)", "(?:(?i:a)+(?i:(?i:a)+))(?i:b)"),
+            (r"(?m)(x)\1$", "xx(?m:$)"),
+            (r"(a)?(?(1)b|c)\1", "a?(?:b|c)a"),
+            (r"(?(DEFINE)(?<d>\d))\g<d>(\w)\1", r"\d\w\d"),
+            (r"(?x) ( a ) \1 # comment", "aa"),
+        ] {
+            let plain = Regex::new(pattern).unwrap();
+            let seeking = RegexBuilder::new(pattern)
+                .seek_filter(|_| true)
+                .build()
+                .unwrap();
+            assert_eq!(fancy_prog(&plain).seek_pattern(), None, "{pattern}");
+            assert_eq!(
+                fancy_prog(&seeking).seek_pattern(),
+                Some(released),
+                "{pattern}"
+            );
+            assert_eq!(plain.seek_pattern().unwrap(), released, "{pattern}");
+            assert_eq!(seeking.seek_pattern().unwrap(), released, "{pattern}");
+        }
+        // An anchored program never seeks, nor one whose filter declines.
+        let anchored = RegexBuilder::new(r"^(a)\1").seek(true).build().unwrap();
+        assert_eq!(fancy_prog(&anchored).seek_pattern(), None);
+        assert_eq!(anchored.seek_pattern().unwrap(), "^aa");
+        let declined = RegexBuilder::new(r"(abc)\1")
+            .seek_filter(|_| false)
+            .build()
+            .unwrap();
+        assert_eq!(fancy_prog(&declined).seek_pattern(), None);
+        assert_eq!(declined.seek_pattern().unwrap(), "(?:abc)(?:abc)");
+    }
+
+    /// A start filter from a leading lookbehind leads a seek preamble, except
+    /// under an explicit limit; other start filters only reject the seek's
+    /// candidates.
+    #[test]
+    fn lookbehind_literals_lead_seek_without_an_explicit_limit() {
+        let plan = |builder: &mut RegexBuilder| {
+            let regex = builder.build().unwrap();
+            let prog = fancy_prog(&regex);
+            (
+                prog.seek_pattern().is_some(),
+                prog.start_filter().is_some(),
+                prog.filter_leads_seek(),
+            )
+        };
+        let titled = r"(?<=Mr\. )[A-Z]\w+";
+        assert_eq!(
+            plan(RegexBuilder::new(titled).seek(true)),
+            (true, true, true)
+        );
+        assert_eq!(
+            plan(RegexBuilder::new(titled).seek(true).backtrack_limit(1000)),
+            (true, true, false)
+        );
+        assert_eq!(plan(&mut RegexBuilder::new(titled)), (false, true, false));
+        assert_eq!(
+            plan(RegexBuilder::new(r"#(\d)\1").seek(true)),
+            (true, true, false)
+        );
     }
 
     #[test]

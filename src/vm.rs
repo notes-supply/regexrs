@@ -563,10 +563,12 @@ pub struct Prog {
     n_saves: usize,
     /// How the VM advances positions: byte-level (Ascii) vs codepoint-level (Unicode/UnicodeBytes).
     bytes_mode: BytesMode,
-    /// A pattern compatible with a DFA which can be used to seek to candidate positions where the real/full pattern might match
-    pub(crate) seek_pattern: String,
-    /// Positions the `SplitUnanchored` preamble may skip; see [`StartFilter`].
+    /// Positions the unanchored preamble may skip; see [`StartFilter`].
     start_filter: Option<StartFilter>,
+    /// Whether a seek preamble takes its candidates from the start filter's
+    /// literal search and confirms them with the seek engine, rather than the
+    /// reverse; see `Insn::Seek`.
+    filter_leads_seek: bool,
     scratch_pool: Pool<Scratch, fn() -> Scratch>,
 }
 
@@ -589,22 +591,35 @@ impl Prog {
         body: Vec<Insn>,
         n_saves: usize,
         bytes_mode: BytesMode,
-        seek_pattern: String,
         start_filter: Option<StartFilter>,
+        filter_leads_seek: bool,
     ) -> Prog {
         Prog {
             body,
             n_saves,
             bytes_mode,
-            seek_pattern,
             start_filter,
+            filter_leads_seek,
             scratch_pool: Pool::new(new_scratch),
+        }
+    }
+
+    /// The pattern of the seek preamble, when the program starts with one.
+    pub(crate) fn seek_pattern(&self) -> Option<&str> {
+        match self.body.first() {
+            Some(Insn::Seek(seek)) => Some(&seek.pattern),
+            _ => None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn start_filter(&self) -> Option<&StartFilter> {
         self.start_filter.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn filter_leads_seek(&self) -> bool {
+        self.filter_leads_seek
     }
 
     #[doc(hidden)]
@@ -1636,33 +1651,70 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                         // need to verify the seek pattern matches here. We also don't push any backtracking
                         // states and just continue on like a no-op.
                     } else {
-                        // TODO: ideally we would be able to use .earliest(true) as an extra optimization
-                        //       as we only care about the start of the match, but unfortunately this doesn't
-                        //       always return the correct start position, perhaps a bug in regex-automata
-                        let seek_input = Input::new(haystack.as_bytes()).span(ix..match_range.end);
-                        match inner.search(&seek_input) {
-                            None => return Ok(None),
-                            Some(m) => {
-                                // Compute the next position to retry the seek from on backtrack:
-                                // one codepoint past the start of this match (or past the end for
-                                // zero-width matches) so we make progress.
-                                let next_seek_start = if m.start() == m.end() {
-                                    if m.end() < haystack.len() {
-                                        m.end() + advance_one(haystack, m.end(), prog.bytes_mode)
-                                    } else {
-                                        // Zero-width match at end-of-string.  Push a sentinel value
-                                        // (haystack.len() + 1) so that if the main pattern fails and we
-                                        // backtrack here, the `ix > haystack.len()` guard above returns None
-                                        // immediately instead of looping.
-                                        haystack.len() + 1
-                                    }
-                                } else {
-                                    m.start() + advance_one(haystack, m.start(), prog.bytes_mode)
-                                };
-                                state.push(pc, next_seek_start)?;
-                                ix = m.start();
+                        let bytes = haystack.as_bytes();
+                        // After an attempt at `start` fails, seeking resumes one character later,
+                        // or past the end after a zero-width match there.
+                        let resume = |start: usize| {
+                            if start < bytes.len() {
+                                start + advance_one(haystack, start, prog.bytes_mode)
+                            } else {
+                                bytes.len() + 1
                             }
-                        }
+                        };
+                        let start = match start_filter {
+                            // The literal search proposes candidates and the seek engine,
+                            // searched anchored, confirms them: attempts are made exactly at the
+                            // seek candidates the start filter keeps. Seek candidates it skips
+                            // cannot be counted, so their backtracks are not charged; the
+                            // compiler only lets the filter lead under the default limit.
+                            Some(filter) if prog.filter_leads_seek => loop {
+                                let Some(candidate) = filter.next(bytes, ix, match_range.end)
+                                else {
+                                    return Ok(None);
+                                };
+                                let anchored = Input::new(bytes)
+                                    .span(candidate..match_range.end)
+                                    .anchored(Anchored::Yes);
+                                if inner.search_half(&anchored).is_some() {
+                                    break candidate;
+                                }
+                                ix = resume(candidate);
+                                if ix > match_range.end {
+                                    return Ok(None);
+                                }
+                            },
+                            // The seek engine proposes candidates. One the start filter rejects
+                            // would fail at a fixed cost, which is charged without attempting it,
+                            // so matches and limit errors are exactly those of seeking alone.
+                            _ => loop {
+                                // TODO: ideally we would be able to use .earliest(true) as an extra optimization
+                                //       as we only care about the start of the match, but unfortunately this doesn't
+                                //       always return the correct start position, perhaps a bug in regex-automata
+                                let seek_input = Input::new(bytes).span(ix..match_range.end);
+                                let Some(found) = inner.search(&seek_input) else {
+                                    return Ok(None);
+                                };
+                                let candidate = found.start();
+                                match start_filter {
+                                    Some(filter) if !filter.admits(bytes, candidate) => {
+                                        backtrack_count =
+                                            backtrack_count.saturating_add(filter.cost());
+                                        if backtrack_count > options.backtrack_limit {
+                                            return Err(Error::RuntimeError(
+                                                RuntimeError::BacktrackLimitExceeded,
+                                            ));
+                                        }
+                                        ix = resume(candidate);
+                                        if ix > match_range.end {
+                                            return Ok(None);
+                                        }
+                                    }
+                                    _ => break candidate,
+                                }
+                            },
+                        };
+                        state.push(pc, resume(start))?;
+                        ix = start;
                     }
                     match_attempt_start = ix;
                     slash_z_matched = false;

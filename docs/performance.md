@@ -64,6 +64,15 @@ failure cost varies still try every position, as do byte haystacks outside
 ASCII mode; dense hits gain nothing. Repeated alternatives such as `((a|ab)+)\1` remain portable.
 `RegexBuilder::seek(true)` uses a fuller regular approximation for explicit
 tuning, but is not selected automatically: it can regress hit-heavy searches.
+A seek also uses the start filter. A start filter from a leading lookbehind's
+literals, which the seek approximation drops, proposes the candidates and the
+seek engine confirms them, anchored; otherwise the seek proposes them and the
+start filter rejects those that would fail at their fixed cost, charging that
+cost. Both attempt only positions plain seeking attempts. An explicit
+`backtrack_limit` keeps the seek in the lead, so its limit errors are exactly
+those of seeking alone; under the default limit a lookbehind-led seek can
+finish where plain seeking spent the limit on attempts the lookbehind rules out.
+The seek approximation is only derived when a seek filter may use it.
 
 Caller-owned scratch is an allocation/ownership interface, not a guaranteed
 speedup: the portable implementation already pools working memory. Owned capture

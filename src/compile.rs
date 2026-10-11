@@ -73,15 +73,15 @@ impl VMBuilder {
     fn build(
         self,
         bytes_mode: BytesMode,
-        seek_pattern: String,
         start_filter: Option<StartFilter>,
+        filter_leads_seek: bool,
     ) -> Prog {
         Prog::new(
             self.prog,
             self.n_saves,
             bytes_mode,
-            seek_pattern,
             start_filter,
+            filter_leads_seek,
         )
     }
 
@@ -1248,6 +1248,11 @@ pub struct CompileOptions {
     pub delegate_size_limit: Option<usize>,
     /// Optional size limit in bytes for the DFA of each delegated sub-expression.
     pub delegate_dfa_size_limit: Option<usize>,
+    /// Whether the caller set an explicit backtrack limit. A seek preamble then
+    /// only uses the start filter to reject the candidates it finds, charging
+    /// each the backtracks its attempt would have performed, so its limit
+    /// errors are exactly those of seeking alone.
+    pub explicit_backtrack_limit: bool,
 }
 
 impl core::fmt::Debug for CompileOptions {
@@ -1273,6 +1278,7 @@ impl core::fmt::Debug for CompileOptions {
             .field("unicode", &self.unicode)
             .field("delegate_size_limit", &self.delegate_size_limit)
             .field("delegate_dfa_size_limit", &self.delegate_dfa_size_limit)
+            .field("explicit_backtrack_limit", &self.explicit_backtrack_limit)
             .finish()
     }
 }
@@ -1288,8 +1294,18 @@ impl Default for CompileOptions {
             unicode: true,
             delegate_size_limit: None,
             delegate_dfa_size_limit: None,
+            explicit_backtrack_limit: false,
         }
     }
+}
+
+/// The seek approximation `compile` derives for an analyzed expression.
+pub(crate) fn seek_pattern_of(info: &Info<'_>) -> String {
+    let mut group_info_map = Map::new();
+    populate_group_info_map(&mut group_info_map, info);
+    let mut seek_pattern = String::new();
+    build_seek_pattern(info, &group_info_map, 0, &mut seek_pattern, 0);
+    seek_pattern
 }
 
 /// Compile the analyzed expressions into a program.
@@ -1310,30 +1326,32 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
         delegate_hirs: Vec::new(),
     };
 
-    let mut seek_pattern = String::new();
-    build_seek_pattern(info, &c.group_info_map, 0, &mut seek_pattern, 0);
-
+    // The first instruction after the unanchored preamble, which is either a
+    // seek or the classic scan. The seek approximation is only derived when a
+    // filter may select it; `Regex::seek_pattern` rebuilds it on demand.
     let mut body_start = None;
+    let mut seeks = false;
     if !c.options.anchored {
-        let mut used_seek = false;
-        if let Some(filter) = c.options.seek_filter
-            && filter(&seek_pattern)
-        {
+        if let Some(filter) = c.options.seek_filter {
+            let mut seek_pattern = String::new();
+            build_seek_pattern(info, &c.group_info_map, 0, &mut seek_pattern, 0);
             // The seek engine is searched unanchored to find the next candidate
             // position, so it keeps its prefilter (the whole point of seeking).
-            if let Ok(inner) = compile_inner(&seek_pattern, &c.options, DelegateUsage::unanchored())
+            if filter(&seek_pattern)
+                && let Ok(inner) =
+                    compile_inner(&seek_pattern, &c.options, DelegateUsage::unanchored())
             {
                 c.b.add(Insn::Seek(Seek {
                     inner,
-                    pattern: seek_pattern.clone(),
+                    pattern: seek_pattern,
                 }));
-                used_seek = true;
+                seeks = true;
             }
         }
 
         // If compilation of the seek pattern fails for any reason, or seeking for this
         // pattern is disabled, fall back to the standard SplitUnanchored preamble.
-        if !used_seek {
+        if !seeks {
             // add instructions as if \O*? was used at the start of the expression
             // so that we bump the haystack index by one when failing to match at the current position
             let current_pc = c.b.pc();
@@ -1341,8 +1359,8 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
             c.b.add(Insn::SplitUnanchored(current_pc + 3, current_pc + 1));
             c.b.add(Insn::Any);
             c.b.add(Insn::Jmp(current_pc));
-            body_start = Some(current_pc + 3);
         }
+        body_start = Some(c.b.pc());
     }
     if info.start_group() == 1 {
         // add implicit capture group 0 begin
@@ -1359,7 +1377,16 @@ pub fn compile(info: &Info<'_>, options: CompileOptions) -> Result<Prog> {
     c.b.add(Insn::End);
     let start_filter = body_start
         .and_then(|start| StartFilter::new(&c.b.prog, start, &c.delegate_hirs, bytes_mode));
-    Ok(c.b.build(bytes_mode, seek_pattern, start_filter))
+    // The seek approximation drops look-arounds, so a start filter built from
+    // a leading lookbehind's literals is more selective and leads a seek
+    // preamble. The seek candidates it skips cannot be charged, though, so an
+    // explicit limit keeps the seek in the lead.
+    let filter_leads_seek = seeks
+        && !c.options.explicit_backtrack_limit
+        && start_filter
+            .as_ref()
+            .is_some_and(StartFilter::follows_lookbehind);
+    Ok(c.b.build(bytes_mode, start_filter, filter_leads_seek))
 }
 
 struct DelegateBuilder {

@@ -362,7 +362,7 @@ impl RegexSet {
         let mut patterns = Vec::with_capacity(regexes_vec.len());
 
         for regex in &regexes_vec {
-            patterns.push(regex.seek_pattern());
+            patterns.push(regex.seek_pattern()?);
         }
 
         let compile_options = CompileOptions {

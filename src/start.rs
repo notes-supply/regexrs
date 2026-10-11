@@ -218,6 +218,49 @@ impl StartFilter {
         })
     }
 
+    /// Backtracks an attempt performs at a position that is not a candidate.
+    pub(crate) fn cost(&self) -> usize {
+        self.cost
+    }
+
+    /// Whether candidates are where a leading lookbehind's literals end.
+    pub(crate) fn follows_lookbehind(&self) -> bool {
+        matches!(self.candidates, Candidates::Behind { .. })
+    }
+
+    /// The first candidate in `from..=end`.
+    pub(crate) fn next(&self, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
+        self.find(haystack, from).filter(|&at| at <= end)
+    }
+
+    /// Whether `at` is a candidate, tested at that position alone; positions
+    /// where it is not fail at the fixed cost.
+    pub(crate) fn admits(&self, haystack: &[u8], at: usize) -> bool {
+        let byte_in = |set: &ByteSet, at: usize| haystack.get(at).is_some_and(|&b| set.contains(b));
+        let first = match &self.candidates {
+            Candidates::Literal(prefilter) => prefilter
+                .prefix(haystack, Span::from(at..haystack.len()))
+                .is_some(),
+            Candidates::Bytes(set) => byte_in(set, at),
+            Candidates::Behind {
+                literals,
+                len,
+                firsts,
+            } => {
+                at >= *len
+                    && literals
+                        .prefix(haystack, Span::from(at - len..at))
+                        .is_some()
+                    && firsts.as_ref().is_none_or(|firsts| byte_in(firsts, at))
+            }
+        };
+        first
+            && self
+                .seconds
+                .as_ref()
+                .is_none_or(|seconds| byte_in(seconds, at + 1))
+    }
+
     /// The first candidate at or after `start`.
     fn find(&self, haystack: &[u8], mut start: usize) -> Option<usize> {
         loop {
