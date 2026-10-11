@@ -119,6 +119,7 @@ use crate::RegexInput;
 use crate::RegexOptionsBuilder;
 use regex_automata::Anchored;
 use regex_automata::Input as RaInput;
+use regex_automata::MatchError;
 use regex_automata::MatchErrorKind;
 use regex_automata::MatchKind;
 use regex_automata::PatternID;
@@ -136,7 +137,7 @@ use crate::CompileError;
 use crate::Error;
 use crate::RegexOptions;
 use crate::vm::OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH;
-use crate::{BytesMode, Captures, Regex, Result};
+use crate::{BytesMode, Captures, Regex, Result, RuntimeError};
 
 type DfaCachePoolFactory = alloc::boxed::Box<
     dyn Fn() -> dfa::Cache + Send + Sync + core::panic::UnwindSafe + core::panic::RefUnwindSafe,
@@ -247,6 +248,15 @@ impl RegexSetOptions {
         self.overlapping_dfa_skip_cache_capacity_check = yes;
         self
     }
+}
+
+/// Whether the overlapping DFA stopped for a reason the per-pattern fallback
+/// handles. Any other failure is reported, not hidden.
+fn dfa_gave_up(error: &MatchError) -> bool {
+    matches!(
+        error.kind(),
+        MatchErrorKind::Quit { .. } | MatchErrorKind::GaveUp { .. }
+    )
 }
 
 impl RegexSet {
@@ -497,18 +507,16 @@ impl RegexSet {
                     &overlapping_input,
                     &mut seen_pattern_indices,
                 ) {
-                    match e.kind() {
-                        MatchErrorKind::Quit { .. } | MatchErrorKind::GaveUp { .. } => {
-                            // The DFA gave up (e.g. it encountered non-ASCII bytes while
-                            // unicode word boundaries are enabled, which adds quit bytes
-                            // for multi-byte UTF-8 sequences). Fall back to trying every
-                            // pattern at this position so correctness is preserved.
-                            seen_pattern_indices.clear();
-                            for i in 0..self.regexes.len() {
-                                seen_pattern_indices.insert(PatternID::must(i));
-                            }
-                        }
-                        _ => panic!("unexpected overlapping DFA error: {:?}", e),
+                    if !dfa_gave_up(&e) {
+                        return Err(Error::RuntimeError(RuntimeError::InnerError(e)));
+                    }
+                    // The DFA gave up (e.g. it encountered non-ASCII bytes while
+                    // unicode word boundaries are enabled, which adds quit bytes
+                    // for multi-byte UTF-8 sequences). Fall back to trying every
+                    // pattern at this position so correctness is preserved.
+                    seen_pattern_indices.clear();
+                    for i in 0..self.regexes.len() {
+                        seen_pattern_indices.insert(PatternID::must(i));
                     }
                 }
             } // release cache_guard back to pool before doing per-pattern matching
@@ -711,6 +719,17 @@ mod tests {
         DEFAULT_OVERLAPPING_DFA_CACHE_CAPACITY, RegexSet, RegexSetOptions,
     };
     use crate::{Error, RegexInput, RegexOptionsBuilder, RuntimeError};
+
+    #[test]
+    fn only_dfa_quits_fall_back_to_every_pattern() {
+        use regex_automata::{Anchored, MatchError};
+        assert!(super::dfa_gave_up(&MatchError::quit(b'x', 3)));
+        assert!(super::dfa_gave_up(&MatchError::gave_up(3)));
+        assert!(!super::dfa_gave_up(&MatchError::unsupported_anchored(
+            Anchored::Yes
+        )));
+        assert!(!super::dfa_gave_up(&MatchError::haystack_too_long(10)));
+    }
 
     #[test]
     fn regex_set_options_defaults_to_larger_regex_automata_limits() {

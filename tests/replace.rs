@@ -1,4 +1,4 @@
-use regexrs::{Captures, NoExpand};
+use regexrs::{Captures, Error, NoExpand, RegexBuilder, RuntimeError};
 use std::borrow::Cow;
 
 mod common;
@@ -79,4 +79,52 @@ fn replace_all() {
 fn replacen() {
     let regex = common::regex("bla");
     assert_eq!(regex.replacen("blablabla", 2, "foo"), "foofoobla");
+}
+
+/// The fallible conveniences report the first matching error instead of
+/// panicking, whatever the replacer.
+#[test]
+fn try_replace_reports_limit_errors() {
+    let regex = RegexBuilder::new(r"(a+)+\1$")
+        .backtrack_limit(100)
+        .build()
+        .unwrap();
+    let text = "aaaaaaaaaaaaaaaaaaaa!";
+    for result in [
+        regex.try_replace(text, "x"),
+        regex.try_replace_all(text, "x"),
+        regex.try_replace_all(text, |caps: &Captures| caps[0].to_owned()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded))
+        ));
+    }
+}
+
+/// Successful results equal the panicking methods, including borrowing the
+/// input when nothing matched.
+#[test]
+fn try_replace_equals_replace_on_success() {
+    let regex = common::regex(r"(?<word>\w+)\s+\k<word>");
+    let text = "the the cat cat sat";
+    assert_eq!(
+        regex.try_replace(text, "$word").unwrap(),
+        regex.replace(text, "$word")
+    );
+    assert_eq!(regex.try_replace_all(text, "$word").unwrap(), "the cat sat");
+    assert!(matches!(
+        regex.try_replace_all("no repeats", "x").unwrap(),
+        Cow::Borrowed("no repeats")
+    ));
+}
+
+/// `Captures` defaults to `str`, so closures need no type arguments.
+#[test]
+fn replacement_closures_infer_str_captures() {
+    let regex = common::regex(r"(\d+)");
+    let doubled = regex.replace_all("1 22", |caps: &Captures| {
+        (caps[1].parse::<u32>().unwrap() * 2).to_string()
+    });
+    assert_eq!(doubled, "2 44");
 }

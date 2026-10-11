@@ -674,3 +674,12 @@ fn continue_from_previous_match_end_override_is_suppression_only() {
         .collect();
     assert_eq!(cleared_override_spans, default_spans);
 }
+
+/// `native(false)` compiles with or without the `native` feature, so a library
+/// can opt out even when feature unification enables native code elsewhere.
+#[test]
+fn native_opt_out_does_not_require_the_feature() {
+    let regex = build_regex(RegexBuilder::new(r"(\w+) \1").native(false));
+    assert!(regex.is_match("word word").unwrap());
+    assert!(!regex.has_native_code());
+}

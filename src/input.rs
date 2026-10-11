@@ -104,6 +104,11 @@ impl<'h, S: Input + ?Sized> RegexInput<'h, S> {
     ///
     /// This override is suppression-only: `false` suppresses the assertion, while
     /// `true` clears the override and preserves default behavior.
+    ///
+    /// Overrides take effect only for a regex built with
+    /// [`allow_input_assertion_overrides`] enabled; other regexes ignore them.
+    ///
+    /// [`allow_input_assertion_overrides`]: crate::RegexBuilder::allow_input_assertion_overrides
     pub fn start_text(mut self, yes: bool) -> Self {
         self.start_text = if yes { None } else { Some(false) };
         self
@@ -114,6 +119,11 @@ impl<'h, S: Input + ?Sized> RegexInput<'h, S> {
     ///
     /// This override is suppression-only: `false` suppresses the assertion, while
     /// `true` clears the override and preserves default behavior.
+    ///
+    /// Overrides take effect only for a regex built with
+    /// [`allow_input_assertion_overrides`] enabled; other regexes ignore them.
+    ///
+    /// [`allow_input_assertion_overrides`]: crate::RegexBuilder::allow_input_assertion_overrides
     pub fn end_text(mut self, yes: bool) -> Self {
         self.end_text = if yes { None } else { Some(false) };
         self
@@ -124,6 +134,11 @@ impl<'h, S: Input + ?Sized> RegexInput<'h, S> {
     ///
     /// This override is suppression-only: `false` suppresses the assertion, while
     /// `true` clears the override and preserves default behavior.
+    ///
+    /// Overrides take effect only for a regex built with
+    /// [`allow_input_assertion_overrides`] enabled; other regexes ignore them.
+    ///
+    /// [`allow_input_assertion_overrides`]: crate::RegexBuilder::allow_input_assertion_overrides
     pub fn continue_from_previous_match_end(mut self, yes: bool) -> Self {
         self.continue_from_previous_match_end = if yes { None } else { Some(false) };
         self

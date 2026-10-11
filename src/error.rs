@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::fmt;
+use regex_automata::MatchError as RaMatchError;
 use regex_automata::meta::BuildError as RaBuildError;
 
 /// Result type for this crate with specific error enum.
@@ -106,6 +107,9 @@ pub enum RuntimeError {
     /// Configure using
     /// [`RegexBuilder::backtrack_limit`](struct.RegexBuilder.html#method.backtrack_limit).
     BacktrackLimitExceeded,
+    /// An underlying `regex-automata` search failed in a way this crate does
+    /// not recover from by falling back to another engine.
+    InnerError(RaMatchError),
 }
 
 #[cfg(feature = "std")]
@@ -210,6 +214,7 @@ impl fmt::Display for RuntimeError {
             RuntimeError::BacktrackLimitExceeded => {
                 write!(f, "Max limit for backtracking count exceeded")
             }
+            RuntimeError::InnerError(e) => write!(f, "Underlying search failed: {}", e),
         }
     }
 }

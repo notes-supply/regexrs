@@ -338,9 +338,10 @@ impl<'r, 't, S: input::Input + ?Sized> Iterator for CaptureMatches<'r, 't, S> {
 
 /// A set of capture groups found for a regex.
 ///
-/// `S` is the input type (`str` or `[u8]`).
+/// `S` is the input type, `str` by default, so a replacement closure can be
+/// written `|caps: &Captures| ...`. Byte haystacks produce `Captures<'_, [u8]>`.
 #[derive(Debug)]
-pub struct Captures<'t, S: input::Input + ?Sized> {
+pub struct Captures<'t, S: input::Input + ?Sized = str> {
     inner: CapturesImpl,
     named_groups: Arc<NamedGroups>,
     input: &'t S,
@@ -640,13 +641,22 @@ impl Default for RegexOptionsBuilder {
 }
 
 impl RegexOptionsBuilder {
-    /// Enable optional native acceleration for supported whole-string boolean
-    /// searches. The `native` feature is required; unsupported platforms and
+    /// Enable or disable native acceleration for supported whole-string
+    /// boolean searches. It is enabled by default, but only takes effect with
+    /// the `native` feature on a supported platform; other platforms and
     /// patterns retain the complete portable engine. Explicit execution limits
     /// always use the portable path, regardless of this setting.
-    #[cfg(feature = "native")]
+    ///
+    /// The method exists with or without the feature, so a library can request
+    /// `native(false)` even when Cargo feature unification enables `native` on
+    /// behalf of another dependency.
     pub fn native(&mut self, enabled: bool) -> &mut Self {
-        self.options.native_enabled = enabled;
+        #[cfg(feature = "native")]
+        {
+            self.options.native_enabled = enabled;
+        }
+        #[cfg(not(feature = "native"))]
+        let _ = enabled;
         self
     }
 
@@ -997,7 +1007,6 @@ impl RegexOptionsBuilder {
 
 impl RegexBuilder {
     /// See [`RegexOptionsBuilder::native`].
-    #[cfg(feature = "native")]
     pub fn native(&mut self, enabled: bool) -> &mut Self {
         self.options.native(enabled);
         self
@@ -1957,8 +1966,37 @@ impl Regex {
     /// let result = re.replace("Springsteen, Bruce", NoExpand("$2 $last"));
     /// assert_eq!(result, "$2 $last");
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if matching fails, for example with
+    /// [`RuntimeError::BacktrackLimitExceeded`]. Use [`Regex::try_replace`] to
+    /// handle the error instead.
     pub fn replace<'t, R: Replacer>(&self, text: &'t str, rep: R) -> Cow<'t, str> {
         self.replacen(text, 1, rep)
+    }
+
+    /// Replaces the leftmost-first match, returning an error instead of
+    /// panicking if matching fails.
+    ///
+    /// The replacement syntax is that of [`Regex::replace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first matching error, such as
+    /// [`RuntimeError::BacktrackLimitExceeded`]; no partial result is returned.
+    ///
+    /// ```rust
+    /// # use regexrs::{Captures, Regex};
+    /// let re = Regex::new(r"(?<last>[^,\s]+),\s+(?<first>\S+)")?;
+    /// let swapped = re.try_replace("Springsteen, Bruce", |caps: &Captures| {
+    ///     format!("{} {}", &caps["first"], &caps["last"])
+    /// })?;
+    /// assert_eq!(swapped, "Bruce Springsteen");
+    /// # Ok::<(), regexrs::Error>(())
+    /// ```
+    pub fn try_replace<'t, R: Replacer>(&self, text: &'t str, rep: R) -> Result<Cow<'t, str>> {
+        self.try_replacen(text, 1, rep)
     }
 
     /// Replaces all non-overlapping matches in `text` with the replacement
@@ -1967,16 +2005,44 @@ impl Regex {
     ///
     /// See the documentation for `replace` for details on how to access
     /// capturing group matches in the replacement string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if matching fails; use [`Regex::try_replace_all`] to handle the
+    /// error instead.
     pub fn replace_all<'t, R: Replacer>(&self, text: &'t str, rep: R) -> Cow<'t, str> {
         self.replacen(text, 0, rep)
+    }
+
+    /// Replaces all non-overlapping matches, returning an error instead of
+    /// panicking if matching fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first matching error, such as
+    /// [`RuntimeError::BacktrackLimitExceeded`]; no partial result is returned.
+    ///
+    /// ```rust
+    /// # use regexrs::{Error, RegexBuilder, RuntimeError};
+    /// let re = RegexBuilder::new(r"(a+)+\1$").backtrack_limit(100).build()?;
+    /// assert!(matches!(
+    ///     re.try_replace_all("aaaaaaaaaaaaaaaaaaaa!", ""),
+    ///     Err(Error::RuntimeError(RuntimeError::BacktrackLimitExceeded))
+    /// ));
+    /// # Ok::<(), regexrs::Error>(())
+    /// ```
+    pub fn try_replace_all<'t, R: Replacer>(&self, text: &'t str, rep: R) -> Result<Cow<'t, str>> {
+        self.try_replacen(text, 0, rep)
     }
 
     /// Replaces at most `limit` non-overlapping matches in `text` with the
     /// replacement provided. If `limit` is 0, then all non-overlapping matches
     /// are replaced.
     ///
-    /// Will panic if any errors are encountered. Use `try_replacen`, which this
-    /// function unwraps, if you want to handle errors.
+    /// # Panics
+    ///
+    /// Panics if matching fails. Use [`Regex::try_replacen`], which this
+    /// function unwraps, to handle the error instead.
     ///
     /// See the documentation for `replace` for details on how to access
     /// capturing group matches in the replacement string.
