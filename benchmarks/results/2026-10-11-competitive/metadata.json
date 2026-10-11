@@ -1,0 +1,138 @@
+{
+  "baselineCommit": "34cf8625ffecff621ccd94b209e8b19ee031b722",
+  "candidateCommit": "cd261540d684686a71260bd8c556cd5a9c58e53a",
+  "harness": "463d00f31887e84c38467805b9e3122c314b9521",
+  "repetitions": 6,
+  "measured_rows": 1584,
+  "errors": 0,
+  "elapsed_seconds": 506.4715292453766,
+  "cpu": 2,
+  "max_time": "200ms",
+  "max_warmup_time": "50ms",
+  "max_iters": 10000000,
+  "orders": [
+    {
+      "engines": [
+        "regexrs",
+        "regex",
+        "fancy",
+        "resharp",
+        "regexrs-searcher",
+        "regexrs-regular",
+        "fancy-seek",
+        "regexrs-native",
+        "regexrs-seek"
+      ],
+      "revisions": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "engines": [
+        "regexrs",
+        "regexrs-seek",
+        "regexrs-native",
+        "fancy-seek",
+        "regexrs-regular",
+        "regexrs-searcher",
+        "resharp",
+        "fancy",
+        "regex"
+      ],
+      "revisions": [
+        "candidate",
+        "baseline"
+      ]
+    },
+    {
+      "engines": [
+        "fancy",
+        "resharp",
+        "regexrs-searcher",
+        "regexrs-regular",
+        "fancy-seek",
+        "regexrs-native",
+        "regexrs-seek",
+        "regexrs",
+        "regex"
+      ],
+      "revisions": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "engines": [
+        "fancy",
+        "regex",
+        "regexrs",
+        "regexrs-seek",
+        "regexrs-native",
+        "fancy-seek",
+        "regexrs-regular",
+        "regexrs-searcher",
+        "resharp"
+      ],
+      "revisions": [
+        "candidate",
+        "baseline"
+      ]
+    },
+    {
+      "engines": [
+        "regexrs-searcher",
+        "regexrs-regular",
+        "fancy-seek",
+        "regexrs-native",
+        "regexrs-seek",
+        "regexrs",
+        "regex",
+        "fancy",
+        "resharp"
+      ],
+      "revisions": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "engines": [
+        "regexrs-searcher",
+        "resharp",
+        "fancy",
+        "regex",
+        "regexrs",
+        "regexrs-seek",
+        "regexrs-native",
+        "fancy-seek",
+        "regexrs-regular"
+      ],
+      "revisions": [
+        "candidate",
+        "baseline"
+      ]
+    }
+  ],
+  "benchmarkSource": "cd261540d684686a71260bd8c556cd5a9c58e53a",
+  "toolchain": "nightly-2026-10-11",
+  "rustc": "1.101.0-nightly (6f5da406b 2026-10-10)",
+  "runner_features": [
+    "native"
+  ],
+  "runner_source_sha256": "40791e01453cfe44aa137d5f0b07f6af8c1d5c2c19cd6289374f26e00a9239de",
+  "binaries": {
+    "baseline": "a4ebe361d48b146949e3f8bc638d359bb272d10d5d4848b0fbed5b1aa3adf02e",
+    "candidate": "f4412d96ff98f275e21899abf8c8a0a78d421c987e6fbb2a32a0aba48920419c"
+  },
+  "definitions": 33,
+  "verified_rows_per_revision": 132,
+  "governor": "performance",
+  "smt_siblings": "2,18",
+  "os": "Linux 7.2.5-3-omarchy x86_64",
+  "cpu_model": "AMD Ryzen 9 9950X3D",
+  "isolation": "CPU 2 pinned; SMT sibling not reserved; shared physical workstation; no task builds or profiling on measurement host during timing",
+  "aggregation": "median of six run medians; min/max are ranges of those medians, not confidence intervals",
+  "adapter": "Both library revisions used the candidate benchmark runner, definitions, fixtures, dependency lock and features. Engine order rotates and reverses; baseline/candidate order alternates each repetition. Six rotations do not fully balance nine engine positions.",
+  "scope": "Curated workload comparisons; warm matching and in-process pattern construction, not a universal ranking. Source changed only in package metadata/docs for release."
+}

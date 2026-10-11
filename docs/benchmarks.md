@@ -141,6 +141,62 @@ shared VM, only show that the harness works.
 The suite does not measure consumer build time, binary size, retained memory,
 allocations, concurrency or adversarial scaling; those need separate tools.
 
+## Competitive pass, 2026-10-11
+
+The current tables compare candidate `cd261540d684686a71260bd8c556cd5a9c58e53a`
+with frozen baseline `34cf8625ffecff621ccd94b209e8b19ee031b722`.
+Both library revisions used the candidate's exact runner, dependency lock,
+fixtures, definitions and features, including `regexrs-seek`. The release
+changes package metadata and documentation, not measured library code.
+
+The physical host was an AMD Ryzen 9 9950X3D, Linux 7.2.5-3-omarchy, performance
+governor, nightly-2026-10-11. Each process was pinned to CPU 2; its SMT sibling
+was not reserved. No task builds or profiling ran on the host during timing.
+This is a shared workstation, not an isolated benchmark machine.
+
+All 132 exact-result and expected-count gates passed on each revision before
+timing. Six repetitions rotated and reversed engine order, alternating the
+baseline/candidate order for each pair. This does not fully balance all nine
+engine positions. Each row used 50 ms warmup and a 200 ms measurement budget,
+up to 10 million iterations. All 1,584 timed rows passed count checks.
+
+Numbers are medians of six per-run medians. Ranges are their minimum and
+maximum, not confidence intervals. Matching excludes construction; `compile`
+rows measure in-process pattern construction, not Cargo or cold startup.
+
+- [Paired raw measurements](../benchmarks/results/2026-10-11-competitive/measurements.csv).
+- [All medians and ranges, in nanoseconds](../benchmarks/results/2026-10-11-competitive/summary.csv).
+- [Sources, host, budgets and exact orders](../benchmarks/results/2026-10-11-competitive/metadata.json).
+
+Measured changes:
+
+- `ordinary/rust-keywords` with `regexrs`: 142.42 ms to 11.49 ms, 12.39× as fast.
+- `rich/titled-names` with `regexrs`: 13.92 ms to 65.06 µs, 213.94× as fast.
+- `rich/rust-method-calls` with `regexrs`: 81.53 ms to 6.31 ms, 12.92× as fast.
+
+Non-overlapping regressions above 5% in the same paired run:
+
+- `edge/case-folds` with `regexrs`: 0.24 µs to 0.26 µs, 8.3% slower.
+- `edge/empty-utf8-boundaries` with `regexrs`: 0.38 µs to 0.41 µs, 8.0% slower.
+
+The unchanged regex and Fancy controls also improved by about 32% on the
+literal miss and 8–9% on literal hits between the two runner builds. ReSharp
+was about 11% slower on exclamations. Those shifts prevent attributing the
+literal improvements to regexrs changes; shared code generation or host effects
+remain unisolated. The large routing and lookbehind gains above have no similar
+control shift. Controls, regressions and overlapping ranges remain in the data. Seek remains opt-in,
+not an automatic best choice. ReSharp comparisons cover only patterns whose
+results match; its leftmost-longest semantics are not interchangeable with all
+regexrs patterns. Neither these gains nor the selected README rows establish
+an overall engine ranking.
+
+To reproduce the pair, prepare separate checkouts at the two recorded commits.
+In the baseline measurement checkout only, restore `benchmarks/` from the
+candidate commit so both use the same adapter. Build and verify each with
+`mise run bench:rebar:verify`, then run the per-engine command below in the
+orders recorded in the new metadata. Keep builds and profiling out of timing.
+Preserve the historical baseline separately.
+
 ## Physical baseline, 2026-10-11
 
 The source was clean at `c08c8022a5b4dad8eb9f0ee9f33e23af6f90db55`, with
@@ -168,14 +224,14 @@ eight medians, not a confidence interval or the spread of individual searches.
 - [Every row's median and range, in nanoseconds](../benchmarks/results/2026-10-11/summary.csv).
 - [Sources, binary identity, host conditions, budgets and engine orders](../benchmarks/results/2026-10-11/metadata.json).
 
-The README groups selected rows by workload and configuration, with each time
-expressed relative to the fastest median in that row. Notable findings include:
+The historical dataset below predates the current README tables. Findings at
+that revision included:
 
 - Default `Regex` took 140.92 ms for `ordinary/rust-keywords`, against 9.98 ms
   for regex. At that revision those word boundaries ran on the rich VM: an
   inherited routing cost, not evidence that automata are slower. Later
-  revisions route such patterns to automata; this baseline has not been
-  repeated since.
+  revisions route such patterns to automata; the paired competitive pass above measures
+  the later revision.
 - `rich/titled-names` took 13.68 ms with default `Regex`, 1.32 ms with
   Fancy's opt-in seek prefilter, and 25.34 µs with ReSharp. Default and tuned
   configurations must stay separate; default-only comparisons hide this gap.
