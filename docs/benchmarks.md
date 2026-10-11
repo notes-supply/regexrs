@@ -135,3 +135,60 @@ shared VM, only show that the harness works.
 
 The suite does not measure consumer build time, binary size, retained memory,
 allocations, concurrency or adversarial scaling; those need separate tools.
+
+## Physical baseline, 2026-10-11
+
+The source was clean at `c08c8022a5b4dad8eb9f0ee9f33e23af6f90db55`, with
+nightly-2026-10-11 and the Rebar revision and dependencies pinned above.
+The host ran Linux 7.2.5-3-omarchy on an AMD Ryzen 9 9950X3D with the
+performance governor. Each process was pinned to logical CPU 2 with `taskset`.
+Its SMT sibling, CPU 18, was not reserved. No compilation or profiling ran
+during measurement. This is a controlled run on a shared workstation, not a
+dedicated isolated benchmark machine.
+
+Every engine ran eight times. Engine positions and immediate predecessors
+were balanced across the eight orders recorded in
+[metadata.json](../benchmarks/results/2026-10-11/metadata.json).
+Each row had a 50 ms warmup and a 200 ms measurement budget, with an iteration
+cap of 10 million. Matching rows exclude pattern construction and initial
+native compilation. The `compile` rows time in-process pattern construction,
+not Cargo builds or cold process startup.
+
+All 112 exact-result gates passed before measurement. All 896 timed rows
+passed their expected-count checks. The figures are the median of eight
+per-run medians; the reported range is the minimum and maximum of those
+eight medians, not a confidence interval or the spread of individual searches.
+
+- [Raw measurements](../benchmarks/results/2026-10-11/measurements.csv).
+- [Every row's median and range, in nanoseconds](../benchmarks/results/2026-10-11/summary.csv).
+- [Sources, binary identity, host conditions, budgets and engine orders](../benchmarks/results/2026-10-11/metadata.json).
+
+The README selects six rows from this data. Important findings outside that
+excerpt include:
+
+- Default `Regex` took 140.92 ms for `ordinary/rust-keywords`, against 9.98 ms
+  for regex. Those word boundaries still run on the rich VM. This is an
+  inherited routing cost, not evidence that automata are slower.
+- `rich/titled-names` took 13.68 ms with default `Regex`, 1.32 ms with
+  Fancy's opt-in seek prefilter, and 25.34 µs with ReSharp. Default and tuned
+  configurations must stay separate; default-only comparisons hide this gap.
+- `regular/bounded-words` took 5.47 ms with `RegularRegex` and 11.25 ms with
+  `Regex`. But `regular/log-extract` took 638 µs versus 177 µs. Disabling
+  bounded backtracking moves some capture work to the PikeVM.
+- `scratch/log-records` took 174.61 µs through retained `Searcher` locations,
+  175.01 µs through owned `Regex` captures, and 174.10 µs through the regex
+  crate's retained locations. Their ranges overlap. Reusing scratch is not a
+  demonstrated speedup here, and this suite does not count allocations.
+
+To repeat the measurement after `mise run bench:rebar:verify`, run each engine
+separately in the recorded orders, saving each CSV:
+
+```sh
+cd benchmarks
+taskset -c 2 target/release/rebar measure -d rebar -e '^regexrs$' \
+  --max-time 200ms --max-warmup-time 50ms --max-iters 10000000 > regexrs.csv
+```
+
+Use an available physical core on your own host. Repeat for all eight engine
+names and aggregate medians within each row; do not combine unrelated workloads
+or use this host's timings as universal expectations.

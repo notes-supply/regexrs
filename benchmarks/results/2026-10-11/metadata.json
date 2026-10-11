@@ -1,0 +1,111 @@
+{
+  "source": "c08c8022a5b4dad8eb9f0ee9f33e23af6f90db55",
+  "rebar": "463d00f31887e84c38467805b9e3122c314b9521",
+  "toolchain": "nightly-2026-10-11",
+  "cpu": 2,
+  "repetitions": 8,
+  "definitions": 33,
+  "verified_rows": 112,
+  "measured_rows": 896,
+  "errors": 0,
+  "elapsed_seconds": 292.59855914115906,
+  "binary_sha256": "2d2438e5674aaa00958dbe40b358b3b2cfa38f084aa40142918a7eccc5fcab9e",
+  "max_time": "200ms",
+  "max_warmup_time": "50ms",
+  "max_iters": 10000000,
+  "orders": [
+    [
+      "regexrs",
+      "regex",
+      "regexrs-native",
+      "fancy",
+      "fancy-seek",
+      "resharp",
+      "regexrs-regular",
+      "regexrs-searcher"
+    ],
+    [
+      "regex",
+      "fancy",
+      "regexrs",
+      "resharp",
+      "regexrs-native",
+      "regexrs-searcher",
+      "fancy-seek",
+      "regexrs-regular"
+    ],
+    [
+      "fancy",
+      "resharp",
+      "regex",
+      "regexrs-searcher",
+      "regexrs",
+      "regexrs-regular",
+      "regexrs-native",
+      "fancy-seek"
+    ],
+    [
+      "resharp",
+      "regexrs-searcher",
+      "fancy",
+      "regexrs-regular",
+      "regex",
+      "fancy-seek",
+      "regexrs",
+      "regexrs-native"
+    ],
+    [
+      "regexrs-searcher",
+      "regexrs-regular",
+      "resharp",
+      "fancy-seek",
+      "fancy",
+      "regexrs-native",
+      "regex",
+      "regexrs"
+    ],
+    [
+      "regexrs-regular",
+      "fancy-seek",
+      "regexrs-searcher",
+      "regexrs-native",
+      "resharp",
+      "regexrs",
+      "fancy",
+      "regex"
+    ],
+    [
+      "fancy-seek",
+      "regexrs-native",
+      "regexrs-regular",
+      "regexrs",
+      "regexrs-searcher",
+      "regex",
+      "resharp",
+      "fancy"
+    ],
+    [
+      "regexrs-native",
+      "regexrs",
+      "fancy-seek",
+      "regex",
+      "regexrs-regular",
+      "fancy",
+      "regexrs-searcher",
+      "resharp"
+    ]
+  ],
+  "date": "2026-10-11",
+  "cpu_model": "AMD Ryzen 9 9950X3D",
+  "cpu_smt_sibling": 18,
+  "governor": "performance",
+  "os": "Linux 7.2.5-3-omarchy x86_64",
+  "isolation": "taskset CPU 2; SMT sibling not reserved; no build or profiling during measurement",
+  "runner_features": [
+    "native"
+  ],
+  "source_status": "clean",
+  "aggregation": "median of eight per-run medians; min/max are the range of those medians, not individual iterations",
+  "correctness": "112 exact ordered span/capture/per-record gates; every timed iteration also checked its expected count",
+  "scope": "curated suite; warm matching and in-process pattern compilation; not universal market evidence"
+}

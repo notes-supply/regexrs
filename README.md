@@ -35,5 +35,24 @@ and other workloads, and [the Rebar suite](docs/benchmarks.md) for verified
 cross-engine comparisons. Benchmark tools and reference engines are
 development-only.
 
+## Measured baseline
+
+Selected Rebar rows on a Ryzen 9 9950X3D, nightly-2026-10-11. Times are
+medians across eight rotated, CPU-pinned runs; lower is better.
+
+| workload | regexrs configuration | time | comparison | time |
+|---|---|---:|---|---:|
+| literal count | `Regex` | 9.49 µs | regex | 9.26 µs |
+| doubled words, per-line boolean | native | 5.85 ms | Fancy, seek enabled | 18.27 ms |
+| Rust raw strings | `Regex` | 10.95 ms | Fancy, seek enabled | 10.07 ms |
+| Unicode word boundaries | `RegularRegex` | 5.47 ms | regex | 4.94 ms |
+| log captures | `RegularRegex` | 638 µs | regex | 177 µs |
+| method-call lookaround | `Regex` | 78.63 ms | ReSharp | 3.17 ms |
+
+The literal difference is within run-to-run variation. `RegularRegex` trades
+backtracking-free searches for slower captures on some patterns. This is a
+curated suite, not an overall ranking. [All results and reproduction details](docs/benchmarks.md#physical-baseline-2026-10-11)
+include the remaining wins and losses.
+
 Independently maintained derivative of Fancy Regex 0.19.1. See [NOTICE](NOTICE)
 for provenance and [LICENSE](LICENSE) for the MIT license.
