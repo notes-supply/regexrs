@@ -49,9 +49,11 @@ anchoring, `Searcher` and `CaptureLocations` give the meta engine's results with
 no reverse search, cache or pool.
 
 `Regex` and `RegularRegex` then keep no meta engine for the pattern. The engine
-is still built once and dropped under explicit size limits, or for a pattern
-large enough that the default limits might reject it, so compile errors are
-unchanged.
+is still built once and dropped under explicit size limits, or when a bound
+over every part of the pattern (literal bytes, classes, repetitions, capture
+groups and assertions) exceeds a budget. Within that budget a pattern needs at
+most about 540 KiB of the default 10 MiB NFA size limit. Construction therefore
+accepts and rejects the same patterns, with the same errors.
 
 Patterns whose only construct beyond the regular subset is a word boundary
 (`\b`, `\B`, `\<`, `\>` and the `\b{...}` forms) are compiled for the portable

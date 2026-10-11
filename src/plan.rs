@@ -67,8 +67,8 @@ pub(crate) struct LinearPlan {
     look_matcher: LookMatcher,
     /// The capture groups of the pattern, with their names.
     group_info: GroupInfo,
-    /// An upper bound on the size of the pattern's Thompson NFA, in UTF-8
-    /// sequences and literal bytes.
+    /// An upper bound on the size of the pattern's Thompson NFA; see
+    /// [`nfa_bound`].
     nfa_units: usize,
 }
 
@@ -93,8 +93,6 @@ struct Run {
     /// For a class of every scalar value but at most three ASCII bytes, those
     /// bytes: in valid UTF-8 the run ends at the next of them.
     stops: Option<Stops>,
-    /// An upper bound on the UTF-8 sequences, or byte ranges, of the class.
-    units: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -106,8 +104,12 @@ enum Stops {
 }
 
 /// The largest [`LinearPlan::nfa_units`] for which the meta engine's default
-/// size limits, first reached at about 98,000 units, certainly accept the
-/// pattern, so its engine need not be built to find out.
+/// NFA size limit certainly accepts the pattern, so its engine need not be
+/// built to find out. Against that limit, a unit of any component costs at
+/// most about 66 bytes (astral classes), so a pattern within the budget needs
+/// at most about 540 KiB of the 10 MiB allowed. Repeated components first
+/// exceed the limit at about 160,000 units (astral classes), 200,000
+/// (optional characters) and 327,000 (captures, assertions, literal bytes).
 pub(crate) const NFA_UNIT_BUDGET: usize = 8192;
 
 /// The most bytes a plan's bounded steps may span when an attempt can fail,
@@ -394,16 +396,42 @@ fn sequence_bound(start: char, end: char) -> usize {
     .sum()
 }
 
-/// The class of `class` and its size bound for [`LinearPlan::nfa_units`].
-fn class_of(class: &hir::Class) -> (Class, usize) {
-    let units = match class {
+/// The units of a class: an upper bound on its UTF-8 sequences, or its byte
+/// ranges.
+fn class_units(class: &hir::Class) -> usize {
+    match class {
         hir::Class::Unicode(class) => class
             .iter()
             .map(|range| sequence_bound(range.start(), range.end()))
-            .sum(),
+            .fold(0, usize::saturating_add),
         hir::Class::Bytes(class) => class.ranges().len(),
+    }
+}
+
+/// An upper bound on the size of the Thompson NFA regex-automata compiles from
+/// `hir`, counting every node: a unit per literal byte, empty expression,
+/// assertion and concatenation, a class's [`class_units`], two units per
+/// capture group, and each copy of a repetition's expression plus one. No
+/// node is left out, so a pattern whose engine the default size limit rejects
+/// always exceeds [`NFA_UNIT_BUDGET`].
+fn nfa_bound(hir: &Hir) -> usize {
+    let own = match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Concat(_) | HirKind::Alternation(_) => 1,
+        HirKind::Literal(hir::Literal(bytes)) => bytes.len(),
+        HirKind::Class(class) => class_units(class),
+        HirKind::Capture(_) => 2,
+        HirKind::Repetition(repetition) => {
+            let copies = repetition.max.unwrap_or(repetition.min).max(1) as usize;
+            return nfa_bound(&repetition.sub)
+                .saturating_add(1)
+                .saturating_mul(copies);
+        }
     };
-    (Class::from_hir(class), units)
+    hir.kind()
+        .subs()
+        .iter()
+        .map(nfa_bound)
+        .fold(own, usize::saturating_add)
 }
 
 impl Class {
@@ -701,22 +729,20 @@ fn flatten(
             _ => items.push(Item::Literal(bytes.to_vec())),
         },
         HirKind::Class(class) => {
-            let (class, units) = class_of(class);
             let run = Run {
-                class,
+                class: Class::from_hir(class),
                 min: 1,
                 max: 1,
                 shortest: false,
                 stops: None,
-                units,
             };
             items.push(Item::Run(run, true));
         }
         HirKind::Look(hir_look) => items.push(Item::Look(look(*hir_look))),
         HirKind::Repetition(repetition) => {
-            let (class, units) = match repetition.sub.kind() {
-                HirKind::Class(class) => class_of(class),
-                HirKind::Literal(hir::Literal(bytes)) => (Class::from_literal(bytes)?, 1),
+            let class = match repetition.sub.kind() {
+                HirKind::Class(class) => Class::from_hir(class),
+                HirKind::Literal(hir::Literal(bytes)) => Class::from_literal(bytes)?,
                 _ => return None,
             };
             let max = repetition.max.map_or(usize::MAX, |max| max as usize);
@@ -730,7 +756,6 @@ fn flatten(
                 max,
                 shortest: false,
                 stops,
-                units,
             };
             items.push(Item::Run(run, repetition.greedy));
         }
@@ -917,16 +942,7 @@ impl LinearPlan {
                 }
                 Step::Literal(_) | Step::Run(_) | Step::Save(_) => false,
             };
-        let nfa_units = steps
-            .iter()
-            .map(|step| match step {
-                Step::Literal(bytes) => bytes.len(),
-                // `x{n,}` compiles to `n` copies of `x`, the last repeated.
-                Step::Run(run) if run.max == usize::MAX => run.units.saturating_mul(run.min.max(1)),
-                Step::Run(run) => run.units.saturating_mul(run.max),
-                Step::Save(_) => 0,
-            })
-            .fold(0, usize::saturating_add);
+        let nfa_units = nfa_bound(hir);
         let mut group_names = Vec::new();
         group_names.resize(hir.properties().explicit_captures_len() + 1, None);
         for (index, name) in names {
@@ -950,9 +966,7 @@ impl LinearPlan {
         })
     }
 
-    /// An upper bound on the size of the pattern's Thompson NFA, in UTF-8
-    /// sequences and literal bytes. The meta engine's default size limit is
-    /// reached beyond about 98,000 units.
+    /// [`nfa_bound`] of the pattern, compared with [`NFA_UNIT_BUDGET`].
     pub(crate) fn nfa_units(&self) -> usize {
         self.nfa_units
     }
@@ -1482,6 +1496,46 @@ mod tests {
                 let bound = super::sequence_bound(range.start(), range.end());
                 assert!(actual <= bound, "{pattern} {range:?}: {actual} > {bound}");
             }
+        }
+    }
+
+    /// Every component the default NFA size limit counts takes units in
+    /// proportion. Each family below is repeated as often as it takes for
+    /// 0.1.5 to reject it with that limit (measured once with regex-automata
+    /// 0.4.18, the locked version). There, its bound is over sixteen times the
+    /// budget, so no pattern the limit rejects can skip building the engine.
+    #[test]
+    fn nfa_bound_exceeds_the_budget_wherever_the_default_limit_rejects() {
+        let families: &[(&str, &str, &str, usize)] = &[
+            ("", "()", "a", 109_225),
+            ("", "(a)", "", 109_225),
+            ("", "(?m:^)", "a", 327_673),
+            ("a", "(?m:$)", "", 327_673),
+            ("", r"\b", "a", 327_673),
+            ("", "a", "", 327_672),
+            ("", "(?s:.)", "", 10_878),
+            ("", r"\w", "", 210),
+            ("", "a?", "", 100_823),
+            ("", "a*b", "", 100_823),
+            ("", r"(\w)", "", 210),
+            ("", r"[\x{10000}-\x{10FFFF}]", "", 22_795),
+            ("", r"\p{Han}", "", 2_891),
+            ("", "[€-𝄞]", "", 12_603),
+            ("", "(?i:[a-z])", "", 34_493),
+            ("", r"[\x{80}-\x{7FF}]", "", 79_437),
+        ];
+        for &(prefix, unit, suffix, rejected) in families {
+            let bound = |copies: usize| {
+                let pattern = format!("{prefix}{}{suffix}", unit.repeat(copies));
+                super::nfa_bound(&regex_syntax::parse(&pattern).unwrap())
+            };
+            // The bound grows by the same amount with every copy.
+            let (hundred, two_hundred) = (bound(100), bound(200));
+            let at_rejection = hundred + (two_hundred - hundred) * (rejected - 100) / 100;
+            assert!(
+                at_rejection > 16 * NFA_UNIT_BUDGET,
+                "{unit}: {at_rejection} units where the limit rejects"
+            );
         }
     }
 

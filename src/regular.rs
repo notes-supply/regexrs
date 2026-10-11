@@ -1,6 +1,8 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
-//! Expressions restricted to the regular subset of the syntax, searched by
-//! regex-automata's automata and PikeVM only.
+//! Expressions restricted to the regular subset of the syntax, searched
+//! without backtracking: by a linear plan where the pattern's matches follow
+//! one deterministic path, and otherwise by regex-automata's automata and
+//! PikeVM.
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -56,13 +58,23 @@ use crate::{
 ///
 /// # Complexity
 ///
-/// The engine is regex-automata's meta regex with its bounded backtracker
-/// disabled, leaving DFAs, a one-pass DFA and the PikeVM. One search
-/// (`is_match`, `find`, `captures`) takes `O(m * n)` time for a compiled
-/// pattern of size `m` and a haystack of length `n`. Iterators run one search
-/// per match from the end of the previous one, so a complete iteration can take
-/// `O(m * n^2)` in the worst case, as in the `regex` crate; no linear bound is
-/// claimed for whole iterations.
+/// A pattern whose matches follow one deterministic path is searched by a
+/// linear plan: a sequence of literals and single-character runs, where no
+/// run can take a character that what follows it needs, as in `\w+`,
+/// `"[^"]*"` or `\bfn\s+(\w+)`. The plan scans forward from each candidate
+/// start once, skipping past runs that cannot match, so a search, and a whole
+/// iteration, takes time linear in the haystack for a given pattern.
+///
+/// Any other pattern uses regex-automata's meta regex with its bounded
+/// backtracker disabled, leaving DFAs, a one-pass DFA and the PikeVM. One
+/// search (`is_match`, `find`, `captures`) takes `O(m * n)` time for a
+/// compiled pattern of size `m` and a haystack of length `n`. Iterators run one
+/// search per match from the end of the previous one, so a complete iteration
+/// can take `O(m * n^2)` in the worst case, as in the `regex` crate; no linear
+/// bound is claimed for whole iterations on this engine.
+///
+/// Either way, construction accepts and rejects exactly the patterns the meta
+/// engine's size limits do, with the same errors.
 ///
 /// # Example
 ///
