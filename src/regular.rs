@@ -45,8 +45,9 @@ use crate::{
 /// subroutine calls, `DEFINE` groups, `\K`, `\G`, `\R`, `\Z`, absent operators,
 /// backtracking control verbs and Oniguruma's multi-line `^`. They are
 /// rejected even where [`Regex`] would currently optimize them away, so the
-/// accepted language does not depend on optimizer routing or on which Cargo
-/// features are enabled.
+/// regular-only restriction does not depend on optimizer routing or on which
+/// Cargo features are enabled. As with [`Regex`], Unicode character classes
+/// still require the corresponding Unicode features.
 ///
 /// Builder options that change matching semantics only the backtracking engine
 /// implements (`find_not_empty`, `disallow_empty_match_at_eof_after_newline`,
