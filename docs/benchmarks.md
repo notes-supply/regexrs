@@ -189,6 +189,137 @@ shared VM, only show that the harness works.
 The suite does not measure consumer build time, binary size, retained memory,
 allocations, concurrency or adversarial scaling; those need separate tools.
 
+## Planning and construction pass, 2026-10-11
+
+This pair compares released 0.1.4, `9ebb13d2d262a7c821ab22efad33e917ca75d67f`,
+with `bd59bf9f99aa561e3fc67733949679d71ce9613d`. Both use the candidate's
+adapter, dependency lock, fixtures, features and pinned compiler. The 0.1.5
+release changes package metadata and documentation, not the measured library.
+Earlier 0.1.4 results and README tables are preserved.
+
+The host was an AMD Ryzen 9 9950X3D running Linux 7.2.5-3-omarchy, with the
+performance governor and nightly-2026-10-11. Each process was pinned to CPU 2.
+Its SMT sibling was not reserved. This is a shared workstation. No task builds
+or profiling ran during timing.
+
+Both revisions passed 11 runner tests and exact output and count checks for all
+351 rows before timing. Six repetitions rotated and reversed engine order and
+alternated revision order per pair. Nine engine positions are not completely
+balanced by six repetitions. Each row used a 50 ms warmup and a 200 ms measurement
+budget, up to 10 million iterations. All 4,212 timed rows passed count checks.
+
+Results are medians of six run medians. Ranges are their minimum and maximum,
+not confidence intervals. `compile` measures pattern construction without a
+search. `fresh-MODEL` measures the first actual model run on a new instance,
+constructed outside the interval. `startup-MODEL` includes both construction
+and that first run. Plain models are warmed and retain their working storage.
+No first-use result is inferred from a warmed search.
+
+- [All paired measurements](../benchmarks/results/2026-10-11-planning/measurements.csv).
+- [Every median and range, in nanoseconds](../benchmarks/results/2026-10-11-planning/summary.csv).
+- [Source, host, compiler, budgets and exact orders](../benchmarks/results/2026-10-11-planning/metadata.json).
+
+The implementation avoids unused seek-pattern construction and lets an opt-in
+seek use leading-lookbehind candidates. It does not turn seek on by default.
+Under explicit backtrack limits, seek still leads and rejected candidates retain
+their failure cost. With the default limit, a lookbehind-led seek can return the
+correct answer where the old path exhausted its budget on impossible positions.
+
+Selected before/after results, including construction and small-store startup:
+
+| Workload | Configuration | 0.1.4 | Candidate | Change | Ranges overlap |
+|---|---|---:|---:|---:|---|
+| `titled-compile` | `regexrs` | 136.26 µs | 136.12 µs | -0.1% | yes |
+| `titled-compile` | `regexrs-seek` | 281.38 µs | 265.39 µs | -5.7% | yes |
+| `titled-fresh-small` | `regexrs` | 5.63 µs | 5.87 µs | +4.3% | no |
+| `titled-fresh-small` | `regexrs-seek` | 38.12 µs | 8.82 µs | -76.8% | no |
+| `titled-startup-small` | `regexrs` | 141.81 µs | 141.95 µs | +0.1% | yes |
+| `titled-startup-small` | `regexrs-seek` | 326.50 µs | 281.98 µs | -13.6% | yes |
+| `titled-warm` | `regexrs` | 64.58 µs | 65.40 µs | +1.3% | yes |
+| `titled-warm` | `regexrs-seek` | 1.30 ms | 54.91 µs | -95.8% | no |
+| `titled-miss-compile` | `regexrs` | 135.72 µs | 134.84 µs | -0.7% | yes |
+| `titled-miss-compile` | `regexrs-seek` | 274.13 µs | 290.36 µs | +5.9% | yes |
+| `titled-miss-fresh-small` | `regexrs` | 321.0 ns | 315.5 ns | -1.7% | yes |
+| `titled-miss-fresh-small` | `regexrs-seek` | 34.20 µs | 350.0 ns | -99.0% | no |
+| `titled-miss-startup-small` | `regexrs` | 135.95 µs | 135.72 µs | -0.2% | yes |
+| `titled-miss-startup-small` | `regexrs-seek` | 313.83 µs | 280.81 µs | -10.5% | yes |
+| `titled-miss-warm` | `regexrs` | 25.82 µs | 25.82 µs | -0.0% | yes |
+| `titled-miss-warm` | `regexrs-seek` | 1.30 ms | 25.80 µs | -98.0% | no |
+| `method-calls-compile` | `regexrs` | 1.95 µs | 1.90 µs | -2.6% | yes |
+| `method-calls-compile` | `regexrs-seek` | 6.28 µs | 6.20 µs | -1.3% | no |
+| `method-calls-fresh-small` | `regexrs` | 1.65 µs | 1.67 µs | +1.2% | yes |
+| `method-calls-fresh-small` | `regexrs-seek` | 9.56 µs | 2.67 µs | -72.1% | no |
+| `method-calls-startup-small` | `regexrs` | 3.57 µs | 3.58 µs | +0.3% | yes |
+| `method-calls-startup-small` | `regexrs-seek` | 15.95 µs | 8.83 µs | -44.6% | no |
+| `method-calls-warm` | `regexrs` | 6.33 ms | 6.36 ms | +0.4% | yes |
+| `method-calls-warm` | `regexrs-seek` | 16.87 ms | 3.44 ms | -79.6% | no |
+| `after-space-compile` | `regexrs` | 125.19 µs | 125.07 µs | -0.1% | yes |
+| `after-space-compile` | `regexrs-seek` | 274.79 µs | 281.11 µs | +2.3% | yes |
+| `after-space-fresh-small` | `regexrs` | 73.83 µs | 73.55 µs | -0.4% | yes |
+| `after-space-fresh-small` | `regexrs-seek` | 117.72 µs | 119.06 µs | +1.1% | yes |
+| `after-space-startup-small` | `regexrs` | 199.40 µs | 198.00 µs | -0.7% | yes |
+| `after-space-startup-small` | `regexrs-seek` | 387.30 µs | 392.83 µs | +1.4% | yes |
+| `after-space-warm` | `regexrs` | 9.12 ms | 9.04 ms | -0.9% | yes |
+| `after-space-warm` | `regexrs-seek` | 9.54 ms | 9.61 ms | +0.7% | yes |
+| `rust-keywords-compile` | `regexrs` | 3.74 µs | 3.54 µs | -5.3% | no |
+| `rust-keywords-compile` | `regexrs-seek` | 37.88 µs | 37.34 µs | -1.4% | no |
+| `rust-keywords-fresh-small` | `regexrs` | 27.07 µs | 26.48 µs | -2.2% | no |
+| `rust-keywords-fresh-small` | `regexrs-seek` | 27.26 µs | 26.89 µs | -1.3% | no |
+| `rust-keywords-startup-small` | `regexrs` | 30.16 µs | 29.56 µs | -2.0% | yes |
+| `rust-keywords-startup-small` | `regexrs-seek` | 65.28 µs | 64.20 µs | -1.6% | no |
+| `rust-keywords-warm` | `regexrs` | 11.66 ms | 11.68 ms | +0.1% | yes |
+| `rust-keywords-warm` | `regexrs-seek` | 11.72 ms | 11.70 ms | -0.2% | yes |
+
+Positive changes are slower. Overlapping ranges do not establish a difference.
+
+Non-overlapping regressions above 2%, including unchanged configurations:
+
+- `planning/tripled-words-compile` with `regexrs-seek`: 577.30 µs to 610.70 µs, 5.8% slower.
+- `planning/tripled-words-compile` with `fancy-seek`: 577.20 µs to 605.90 µs, 5.0% slower.
+- `scratch/doubled-words-records` with `regexrs-searcher`: 20.34 ms to 21.22 ms, 4.4% slower.
+- `planning/tripled-words-startup-small` with `regexrs-seek`: 774.27 µs to 807.67 µs, 4.3% slower.
+- `planning/titled-fresh-small` with `regexrs`: 5.63 µs to 5.87 µs, 4.3% slower.
+- `edge/empty-utf8-boundaries` with `fancy`: 365.5 ns to 381.0 ns, 4.2% slower.
+- `planning/literal-miss-compile` with `regexrs`: 1.07 µs to 1.12 µs, 4.2% slower.
+- `planning/tripled-words-startup-small` with `fancy-seek`: 780.99 µs to 813.32 µs, 4.1% slower.
+- `planning/tripled-words-compile` with `fancy`: 2.08 µs to 2.15 µs, 3.9% slower.
+- `scratch/doubled-words-lines` with `regexrs-searcher`: 20.50 ms to 21.20 ms, 3.4% slower.
+- `planning/doubled-words-compile` with `fancy`: 2.17 µs to 2.24 µs, 3.0% slower.
+- `planning/doubled-words-compile` with `regexrs-seek`: 277.83 µs to 285.89 µs, 2.9% slower.
+- `rich/compile-doubled-words` with `regexrs-seek`: 298.64 µs to 306.45 µs, 2.6% slower.
+- `planning/doubled-words-compile` with `fancy-seek`: 278.12 µs to 284.76 µs, 2.4% slower.
+- `rich/exclamations` with `regexrs-seek`: 25.84 µs to 26.36 µs, 2.0% slower.
+
+Tripled-word seek construction was 5.8% slower, while the unchanged fancy-seek
+configuration was 5.0% slower on the same row. Reused doubled-word capture
+searches were 4.4% slower, and the default small-store title first search was
+4.3% slower. These measured losses remain in the results; their cause is not
+established by this paired run. Literal controls in unchanged competitors also
+shifted substantially, so those apparent gains are not attributed to this patch.
+Title seek construction and title construct-plus-search have overlapping ranges
+and are inconclusive. Method-call construct-plus-search has disjoint ranges.
+
+Unchanged competitor shifts and shared-workstation noise limit attribution of
+small differences. This suite covers sparse hits, misses, dense matching and
+literal/class-run controls; it is not an overall engine ranking. Defaults and
+tuned seek configurations remain separate. ReSharp appears only where exact
+results match, not as a claim of interchangeable semantics for all patterns.
+
+Profiles taken separately from timing identify remaining costs in Unicode
+delegate construction, first-use automata setup and dense iterator bookkeeping.
+Those are future work, not improvements included in this release.
+
+To reproduce, use separate checkouts at the source commits above. Restore only
+the measurement checkout's baseline `benchmarks/` directory from the candidate
+so both sides use the same adapter. Run `mise run bench:rebar:verify` on each.
+Then execute the per-engine measurement command in the orders in the metadata,
+with builds and profiling stopped. Keep the historical baseline separately.
+
+```sh
+taskset -c 2 target/release/rebar measure -d rebar -e '^regexrs$' \
+  --max-time 200ms --max-warmup-time 50ms --max-iters 10000000
+```
+
 ## Competitive pass, 2026-10-11
 
 The current tables compare candidate `cd261540d684686a71260bd8c556cd5a9c58e53a`

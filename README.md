@@ -27,6 +27,10 @@ backtracks; its searches cannot fail.
 
 ## Benchmarks
 
+The tables below retain the accepted 0.1.4 measurements. The separate
+[0.1.5 planning comparison](docs/benchmarks.md#planning-and-construction-pass-2026-10-11)
+covers construction, first use, startup and warmed matching.
+
 Measured on an AMD Ryzen 9 9950X3D with nightly-2026-10-11, using six
 CPU-pinned paired runs with rotated engine order. Each result is the median of the
 six candidate run medians. Matching excludes pattern construction.
