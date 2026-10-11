@@ -2699,6 +2699,7 @@ type RegularCache<'c> = Option<(&'c mut regex_automata::meta::Cache, &'c mut RaC
 
 /// The leftmost-first match span of an ordinary engine, through a searcher's
 /// cache when there is one.
+#[inline]
 fn regular_find(
     regex: &RaRegex,
     input: &RaInput<'_>,
@@ -2843,6 +2844,7 @@ where
 
 /// The `regex-automata` input for a search: same haystack, range, start and
 /// anchoring, so every entry point of an ordinary pattern agrees.
+#[inline]
 fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInput<'a> {
     let mut ra_input = RaInput::new(input.haystack().as_bytes()).range(input.get_range());
     ra_input.set_start(input.effective_start());
