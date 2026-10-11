@@ -1,0 +1,397 @@
+analysis = '''
+Construction, first search and warmed matching, kept apart. For each case,
+`compile` times construction alone, `fresh-MODEL` the first run of MODEL on an
+instance constructed outside the timed interval, `startup-MODEL` construction
+plus that first run, both on a small store of about a hundred lines, and the
+plain model warmed matching on the whole haystack with the same calls as the
+other suites. Defaults and tuned configurations (regexrs-seek, fancy-seek) are
+separate engines. regexrs-regular, regex and resharp only appear where their
+semantics match. See docs/benchmarks.md.
+'''
+
+[[bench]]
+model = "compile"
+name = "titled-compile"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 5
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "titled-fresh-small"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 5
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "titled-startup-small"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 5
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "titled-fresh-full"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 269
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count"
+name = "titled-warm"
+regex = '(?<=Mr\. |Dr\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 269
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "titled-miss-compile"
+regex = '(?<=Qx\. |Zq\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "titled-miss-fresh-small"
+regex = '(?<=Qx\. |Zq\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "titled-miss-startup-small"
+regex = '(?<=Qx\. |Zq\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count"
+name = "titled-miss-warm"
+regex = '(?<=Qx\. |Zq\. )[A-Z]\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "method-calls-compile"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 9
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "method-calls-fresh-small"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 9
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "method-calls-startup-small"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 9
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "method-calls-fresh-full"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 19349
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count"
+name = "method-calls-warm"
+regex = '(?<=\.)[a-z][a-z0-9]*(?=\()'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 19349
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "after-space-compile"
+regex = '(?<=\s)\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 847
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "after-space-fresh-small"
+regex = '(?<=\s)\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 847
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "after-space-startup-small"
+regex = '(?<=\s)\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 847
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "count"
+name = "after-space-warm"
+regex = '(?<=\s)\w+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 104521
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "doubled-words-compile"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "fresh-count"
+name = "doubled-words-fresh-small"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "startup-count"
+name = "doubled-words-startup-small"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "count"
+name = "doubled-words-warm"
+regex = '\b(\w+)\s+\1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 15
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "compile"
+name = "tripled-words-compile"
+regex = '\b(\w+) \1 \1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "fresh-grep"
+name = "tripled-words-fresh-small"
+regex = '\b(\w+) \1 \1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "startup-grep"
+name = "tripled-words-startup-small"
+regex = '\b(\w+) \1 \1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "grep"
+name = "tripled-words-warm"
+regex = '\b(\w+) \1 \1\b'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 0
+engines = ["regexrs", "regexrs-seek", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "compile"
+name = "class-run-compile"
+regex = '[a-z]+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 848
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "fresh-count-spans"
+name = "class-run-fresh-small"
+regex = '[a-z]+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 3677
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "startup-count-spans"
+name = "class-run-startup-small"
+regex = '[a-z]+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 3677
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count-spans"
+name = "class-run-warm"
+regex = '[a-z]+'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 432965
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "literal-compile"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 1
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "literal-fresh-small"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 1
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "literal-startup-small"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 1
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "literal-warm"
+regex = 'Sherlock Holmes'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 91
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "literal-miss-compile"
+regex = 'zqxjkw'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "fresh-count"
+name = "literal-miss-fresh-small"
+regex = 'zqxjkw'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "startup-count"
+name = "literal-miss-startup-small"
+regex = 'zqxjkw'
+unicode = true
+haystack = { path = "rebar/sherlock.txt", line-start = 1200, line-end = 1300 }
+count = 0
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "count"
+name = "literal-miss-warm"
+regex = 'zqxjkw'
+unicode = true
+haystack = { path = "rebar/sherlock.txt" }
+count = 0
+engines = ["regexrs", "regexrs-seek", "regexrs-regular", "regex", "fancy", "resharp"]
+
+[[bench]]
+model = "compile"
+name = "rust-keywords-compile"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 29
+engines = ["regexrs", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "fresh-grep"
+name = "rust-keywords-fresh-small"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 22
+engines = ["regexrs", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "startup-grep"
+name = "rust-keywords-startup-small"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt", line-start = 0, line-end = 120 }
+count = 22
+engines = ["regexrs", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "fresh-grep"
+name = "rust-keywords-fresh-full"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 41033
+engines = ["regexrs", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+model = "grep"
+name = "rust-keywords-warm"
+regex = '\b(?:fn|let|mut|impl|struct|pub)\b'
+unicode = true
+haystack = { path = "rebar/rust-src-tools-3b0d4813.txt" }
+count = 41033
+engines = ["regexrs", "regexrs-seek", "regex", "fancy", "fancy-seek"]

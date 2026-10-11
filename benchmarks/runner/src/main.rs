@@ -6,6 +6,12 @@
 //! calls outside any timing and compares the engine's ordered match spans,
 //! every capture span and, for line models, each record's boolean result or
 //! first-match groups against Fancy Regex as the leftmost-first oracle.
+//!
+//! Besides Rebar's models, `fresh-MODEL` times the first run of `MODEL` on an
+//! instance constructed outside the timed interval and never searched before,
+//! including its lazily built engines and caches, and `startup-MODEL` times
+//! construction plus that first run. Each sample uses a new instance, dropped
+//! outside the interval.
 
 use std::io::Write;
 
@@ -403,10 +409,42 @@ fn lines(text: &str) -> impl Iterator<Item = &str> {
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
 }
 
+/// The model a `fresh-` or `startup-` model runs once per instance, and
+/// whether construction is inside the timed interval.
+fn first_run(model: &str) -> Option<(&str, bool)> {
+    model
+        .strip_prefix("fresh-")
+        .map(|base| (base, false))
+        .or_else(|| model.strip_prefix("startup-").map(|base| (base, true)))
+}
+
 fn measure(engine: &str, benchmark: &klv::Benchmark) -> Result<Vec<timer::Sample>> {
     let text = benchmark
         .haystack_str()
         .context("this runner requires UTF-8 haystacks")?;
+    if let Some((base, constructed)) = first_run(&benchmark.model) {
+        let first = |compiled: Engine| -> Result<(usize, Engine)> {
+            let count = Workload::new(&compiled, text).run(base)?;
+            Ok((count, compiled))
+        };
+        if constructed {
+            return timer::run_and_count(
+                benchmark,
+                |(count, _compiled)| Ok(count),
+                || first(Engine::compile(engine, benchmark)?),
+            );
+        }
+        // The untimed step after each sample builds the next sample's instance.
+        let next = std::cell::RefCell::new(Some(Engine::compile(engine, benchmark)?));
+        return timer::run_and_count(
+            benchmark,
+            |(count, _compiled)| {
+                next.replace(Some(Engine::compile(engine, benchmark)?));
+                Ok(count)
+            },
+            || first(next.take().context("an instance per sample")?),
+        );
+    }
     if benchmark.model == "compile" {
         return timer::run_and_count(
             benchmark,
@@ -421,6 +459,32 @@ fn measure(engine: &str, benchmark: &klv::Benchmark) -> Result<Vec<timer::Sample
 
 fn is_line_model(model: &str) -> bool {
     matches!(model, "grep" | "grep-captures" | "first-captures-per-line")
+}
+
+/// What the calls `model` times report in one run over `text`, through a new
+/// workload: for a fresh instance, exactly what its first run computes.
+fn timed_report(engine: &Engine, text: &str, model: &str) -> Result<Report> {
+    let mut workload = Workload::new(engine, text);
+    let mut report = Report::default();
+    for (offset, segment) in segments(text, model) {
+        match model {
+            "count" | "count-spans" | "compile" => workload.for_each_match(segment, |(s, e)| {
+                report.matches.push((s + offset, e + offset))
+            })?,
+            "count-captures" | "grep-captures" => {
+                let captures = report.captures.get_or_insert_with(Vec::new);
+                workload.for_each_captures(segment, |groups| {
+                    captures.push(group_spans(groups, offset))
+                })?
+            }
+            "grep" => report.hits.push(workload.is_match(segment)?),
+            "first-captures-per-line" => report.first.push(
+                workload.first_record(segment, |groups| groups.map(|g| group_spans(g, offset)))?,
+            ),
+            _ => bail!("unsupported benchmark model {model:?}"),
+        }
+    }
+    Ok(report)
 }
 
 /// The text a model searches with its offset: each line for line models,
@@ -506,14 +570,22 @@ fn verify(engine: &str, benchmark: &klv::Benchmark) -> Result<()> {
     let text = benchmark
         .haystack_str()
         .context("this runner requires UTF-8 haystacks")?;
-    let candidate = Engine::compile(engine, benchmark)?;
-    let found = report(&candidate, text, &benchmark.model)?;
-    let expected = report(
-        &Engine::compile("fancy", benchmark)?,
-        text,
-        &benchmark.model,
-    )?;
     let context = format!("{} {engine}:", benchmark.name);
+    let (model, first) = match first_run(&benchmark.model) {
+        Some((base, _)) => (base, true),
+        None => (benchmark.model.as_str(), false),
+    };
+    if first {
+        // The timed calls themselves, on instances nothing searched before.
+        let found = timed_report(&Engine::compile(engine, benchmark)?, text, model)?;
+        let expected = timed_report(&Engine::compile("fancy", benchmark)?, text, model)?;
+        if found != expected {
+            bail!("{context} first run reports {found:?}, Fancy Regex reports {expected:?}");
+        }
+    }
+    let candidate = Engine::compile(engine, benchmark)?;
+    let found = report(&candidate, text, model)?;
+    let expected = report(&Engine::compile("fancy", benchmark)?, text, model)?;
     check_same(
         &format!("{context} match"),
         &found.matches,
@@ -528,7 +600,10 @@ fn verify(engine: &str, benchmark: &klv::Benchmark) -> Result<()> {
         &found.first,
         &expected.first,
     )?;
-    let count = Workload::new(&candidate, text).run(&benchmark.model)?;
+    let count = match first {
+        true => Workload::new(&Engine::compile(engine, benchmark)?, text).run(model)?,
+        false => Workload::new(&candidate, text).run(model)?,
+    };
     println!(
         "verified {} {engine}: {} matches, {} capture sets, {} records, model count {count}",
         benchmark.name,
@@ -750,6 +825,44 @@ ba bab
         assert!(program("regexrs-seek")?.contains("Seek"));
         assert!(!program("regexrs")?.contains("Seek"));
         verify("regexrs-seek", &b)
+    }
+
+    /// `fresh-` and `startup-` models run the base model once per new
+    /// instance, verify its first run against the oracle, and report the base
+    /// model's count for every sample.
+    #[test]
+    fn first_run_models_count_and_verify_like_their_base() -> Result<()> {
+        let text = "ab\nx\n\na\nba bab\n";
+        for base in [
+            "count",
+            "count-spans",
+            "count-captures",
+            "grep",
+            "grep-captures",
+        ] {
+            let expected = {
+                let b = benchmark(r"(a)(b)?", base, text);
+                Workload::new(&Engine::compile("fancy", &b)?, text).run(base)?
+            };
+            for prefix in ["fresh-", "startup-"] {
+                let mut b = benchmark(r"(a)(b)?", &format!("{prefix}{base}"), text);
+                b.max_iters = 3;
+                b.max_warmup_iters = 1;
+                for engine in ENGINE_NAMES {
+                    verify(engine, &b)?;
+                    let samples = measure(engine, &b)?;
+                    assert_eq!(samples.len(), 3, "{engine} {prefix}{base}");
+                    assert!(samples.iter().all(|s| s.count == expected as u64));
+                }
+            }
+        }
+        assert_eq!(
+            first_run("fresh-first-captures-per-line"),
+            Some(("first-captures-per-line", false))
+        );
+        assert_eq!(first_run("startup-grep"), Some(("grep", true)));
+        assert_eq!(first_run("first-captures-per-line"), None);
+        Ok(())
     }
 
     #[test]

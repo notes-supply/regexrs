@@ -89,6 +89,12 @@ target/release/rebar measure -d rebar > "$out/results.csv"
 echo "$out/results.csv"
 """
 
+[tasks."bench:rebar:revision"]
+description = "Build this runner against another regexrs source, or verify such a build: build SOURCE LABEL | verify LABEL"
+depends = ["bench:rebar:build"]
+dir = "{{config_root}}/benchmarks"
+run = "bash revision.sh"
+
 [tasks."bench:rebar:smoke"]
 description = "Short run that exercises the harness; not for performance claims"
 depends = ["bench:rebar:verify"]

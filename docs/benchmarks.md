@@ -58,6 +58,18 @@ counting the participating groups of its first match. It is the record
 extraction case where caller-owned capture storage matters, and is only
 compared within `definitions/scratch.toml`.
 
+Two prefixes time a regex's first use with any of these models:
+
+- `fresh-MODEL` times the first run of MODEL on an instance constructed outside
+  the timed interval and never searched before. Lazily built engines, caches
+  and code are inside the interval.
+- `startup-MODEL` times construction plus that first run.
+
+Every sample uses a new instance, and instances are dropped outside the
+interval. `compile` times construction alone, and the plain models time warmed
+matching. `--verify` also replays the timed calls of a first run on fresh
+instances of the engine and the oracle.
+
 Capture APIs differ by engine, and each row uses the engine's API as listed:
 
 - **Reusable storage:** `regexrs-searcher` (`Searcher::captures_read` into one
@@ -112,8 +124,41 @@ All rows use Unicode mode.
 - `edge.toml`: small checked-in fixtures for empty matches at UTF-8
   boundaries, unmatched versus empty groups, and case folds of different
   UTF-8 widths.
+- `planning.toml`: construction, first use and warmed matching, kept apart, for
+  title lookbehind hits and a full miss, method calls, a dense lookbehind,
+  repeated and tripled words, a regular class run, literal hit and miss
+  controls and the routed keyword lines. Each case has `compile`,
+  `fresh-MODEL` and `startup-MODEL` rows on a store of about a hundred lines,
+  and the warmed model on the whole haystack; some also run `fresh-MODEL` on
+  the whole haystack. regexrs, regexrs-seek, fancy and fancy-seek are on every
+  case, and regexrs-regular, regex and resharp where their semantics match.
 
-The suite has 33 definitions and 132 engine rows.
+The suite has 76 definitions and 351 engine rows; the 219 `planning/` rows can
+be selected or excluded with Rebar's `-f`/`-F '^planning/'`.
+
+### Comparing revisions
+
+`benchmarks/revision.sh` builds this checkout's runner adapter, with its lock,
+features and definitions, against any regexrs source tree, so two revisions run
+the same calls on the same fixtures:
+
+```sh
+git archive 9ebb13d | (mkdir -p /tmp/base && tar -x -C /tmp/base)
+mise run bench:rebar:revision build /tmp/base 9ebb13d
+mise run bench:rebar:revision build "$PWD" candidate
+mise run bench:rebar:revision verify 9ebb13d
+mise run bench:rebar:revision verify candidate
+cd benchmarks
+taskset -c 2 target/release/rebar measure -d target/planning/9ebb13d/suite \
+  -f '^planning/' > base.csv
+taskset -c 2 target/release/rebar measure -d target/planning/candidate/suite \
+  -f '^planning/' > candidate.csv
+target/release/rebar diff base.csv candidate.csv
+```
+
+Each label gets `target/planning/LABEL/regexrs-rebar-runner` and a suite
+directory whose engines run it. Revision builds share `target/planning/cargo`.
+Alternate the revision order across repeated runs.
 
 ### Provenance
 
