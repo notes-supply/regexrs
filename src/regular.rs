@@ -384,7 +384,7 @@ impl FromStr for RegularRegex {
 }
 
 /// The first rich-only option set in `options`.
-fn rich_option(options: &RegexOptions) -> Option<&'static str> {
+pub(crate) fn rich_option(options: &RegexOptions) -> Option<&'static str> {
     let runtime = &options.hard_regex_runtime_options;
     if runtime.find_not_empty {
         Some("the find_not_empty option")
@@ -399,7 +399,7 @@ fn rich_option(options: &RegexOptions) -> Option<&'static str> {
 
 /// The first construct outside the regular subset, in pattern order. Every
 /// variant is listed so a new construct must be classified explicitly.
-fn rich_construct(expr: &Expr) -> Option<&'static str> {
+pub(crate) fn rich_construct(expr: &Expr) -> Option<&'static str> {
     match expr {
         Expr::Empty | Expr::Any { .. } | Expr::Literal { .. } | Expr::Delegate { .. } => None,
         Expr::Assertion(Assertion::EndTextIgnoreTrailingNewlines { .. }) => {

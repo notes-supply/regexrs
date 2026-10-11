@@ -1,25 +1,38 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
 //! Caller-owned search working memory. All selection logic stays in `Regex`.
+use crate::regular_route::Automata;
 use crate::{
     CaptureLocations, CaptureMatches, Captures, Input, Matches, Regex, RegexImpl, RegexInput,
     Result, vm,
 };
 use alloc::boxed::Box;
-use regex_automata::{meta, util::captures::Captures as RaCaptures};
+use regex_automata::{hybrid, meta, util::captures::Captures as RaCaptures};
 
 pub(crate) enum Cache {
     Regular {
         cache: Box<meta::Cache>,
         captures: RaCaptures,
     },
-    Rich(vm::Scratch),
+    /// VM scratch, plus the caches and capture storage of a pattern's
+    /// regular route, created when it is first used.
+    Rich {
+        scratch: vm::Scratch,
+        route: Option<RouteCache>,
+    },
+}
+
+pub(crate) struct RouteCache {
+    dfa: Box<hybrid::regex::Cache>,
+    /// The meta engine's cache and capture storage, created for the first
+    /// search that uses that engine.
+    meta: Option<(Box<meta::Cache>, RaCaptures)>,
 }
 
 impl core::fmt::Debug for Cache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Regular { .. } => "Cache::Regular",
-            Self::Rich(_) => "Cache::Rich",
+            Self::Rich { .. } => "Cache::Rich",
         })
     }
 }
@@ -28,13 +41,47 @@ impl Cache {
     pub(crate) fn regular(&mut self) -> Option<(&mut meta::Cache, &mut RaCaptures)> {
         match self {
             Self::Regular { cache, captures } => Some((cache.as_mut(), captures)),
-            Self::Rich(_) => None,
+            Self::Rich { .. } => None,
         }
+    }
+
+    /// The lazy DFAs' cache of a pattern's regular route, after creating
+    /// the route's caches if this is its first use.
+    pub(crate) fn route(&mut self, automata: &Automata) -> Option<&mut hybrid::regex::Cache> {
+        match self {
+            Self::Rich { route, .. } => Some(Self::route_cache(route, automata).dfa.as_mut()),
+            Self::Regular { .. } => None,
+        }
+    }
+
+    /// The route's meta engine cache and capture storage, created on first use.
+    pub(crate) fn route_meta(
+        &mut self,
+        automata: &Automata,
+    ) -> Option<(&mut meta::Cache, &mut RaCaptures)> {
+        let Self::Rich { route, .. } = self else {
+            return None;
+        };
+        let regex = automata.regex()?;
+        let (cache, captures) = Self::route_cache(route, automata)
+            .meta
+            .get_or_insert_with(|| (Box::new(regex.create_cache()), regex.create_captures()));
+        Some((cache.as_mut(), captures))
+    }
+
+    fn route_cache<'c>(
+        route: &'c mut Option<RouteCache>,
+        automata: &Automata,
+    ) -> &'c mut RouteCache {
+        route.get_or_insert_with(|| RouteCache {
+            dfa: Box::new(automata.create_cache()),
+            meta: None,
+        })
     }
 
     pub(crate) fn rich(&mut self) -> Option<&mut vm::Scratch> {
         match self {
-            Self::Rich(scratch) => Some(scratch),
+            Self::Rich { scratch, .. } => Some(scratch),
             Self::Regular { .. } => None,
         }
     }
@@ -92,7 +139,10 @@ impl<'r> Searcher<'r> {
                 cache: Box::new(inner.create_cache()),
                 captures: inner.create_captures(),
             },
-            RegexImpl::Fancy { .. } => Cache::Rich(vm::new_scratch()),
+            RegexImpl::Fancy { .. } => Cache::Rich {
+                scratch: vm::new_scratch(),
+                route: None,
+            },
         };
         Self { regex, cache }
     }
@@ -104,28 +154,37 @@ impl<'r> Searcher<'r> {
 
     /// Test whether any match exists, reusing working memory.
     pub fn is_match<S: Input + ?Sized>(&mut self, input: &S) -> Result<bool> {
-        if let Some(found) = self.regex.native_match(input) {
-            return Ok(found);
+        match &self.regex.inner {
+            RegexImpl::Wrap { .. } => self.is_match_input(RegexInput::new(input)),
+            RegexImpl::Fancy { .. } => {
+                self.regex
+                    .fancy_is_match(&RegexInput::new(input), true, Some(&mut self.cache))
+            }
         }
-        self.is_match_input(RegexInput::new(input))
     }
 
     /// Test a ranged or anchored search input with the original matching rules.
     pub fn is_match_input<S: Input + ?Sized>(&mut self, input: RegexInput<'_, S>) -> Result<bool> {
-        if input.is_done() {
-            return Ok(false);
+        match &self.regex.inner {
+            RegexImpl::Wrap { inner, .. } => {
+                if input.is_done() {
+                    return Ok(false);
+                }
+                if let Some((cache, _)) = self.cache.regular() {
+                    return Ok(inner
+                        .search_half_with(cache, &crate::ra_input(&input).earliest(true))
+                        .is_some());
+                }
+                Ok(self
+                    .regex
+                    .find_input_raw_cached(&input, 0, Some(&mut self.cache))?
+                    .is_some())
+            }
+            RegexImpl::Fancy { .. } => {
+                self.regex
+                    .fancy_is_match(&input, false, Some(&mut self.cache))
+            }
         }
-        if let (RegexImpl::Wrap { inner, .. }, Some((cache, _))) =
-            (&self.regex.inner, self.cache.regular())
-        {
-            return Ok(inner
-                .search_half_with(cache, &crate::ra_input(&input).earliest(true))
-                .is_some());
-        }
-        Ok(self
-            .regex
-            .find_input_raw_cached(&input, 0, Some(&mut self.cache))?
-            .is_some())
     }
 
     /// Find the leftmost-first match without checking out pooled scratch.

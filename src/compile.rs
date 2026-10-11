@@ -1104,7 +1104,7 @@ pub(crate) fn options_to_rabuilder(options: &CompileOptions, usage: DelegateUsag
     builder
 }
 
-fn meta_config(options: &CompileOptions, usage: DelegateUsage) -> RaConfig {
+pub(crate) fn meta_config(options: &CompileOptions, usage: DelegateUsage) -> RaConfig {
     let mut config = RaConfig::new();
     if let Some(limit) = options.delegate_size_limit {
         config = config.nfa_size_limit(Some(limit));

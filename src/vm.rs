@@ -571,6 +571,20 @@ pub struct Prog {
 }
 
 impl Prog {
+    /// Whether the program repeats, without a bound, an expression that can
+    /// match the empty string. The VM ends such a repetition after an empty
+    /// iteration and continues the match from there, as backtracking engines
+    /// do; regex-automata's engines never take that path, so captures and
+    /// even match spans can differ.
+    pub(crate) fn repeats_empty_matches(&self) -> bool {
+        self.body.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::RepeatEpsilonGr { .. } | Insn::RepeatEpsilonNg { .. }
+            )
+        })
+    }
+
     pub(crate) fn new(
         body: Vec<Insn>,
         n_saves: usize,

@@ -1,0 +1,179 @@
+// Copyright 2026 Notes Supply AB. Distributed under the MIT license.
+//! Automata for patterns that need the backtracking VM only for word
+//! boundaries. `Regex::regular_route` decides per search whether their
+//! results provably equal the VM's.
+//!
+//! The automata are built on the first search that can use them, so
+//! constructing a `Regex` stays as cheap as compiling its VM program.
+//!
+//! Spans come from regex-automata's lazy DFAs, configured as its meta engine
+//! configures them. With Unicode word boundaries they give up on reaching a
+//! non-ASCII byte they would have to classify. The caller then runs the VM,
+//! which is faster on such text than the NFA engines the meta engine would
+//! fall back to. Captures within a span the DFAs found come from the meta
+//! engine, which then only searches that span; it is built for the first
+//! search that needs it.
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::panic::{RefUnwindSafe, UnwindSafe};
+use regex_automata::hybrid;
+use regex_automata::meta::Regex as RaRegex;
+use regex_automata::nfa::thompson::{self, WhichCaptures};
+use regex_automata::util::lazy::Lazy;
+use regex_automata::util::look::LookMatcher;
+use regex_automata::util::pool::Pool;
+use regex_automata::util::prefilter::Prefilter;
+use regex_automata::{Input, MatchError, MatchKind};
+use regex_syntax::hir::{Hir, Look};
+
+use crate::compile::{self, CompileOptions, DelegateUsage};
+
+type BuildFn = Box<dyn Fn() -> Option<Automata> + Send + Sync + UnwindSafe + RefUnwindSafe>;
+type MetaFn = Box<dyn Fn() -> Option<RaRegex> + Send + Sync + UnwindSafe + RefUnwindSafe>;
+type CacheFn = Box<dyn Fn() -> hybrid::regex::Cache + Send + Sync + UnwindSafe + RefUnwindSafe>;
+
+pub(crate) struct RegularRoute {
+    /// ASCII bytes mode: the VM steps one byte at a time, as the automata do.
+    pub(crate) ascii: bool,
+    automata: Lazy<Option<Automata>, BuildFn>,
+}
+
+impl RegularRoute {
+    /// A route for `hir`, whose automata will be compiled with `options`.
+    pub(crate) fn new(
+        hir: Hir,
+        options: CompileOptions,
+        usage: DelegateUsage,
+        ascii: bool,
+    ) -> Self {
+        let build: BuildFn = Box::new(move || Automata::new(&hir, &options, usage));
+        Self {
+            ascii,
+            automata: Lazy::new(build),
+        }
+    }
+
+    /// The automata, built on first use; `None` if they do not fit within
+    /// the configured limits.
+    pub(crate) fn automata(&self) -> Option<&Automata> {
+        Lazy::get(&self.automata).as_ref()
+    }
+}
+
+pub(crate) struct Automata {
+    dfa: Arc<hybrid::regex::Regex>,
+    caches: Pool<hybrid::regex::Cache, CacheFn>,
+    /// The same pattern's meta engine, for captures.
+    regex: Lazy<Option<RaRegex>, MetaFn>,
+}
+
+impl Automata {
+    /// Lazy DFAs for `hir`, configured like the meta engine `options` would
+    /// build, which is itself only built when needed.
+    fn new(hir: &Hir, options: &CompileOptions, usage: DelegateUsage) -> Option<Self> {
+        let config = compile::meta_config(options, usage);
+        let mut look_matcher = LookMatcher::new();
+        look_matcher.set_line_terminator(config.get_line_terminator());
+        let thompson = thompson::Config::new()
+            .utf8(config.get_utf8_empty())
+            .nfa_size_limit(config.get_nfa_size_limit())
+            .shrink(false)
+            .which_captures(WhichCaptures::None)
+            .look_matcher(look_matcher);
+        let forward = thompson::Compiler::new()
+            .configure(thompson.clone())
+            .build_from_hir(hir)
+            .ok()?;
+        let reverse = thompson::Compiler::new()
+            .configure(thompson.reverse(true))
+            .build_from_hir(hir)
+            .ok()?;
+        let prefilter = if config.get_auto_prefilter()
+            && !hir.properties().look_set_prefix().contains(Look::Start)
+        {
+            Prefilter::from_hir_prefix(MatchKind::LeftmostFirst, hir)
+        } else {
+            None
+        };
+        let dfa = hybrid::dfa::Config::new()
+            .match_kind(MatchKind::LeftmostFirst)
+            .specialize_start_states(prefilter.is_some())
+            .prefilter(prefilter)
+            .starts_for_each_pattern(true)
+            .byte_classes(config.get_byte_classes())
+            .unicode_word_boundary(true)
+            .cache_capacity(config.get_hybrid_cache_capacity())
+            .skip_cache_capacity_check(false)
+            .minimum_cache_clear_count(Some(3))
+            .minimum_bytes_per_state(Some(10));
+        let forward = hybrid::dfa::Builder::new()
+            .configure(dfa.clone())
+            .build_from_nfa(forward)
+            .ok()?;
+        let reverse = hybrid::dfa::Builder::new()
+            .configure(
+                dfa.match_kind(MatchKind::All)
+                    .prefilter(None)
+                    .specialize_start_states(false),
+            )
+            .build_from_nfa(reverse)
+            .ok()?;
+        let dfa = Arc::new(hybrid::regex::Builder::new().build_from_dfas(forward, reverse));
+        let create = Arc::clone(&dfa);
+        let create: CacheFn = Box::new(move || create.create_cache());
+        let (hir, options) = (hir.clone(), options.clone());
+        let regex: MetaFn =
+            Box::new(move || compile::compile_inner_from_hir(&hir, &options, usage).ok());
+        Some(Self {
+            caches: Pool::new(create),
+            dfa,
+            regex: Lazy::new(regex),
+        })
+    }
+
+    /// The meta engine, built on first use; `None` if it does not fit within
+    /// the configured limits.
+    pub(crate) fn regex(&self) -> Option<&RaRegex> {
+        Lazy::get(&self.regex).as_ref()
+    }
+
+    pub(crate) fn create_cache(&self) -> hybrid::regex::Cache {
+        self.dfa.create_cache()
+    }
+
+    /// The leftmost-first match span, or `Err` where the DFAs gave up.
+    pub(crate) fn find(
+        &self,
+        input: &Input<'_>,
+        cache: Option<&mut hybrid::regex::Cache>,
+    ) -> Result<Option<(usize, usize)>, MatchError> {
+        let found = match cache {
+            Some(cache) => self.dfa.try_search(cache, input),
+            None => self.dfa.try_search(&mut self.caches.get(), input),
+        }?;
+        Ok(found.map(|found| (found.start(), found.end())))
+    }
+
+    /// Whether there is a match, or `Err` where the DFA gave up.
+    pub(crate) fn is_match(
+        &self,
+        input: &Input<'_>,
+        cache: Option<&mut hybrid::regex::Cache>,
+    ) -> Result<bool, MatchError> {
+        let input = input.clone().earliest(true);
+        let found = match cache {
+            Some(cache) => self
+                .dfa
+                .forward()
+                .try_search_fwd(cache.forward_mut(), &input),
+            None => {
+                let mut cache = self.caches.get();
+                self.dfa
+                    .forward()
+                    .try_search_fwd(cache.forward_mut(), &input)
+            }
+        }?;
+        Ok(found.is_some())
+    }
+}

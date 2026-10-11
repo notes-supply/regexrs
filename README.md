@@ -57,8 +57,10 @@ searches each line separately. regexrs uses its default `Regex`, not `RegularReg
 | `\w+` (Cyrillic) | 9.09 ms (1.31×) | 8.48 ms (1.22×) | 8.82 ms (1.27×) | **6.96 ms (1.00×)** |
 | Rust keyword lines | 140.92 ms (14.12×) | **9.98 ms (1.00×)** | 139.82 ms (14.01×) | 14.84 ms (1.49×) |
 
-Word-boundary patterns still have a routing cost in `Regex`; the keyword row
-shows it. ReSharp is particularly strong on dialogue and name searches here.
+The keyword row was measured while `Regex` ran word-boundary patterns on its
+backtracking engine. They now use automata where the results are identical;
+this row has not been measured since. ReSharp is particularly strong on
+dialogue and name searches here.
 
 ### Backreferences and lookaround
 

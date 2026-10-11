@@ -167,8 +167,10 @@ The README groups selected rows by workload and configuration, with each time
 expressed relative to the fastest median in that row. Notable findings include:
 
 - Default `Regex` took 140.92 ms for `ordinary/rust-keywords`, against 9.98 ms
-  for regex. Those word boundaries still run on the rich VM. This is an
-  inherited routing cost, not evidence that automata are slower.
+  for regex. At that revision those word boundaries ran on the rich VM: an
+  inherited routing cost, not evidence that automata are slower. Later
+  revisions route such patterns to automata; this baseline has not been
+  repeated since.
 - `rich/titled-names` took 13.68 ms with default `Regex`, 1.32 ms with
   Fancy's opt-in seek prefilter, and 25.34 µs with ReSharp. Default and tuned
   configurations must stay separate; default-only comparisons hide this gap.

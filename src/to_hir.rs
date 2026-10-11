@@ -107,7 +107,8 @@ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
             }
             Assertion::EndLine { crlf: true } => Look::EndCRLF,
             // The VM tests word boundaries with these Unicode definitions in
-            // every bytes mode; only `RegularRegex` translates them here.
+            // every bytes mode; only `RegularRegex` and the regular route of
+            // `Regex` translate them here.
             Assertion::WordBoundary => Look::WordUnicode,
             Assertion::NotWordBoundary => Look::WordUnicodeNegate,
             Assertion::LeftWordBoundary => Look::WordStartUnicode,

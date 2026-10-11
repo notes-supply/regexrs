@@ -63,6 +63,7 @@ mod parse;
 mod parse_flags;
 mod regexset;
 mod regular;
+mod regular_route;
 mod replacer;
 mod searcher;
 mod seek;
@@ -76,6 +77,7 @@ use crate::compile::{CompileOptions, compile};
 use crate::optimize::optimize;
 use crate::parse::{ExprTree, NamedGroups, Parser};
 use crate::parse_flags::*;
+use crate::regular_route::{Automata, RegularRoute};
 use crate::vm::{OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH, Prog};
 
 pub use crate::bytes::MatchBytes;
@@ -189,6 +191,10 @@ enum RegexImpl {
         /// The original pattern which the regex was constructed from
         pattern: String,
         options: HardRegexRuntimeOptions,
+        /// For a pattern that needs the VM only for word boundaries, the same
+        /// pattern as automata, used where `Regex::regular_route` shows the
+        /// results cannot differ from the VM's.
+        regular: Option<Arc<RegularRoute>>,
     },
 }
 
@@ -612,7 +618,8 @@ struct RegexOptions {
     delegate_prefilter: bool,
     #[cfg(feature = "native")]
     native_enabled: bool,
-    #[cfg(feature = "native")]
+    /// Set by `backtrack_limit`: exact VM limit accounting was requested, so
+    /// no route that changes it (native code, the regular automata) is used.
     explicit_backtrack_limit: bool,
 }
 
@@ -658,7 +665,6 @@ impl Default for RegexOptions {
             delegate_prefilter: true,
             #[cfg(feature = "native")]
             native_enabled: true,
-            #[cfg(feature = "native")]
             explicit_backtrack_limit: false,
         }
     }
@@ -869,12 +875,15 @@ impl RegexOptionsBuilder {
     /// This is for preventing a regex with catastrophic backtracking to run for too long.
     ///
     /// Default is `1_000_000` (1 million).
+    ///
+    /// Setting a limit, even the default value, also keeps patterns that need
+    /// the backtracking engine only for word boundaries on that engine, with
+    /// its exact limit accounting. Without one, such patterns search with
+    /// automata wherever the results are provably identical, and those
+    /// searches never report a limit error.
     pub fn backtrack_limit(&mut self, limit: usize) -> &mut Self {
         self.options.hard_regex_runtime_options.backtrack_limit = limit;
-        #[cfg(feature = "native")]
-        {
-            self.options.explicit_backtrack_limit = true;
-        }
+        self.options.explicit_backtrack_limit = true;
         self
     }
 
@@ -1431,16 +1440,26 @@ impl Regex {
                 delegate_dfa_size_limit: options.delegate_dfa_size_limit,
             },
         )?;
+        let n_groups = info.end_group();
+        let regular = if requires_capture_group_fixup
+            || options.explicit_backtrack_limit
+            || prog.repeats_empty_matches()
+        {
+            None
+        } else {
+            word_boundary_automata(&tree.expr, options, n_groups).map(Arc::new)
+        };
         Ok(Regex {
-            inner: RegexImpl::Fancy {
-                prog: Arc::new(prog),
-                n_groups: info.end_group(),
-                options: options.hard_regex_runtime_options,
-                pattern,
-            },
-            named_groups: Arc::new(tree.named_groups),
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
             native: native_pattern.map(|pattern| Arc::new(native::LazyNative::new(pattern))),
+            inner: RegexImpl::Fancy {
+                prog: Arc::new(prog),
+                n_groups,
+                options: options.hard_regex_runtime_options,
+                pattern,
+                regular,
+            },
+            named_groups: Arc::new(tree.named_groups),
         })
     }
 
@@ -1479,10 +1498,10 @@ impl Regex {
     /// assert!(re.is_match(b"abc 123").unwrap());
     /// ```
     pub fn is_match<S: input::Input + ?Sized>(&self, input: &S) -> Result<bool> {
-        if let Some(found) = self.native_match(input) {
-            return Ok(found);
+        match &self.inner {
+            RegexImpl::Wrap { .. } => self.is_match_input(RegexInput::new(input)),
+            RegexImpl::Fancy { .. } => self.fancy_is_match(&RegexInput::new(input), true, None),
         }
-        self.is_match_input(RegexInput::new(input))
     }
 
     pub(crate) fn native_match<S: input::Input + ?Sized>(&self, input: &S) -> Option<bool> {
@@ -1535,8 +1554,69 @@ impl Regex {
                     Ok(inner.is_match(ra_input(&input)))
                 }
             }
-            RegexImpl::Fancy { .. } => self.find_input_raw(&input, 0).map(|m| m.is_some()),
+            RegexImpl::Fancy { .. } => self.fancy_is_match(&input, false, None),
         }
+    }
+
+    /// A boolean search on the VM's program: the regular route's lazy DFA
+    /// where it applies, then native code for a whole-text search, then the
+    /// VM.
+    pub(crate) fn fancy_is_match<S: input::Input + ?Sized>(
+        &self,
+        input: &RegexInput<'_, S>,
+        whole_text: bool,
+        mut cache: Option<&mut searcher::Cache>,
+    ) -> Result<bool> {
+        if input.is_done() {
+            return Ok(false);
+        }
+        if let Some(route) = self.regular_route(input)
+            && let Ok(found) = route.is_match(
+                &ra_input(input),
+                cache.as_deref_mut().and_then(|cache| cache.route(route)),
+            )
+        {
+            return Ok(found);
+        }
+        if whole_text && let Some(found) = self.native_match(input.haystack()) {
+            return Ok(found);
+        }
+        Ok(self.find_on_vm(input, 0, cache)?.is_some())
+    }
+
+    /// The automata of a word-boundary pattern, when they report exactly what
+    /// the VM would for `input`:
+    ///
+    /// - The range must end at the end of the haystack. The VM matches over
+    ///   the whole haystack and rejects a match that ends past the range,
+    ///   without trying a shorter match of a delegated sub-expression; the
+    ///   automata stop at the range end and can report that shorter match.
+    /// - In ASCII mode both step one byte at a time. Otherwise the haystack
+    ///   must be text known to be valid UTF-8, searched from a character
+    ///   boundary: elsewhere the VM advances over an invalid or partial
+    ///   character by the length its first byte implies, visiting positions
+    ///   the automata would not.
+    ///
+    /// The route's lazy DFAs can still give up on non-ASCII text, leaving the
+    /// search to the VM. The automata are built here on first use.
+    pub(crate) fn regular_route<S: input::Input + ?Sized>(
+        &self,
+        input: &RegexInput<'_, S>,
+    ) -> Option<&Automata> {
+        let RegexImpl::Fancy {
+            regular: Some(route),
+            ..
+        } = &self.inner
+        else {
+            return None;
+        };
+        let haystack = input.haystack();
+        let eligible = input.get_range().end == haystack.len()
+            && (route.ascii
+                || haystack
+                    .as_utf8()
+                    .is_some_and(|text| text.is_char_boundary(input.effective_start())));
+        if eligible { route.automata() } else { None }
     }
 
     /// Returns an iterator for each successive non-overlapping match in `text`.
@@ -1642,11 +1722,29 @@ impl Regex {
         &self,
         input: &RegexInput<'_, S>,
         option_flags: u32,
-        cache: Option<&mut searcher::Cache>,
+        mut cache: Option<&mut searcher::Cache>,
     ) -> Result<Option<(usize, usize)>> {
         if input.is_done() {
             return Ok(None);
         }
+        if let Some(route) = self.regular_route(input)
+            && let Ok(found) = route.find(
+                &ra_input(input),
+                cache.as_deref_mut().and_then(|cache| cache.route(route)),
+            )
+        {
+            return Ok(found);
+        }
+        self.find_on_vm(input, option_flags, cache)
+    }
+
+    /// `find_input_raw_cached` without the regular route's lazy DFAs.
+    pub(crate) fn find_on_vm<S: input::Input + ?Sized>(
+        &self,
+        input: &RegexInput<'_, S>,
+        option_flags: u32,
+        mut cache: Option<&mut searcher::Cache>,
+    ) -> Result<Option<(usize, usize)>> {
         match &self.inner {
             RegexImpl::Wrap {
                 inner,
@@ -1655,11 +1753,11 @@ impl Regex {
             } => {
                 let delegated_input = ra_input(input);
                 let result = if !*explicit_capture_group_0 {
-                    let result = match cache.and_then(searcher::Cache::regular) {
-                        Some((cache, _)) => inner.search_with(cache, &delegated_input),
-                        None => inner.search(&delegated_input),
-                    };
-                    result.map(|m| (m.start(), m.end()))
+                    regular_find(
+                        inner,
+                        &delegated_input,
+                        cache.and_then(searcher::Cache::regular),
+                    )
                 } else {
                     // Only group 1's span is needed (the real match bounds of
                     // the rewritten pattern); a fixed 4-slot search avoids
@@ -1690,11 +1788,22 @@ impl Regex {
                     };
                 // Span-only VM entry: nothing is moved out of the pooled
                 // scratch, so this path is allocation-free per call.
-                match cache.and_then(searcher::Cache::rich) {
+                let found = match cache.as_deref_mut().and_then(searcher::Cache::rich) {
                     Some(scratch) => {
                         vm::run_spans_cached(prog, input, option_flags, options, scratch)
                     }
                     None => vm::run_spans(prog, input, option_flags, options),
+                };
+                match (found, self.regular_route(input)) {
+                    (Err(error), Some(route)) => match route.regex() {
+                        Some(regex) => Ok(regular_find(
+                            regex,
+                            &ra_input(input),
+                            cache.and_then(|cache| cache.route_meta(route)),
+                        )),
+                        None => Err(error),
+                    },
+                    (found, _) => found,
                 }
             }
         }
@@ -1856,13 +1965,41 @@ impl Regex {
         &self,
         input: &RegexInput<'t, S>,
         option_flags: u32,
-        cache: Option<&mut searcher::Cache>,
+        mut cache: Option<&mut searcher::Cache>,
     ) -> Result<Option<Captures<'t, S>>> {
         if input.is_done() {
             return Ok(None);
         }
         let named_groups = self.named_groups.clone();
         let haystack = input.haystack();
+        let route = self.regular_route(input);
+        let routed = |locations: Option<RaCaptures>| {
+            locations.map(|locations| Captures {
+                inner: CapturesImpl::Wrap {
+                    locations,
+                    explicit_capture_group_0: false,
+                },
+                named_groups: named_groups.clone(),
+                input: haystack,
+            })
+        };
+        if let Some(route) = route
+            && let Some(regex) = route.regex()
+            && let Ok(found) = route.find(
+                &ra_input(input),
+                cache.as_deref_mut().and_then(|cache| cache.route(route)),
+            )
+        {
+            let locations = found.and_then(|(start, end)| {
+                let span = ra_input(input).span(start..end).anchored(RaAnchored::Yes);
+                regular_captures(
+                    regex,
+                    &span,
+                    cache.and_then(|cache| cache.route_meta(route)),
+                )
+            });
+            return Ok(routed(locations));
+        }
         match &self.inner {
             RegexImpl::Wrap {
                 inner,
@@ -1872,22 +2009,12 @@ impl Regex {
                 // find_not_empty patterns are always compiled as Fancy, so find_not_empty is
                 // always false here.
                 let explicit = *explicit_capture_group_0;
-                let delegated_input = ra_input(input);
-                let locations = match cache.and_then(searcher::Cache::regular) {
-                    Some((cache, locations)) => {
-                        inner.search_captures_with(cache, &delegated_input, locations);
-                        if !locations.is_match() {
-                            return Ok(None);
-                        }
-                        locations.clone()
-                    }
-                    None => {
-                        let mut locations = inner.create_captures();
-                        inner.captures(delegated_input, &mut locations);
-                        locations
-                    }
-                };
-                Ok(locations.is_match().then_some(Captures {
+                let locations = regular_captures(
+                    inner,
+                    &ra_input(input),
+                    cache.and_then(searcher::Cache::regular),
+                );
+                Ok(locations.map(|locations| Captures {
                     inner: CapturesImpl::Wrap {
                         locations,
                         explicit_capture_group_0: explicit,
@@ -1908,10 +2035,20 @@ impl Regex {
                     } else {
                         0
                     };
-                let result = match cache.and_then(searcher::Cache::rich) {
+                let result = match cache.as_deref_mut().and_then(searcher::Cache::rich) {
                     Some(scratch) => vm::run_cached(prog, input, option_flags, options, scratch),
                     None => vm::run(prog, input, option_flags, options),
-                }?;
+                };
+                let result = match (result, route) {
+                    (Err(error), Some(route)) => match route.regex() {
+                        Some(regex) => {
+                            let meta = cache.and_then(|cache| cache.route_meta(route));
+                            return Ok(routed(regular_captures(regex, &ra_input(input), meta)));
+                        }
+                        None => return Err(error),
+                    },
+                    (result, _) => result?,
+                };
                 Ok(result.map(|mut saves| {
                     saves.truncate(n_groups * 2);
                     Captures {
@@ -1974,7 +2111,7 @@ impl Regex {
         &self,
         input: &RegexInput<'_, S>,
         locations: &mut CaptureLocations,
-        cache: Option<&mut searcher::Cache>,
+        mut cache: Option<&mut searcher::Cache>,
     ) -> Result<bool> {
         if !Arc::ptr_eq(&locations.named_groups, &self.named_groups) {
             *locations = self.capture_locations();
@@ -1982,6 +2119,22 @@ impl Regex {
         if input.is_done() {
             locations.clear();
             return Ok(false);
+        }
+        let route = self.regular_route(input);
+        if let (Some(route), CapturesImpl::Fancy { saves }) = (route, &mut locations.slots)
+            && let Some(regex) = route.regex()
+            && let Ok(found) = route.find(
+                &ra_input(input),
+                cache.as_deref_mut().and_then(|cache| cache.route(route)),
+            )
+        {
+            let Some((start, end)) = found else {
+                saves.clear();
+                return Ok(false);
+            };
+            let span = ra_input(input).span(start..end).anchored(RaAnchored::Yes);
+            let meta = cache.and_then(|cache| cache.route_meta(route));
+            return Ok(regular_captures_into(regex, &span, meta, saves));
         }
         match (&self.inner, &mut locations.slots) {
             (RegexImpl::Wrap { inner, .. }, CapturesImpl::Wrap { locations, .. }) => {
@@ -2008,15 +2161,25 @@ impl Regex {
                 } else {
                     0
                 };
-                let scratch = cache.and_then(searcher::Cache::rich);
-                vm::run_into(
+                let scratch = cache.as_deref_mut().and_then(searcher::Cache::rich);
+                let found = vm::run_into(
                     prog,
                     input,
                     option_flags,
                     options,
                     scratch,
                     (n_groups * 2, saves),
-                )
+                );
+                match (found, route) {
+                    (Err(error), Some(route)) => match route.regex() {
+                        Some(regex) => {
+                            let meta = cache.and_then(|cache| cache.route_meta(route));
+                            Ok(regular_captures_into(regex, &ra_input(input), meta, saves))
+                        }
+                        None => Err(error),
+                    },
+                    (found, _) => found,
+                }
             }
             // Clones of one regex share its named groups, so their storage
             // always has the matching representation.
@@ -2311,6 +2474,109 @@ pub struct DebugRegex<'a>(pub &'a Regex);
 impl fmt::Display for DebugRegex<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.debug_print(f)
+    }
+}
+
+/// A route to automata for a pattern whose only constructs outside the
+/// regular subset are word boundaries, or `None`. Word boundaries translate
+/// to the Unicode look-around definitions the VM tests (see `to_hir`); any
+/// construct, option or translation the regular engine cannot take keeps the
+/// VM alone, as do automata that exceed the configured size limits.
+fn word_boundary_automata(
+    expr: &Expr,
+    options: &RegexOptions,
+    n_groups: usize,
+) -> Option<RegularRoute> {
+    if regular::rich_option(options).is_some() || regular::rich_construct(expr).is_some() {
+        return None;
+    }
+    let unicode = options.syntaxc.get_unicode() && !matches!(options.bytes_mode, BytesMode::Ascii);
+    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+    let hir = to_hir::expr_to_hir(expr, &mut to_hir::HirCtx::new(unicode, utf8))
+        .filter(|hir| hir.properties().explicit_captures_len() + 1 == n_groups)?;
+    let compile_options = CompileOptions {
+        bytes_mode: options.bytes_mode,
+        unicode,
+        delegate_size_limit: options.delegate_size_limit,
+        delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+        ..CompileOptions::default()
+    };
+    let usage = if options.delegate_prefilter {
+        compile::DelegateUsage::unanchored()
+    } else {
+        compile::DelegateUsage::unanchored_no_prefilter()
+    };
+    let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
+    Some(RegularRoute::new(hir, compile_options, usage, ascii))
+}
+
+/// A searcher's cache and capture storage for an ordinary engine.
+type RegularCache<'c> = Option<(&'c mut regex_automata::meta::Cache, &'c mut RaCaptures)>;
+
+/// The leftmost-first match span of an ordinary engine, through a searcher's
+/// cache when there is one.
+fn regular_find(
+    regex: &RaRegex,
+    input: &RaInput<'_>,
+    cache: RegularCache<'_>,
+) -> Option<(usize, usize)> {
+    match cache {
+        Some((cache, _)) => regex.search_with(cache, input),
+        None => regex.search(input),
+    }
+    .map(|found| (found.start(), found.end()))
+}
+
+/// Fill VM-layout capture slots (start and end per group, `usize::MAX` for a
+/// group that did not take part) from an ordinary engine's search, returning
+/// whether it matched. `saves` is left empty on a miss.
+fn regular_captures_into(
+    regex: &RaRegex,
+    input: &RaInput<'_>,
+    cache: RegularCache<'_>,
+    saves: &mut Vec<usize>,
+) -> bool {
+    let fill = |locations: &RaCaptures, saves: &mut Vec<usize>| {
+        saves.clear();
+        if locations.is_match() {
+            for group in 0..locations.group_len() {
+                let span = locations.get_group(group);
+                saves.push(span.map_or(usize::MAX, |span| span.start));
+                saves.push(span.map_or(usize::MAX, |span| span.end));
+            }
+        }
+    };
+    match cache {
+        Some((cache, locations)) => {
+            regex.search_captures_with(cache, input, locations);
+            fill(locations, saves);
+        }
+        None => {
+            let mut locations = regex.create_captures();
+            regex.search_captures(input, &mut locations);
+            fill(&locations, saves);
+        }
+    }
+    !saves.is_empty()
+}
+
+/// An owned snapshot of an ordinary engine's captures, filled through a
+/// searcher's cache and storage when there are some.
+fn regular_captures(
+    regex: &RaRegex,
+    input: &RaInput<'_>,
+    cache: RegularCache<'_>,
+) -> Option<RaCaptures> {
+    match cache {
+        Some((cache, locations)) => {
+            regex.search_captures_with(cache, input, locations);
+            locations.is_match().then(|| locations.clone())
+        }
+        None => {
+            let mut locations = regex.create_captures();
+            regex.search_captures(input, &mut locations);
+            locations.is_match().then_some(locations)
+        }
     }
 }
 
@@ -3560,6 +3826,126 @@ mod tests {
         assert!(
             matches!(regex.inner, RegexImpl::Fancy { .. }),
             r"\A...\z should use the VM when input assertion overrides are enabled"
+        );
+    }
+
+    fn has_regular_route(regex: &Regex) -> bool {
+        match &regex.inner {
+            RegexImpl::Fancy {
+                regular: Some(route),
+                ..
+            } => route.automata().is_some(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn word_boundary_patterns_get_a_regular_route() {
+        for pattern in [
+            r"\bfn\b",
+            r"\B\w+",
+            r"(?i)\<k(\w)\>",
+            r"\b\d+\b|\w",
+            r"\b{start-half}a",
+            r"\b(a|){2,3}",
+            r"\b(?:a|){0,4}b*",
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            assert!(has_regular_route(&regex), "{pattern}");
+        }
+        // Constructs the automata cannot run, group-zero rewrites, and
+        // unbounded repetitions of expressions that can match empty, where
+        // backtracking differs.
+        for pattern in [
+            r"(a|)*\bb",
+            r"(?:\b|a)+b",
+            r"(\b\w*)*",
+            r"\b(\w+) \1\b",
+            r"\b(?=a)",
+            r"\bfoo\Kbar\b",
+            r"\bfoo(?=bar)",
+            r"(?>\b\w)",
+            r"\b\w++",
+            r"\Gab\b",
+        ] {
+            let regex = Regex::new(pattern).unwrap();
+            assert!(matches!(regex.inner, RegexImpl::Fancy { .. }), "{pattern}");
+            assert!(!has_regular_route(&regex), "{pattern}");
+        }
+        // Options that change VM semantics or ask for its limit accounting.
+        let configured = |configure: fn(&mut RegexBuilder) -> &mut RegexBuilder| {
+            let mut builder = RegexBuilder::new(r"\bab\b");
+            configure(&mut builder);
+            has_regular_route(&builder.build().unwrap())
+        };
+        assert!(configured(|b| b.case_insensitive(true)));
+        assert!(configured(|b| b.bytes_mode(crate::BytesMode::Ascii)));
+        assert!(!configured(|b| b.backtrack_limit(1_000_000)));
+        assert!(!configured(|b| b.find_not_empty(true)));
+        assert!(!configured(|b| b.allow_input_assertion_overrides(true)));
+    }
+
+    /// Native code stays for whole-text booleans the lazy DFA gives up on.
+    #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_code_backs_the_regular_route_on_non_ascii_text() {
+        let regex = Regex::new(r"\b(?:fn|let|é)\b").unwrap();
+        assert!(has_regular_route(&regex));
+        assert!(regex.native.is_some());
+        assert!(regex.is_match("let x").unwrap());
+        assert!(!regex.is_match("fnord").unwrap());
+        assert!(regex.is_match("é x").unwrap());
+        assert!(!regex.is_match("éfn").unwrap());
+    }
+
+    #[test]
+    fn regular_route_dfa_gives_up_on_non_ascii_text() {
+        let regex = Regex::new(r"\b(?:a|a)+\b!").unwrap();
+        let find = |text: &str| {
+            let input = RegexInput::new(text);
+            let route = regex.regular_route(&input).unwrap();
+            (
+                route.find(&crate::ra_input(&input), None).is_err(),
+                route.is_match(&crate::ra_input(&input), None).is_err(),
+            )
+        };
+        assert_eq!(find("aaaa a!"), (false, false));
+        assert_eq!(find("aaaaé"), (true, true));
+    }
+
+    #[test]
+    fn regular_route_is_chosen_per_search() {
+        let regex = Regex::new(r"\b\w+\b").unwrap();
+        let text = "é ab";
+        let routed = |input: RegexInput<'_, str>| regex.regular_route(&input).is_some();
+        assert!(routed(RegexInput::new(text)));
+        assert!(routed(RegexInput::new(text).from_pos(2)));
+        assert!(routed(RegexInput::new(text).range(3..5).anchored(true)));
+        // Inside a character, or a range ending before the haystack does.
+        assert!(!routed(RegexInput::new(text).from_pos(1)));
+        assert!(!routed(RegexInput::new(text).range(0..4)));
+        // Bytes outside ASCII mode keep the VM, which steps over invalid
+        // UTF-8 differently.
+        assert!(
+            regex
+                .regular_route(&RegexInput::new(text.as_bytes()))
+                .is_none()
+        );
+
+        let ascii = RegexBuilder::new(r"\b\w+\b")
+            .bytes_mode(crate::BytesMode::Ascii)
+            .build()
+            .unwrap();
+        let bytes: &[u8] = b"\xFF ab";
+        assert!(
+            ascii
+                .regular_route(&RegexInput::new(bytes).from_pos(1))
+                .is_some()
+        );
+        assert!(
+            ascii
+                .regular_route(&RegexInput::new(bytes).range(0..3))
+                .is_none()
         );
     }
 

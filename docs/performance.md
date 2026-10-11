@@ -33,6 +33,21 @@ not inherently faster than `regex-automata`, and enabling Fancy's existing seek
 option changes many apparent gaps. Compare configured engines, hit-heavy and
 miss-heavy inputs, and compilation cost separately.
 
+Patterns whose only construct beyond the regular subset is a word boundary
+(`\b`, `\B`, `\<`, `\>` and the `\b{...}` forms) are compiled for the portable
+VM and also as `regex-automata` lazy DFAs. The DFAs answer a search when they
+provably give the VM's result: on text, from a character boundary, with a range
+that ends at the end of the haystack, or in ASCII bytes mode. With Unicode word
+boundaries they give up at non-ASCII bytes they would need to classify. That
+search then runs on native code, for a whole-text boolean, or on the VM; a
+limit error there is answered by the automata instead. Rich constructs and
+options, capture-group-zero rewrites such as `\K`, byte haystacks outside
+ASCII mode and an explicit `backtrack_limit` keep the VM alone. So does an
+unbounded repetition the VM runs over an expression that can match empty, such
+as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
+do, and automata can report other captures or spans. The automata are built on
+the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
+
 Unanchored portable searches, including `find`, captures, iteration and
 replacement, skip start positions where the program's leading literal or class
 tests cannot succeed: memmem or memchr via `regex-automata`, or a first-byte
