@@ -163,8 +163,8 @@ eight medians, not a confidence interval or the spread of individual searches.
 - [Every row's median and range, in nanoseconds](../benchmarks/results/2026-10-11/summary.csv).
 - [Sources, binary identity, host conditions, budgets and engine orders](../benchmarks/results/2026-10-11/metadata.json).
 
-The README selects six rows from this data. Important findings outside that
-excerpt include:
+The README groups selected rows by workload and configuration, with each time
+expressed relative to the fastest median in that row. Notable findings include:
 
 - Default `Regex` took 140.92 ms for `ordinary/rust-keywords`, against 9.98 ms
   for regex. Those word boundaries still run on the rich VM. This is an
