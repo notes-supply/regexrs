@@ -30,10 +30,16 @@ resharp 0.7.5. Earlier comparisons against fancy-regex 0.19.1 are historical.
 
 Nothing is timed until `verify.sh` passes for every row:
 
-1. The runner's `--verify` mode compares the engine's ordered match spans and
-   every capture span, keeping unmatched groups distinct from empty ones,
-   against fancy-regex as the leftmost-first oracle. Line models are compared
-   line by line, with absolute offsets.
+1. The runner's `--verify` mode replays the calls each timed model makes,
+   through the same per-engine code and retained storage. It compares the
+   engine's ordered match spans and every capture span against fancy-regex as
+   the leftmost-first oracle, keeping unmatched groups distinct from empty
+   ones. Line models are compared line by line, with absolute offsets, and in
+   file order, so retained storage sees alternating hits and misses:
+   - `grep` checks every line's result from the boolean method that is timed,
+     native code included;
+   - `first-captures-per-line` checks every line's exact first-match groups,
+     or no match, from the per-record capture method that is timed.
 2. `rebar measure -t` checks each row's expected `count`, which Rebar also
    checks on every timed iteration.
 
@@ -51,6 +57,18 @@ terminators.
 counting the participating groups of its first match. It is the record
 extraction case where caller-owned capture storage matters, and is only
 compared within `definitions/scratch.toml`.
+
+Capture APIs differ by engine, and each row uses the engine's API as listed:
+
+- **Reusable storage:** `regexrs-searcher` (`Searcher::captures_read` into one
+  `CaptureLocations`) and `regex` (`Regex::captures_read` into one
+  `CaptureLocations`). Both create their storage once, outside the timed loop,
+  and reuse it across records and iterations.
+- **Owned snapshots:** `regexrs`, `regexrs-regular` and `fancy` return an owned
+  `Captures` per record.
+
+Compare reusable rows with reusable rows, and snapshot rows with snapshot rows.
+A gap between the two kinds reflects the API choice, not engine speed.
 
 ## Engines and configurations
 
