@@ -839,14 +839,17 @@ fn advance_one<S: HaystackInput + ?Sized>(s: &S, ix: usize, bytes_mode: BytesMod
     }
 }
 
-/// The end of the character at `ix`, a position inside the haystack, or `None` when
-/// invalid input ends with a sequence whose first byte implies more bytes than remain.
-/// Such a truncated character cannot be consumed: stepping over it would leave the
-/// haystack, where every later step could only fail or index out of bounds.
+/// Whether `ix` lies past the end of the haystack. Outside ASCII mode, stepping over
+/// byte input that ends with a truncated sequence, such as a lone 0xFF, advances by
+/// the length its first byte implies and leaves the haystack. The search continues
+/// there: saves, restores, splits and look-around bodies that read nothing still
+/// succeed, so a look-around can return in bounds with a result. Instructions that
+/// read the text fail there, as literals, classes and `.` always have; this also
+/// covers the assertions, delegates, steps back and backreferences to a group
+/// captured there, which would otherwise index out of bounds.
 #[inline]
-fn char_end<S: HaystackInput + ?Sized>(s: &S, ix: usize, bytes_mode: BytesMode) -> Option<usize> {
-    let end = ix + advance_one(s, ix, bytes_mode);
-    (end <= s.len()).then_some(end)
+fn past_end<S: HaystackInput + ?Sized>(s: &S, ix: usize) -> bool {
+    ix > s.len()
 }
 
 /// Returns the previous position before `ix`, respecting the bytes mode.
@@ -1167,20 +1170,15 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     return Ok(Some(extract(state)));
                 }
                 Insn::Any => {
-                    if ix < haystack.len()
-                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
-                    {
-                        ix = end;
+                    if ix < haystack.len() {
+                        ix += advance_one(haystack, ix, prog.bytes_mode);
                     } else {
                         break 'fail;
                     }
                 }
                 Insn::AnyNoNL => {
-                    if ix < haystack.len()
-                        && haystack.as_bytes()[ix] != b'\n'
-                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
-                    {
-                        ix = end;
+                    if ix < haystack.len() && haystack.as_bytes()[ix] != b'\n' {
+                        ix += advance_one(haystack, ix, prog.bytes_mode);
                     } else {
                         break 'fail;
                     }
@@ -1189,9 +1187,8 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     if ix < haystack.len()
                         && haystack.as_bytes()[ix] != b'\r'
                         && haystack.as_bytes()[ix] != b'\n'
-                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
                     {
-                        ix = end;
+                        ix += advance_one(haystack, ix, prog.bytes_mode);
                     } else {
                         break 'fail;
                     }
@@ -1212,6 +1209,14 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     None => break 'fail,
                 },
                 Insn::Assertion(assertion) => {
+                    // Past the end, only the text-boundary tests can be
+                    // evaluated: they compare positions and overrides, and
+                    // never hold there without an override.
+                    if past_end(haystack, ix)
+                        && !matches!(assertion, Assertion::StartText | Assertion::EndText)
+                    {
+                        break 'fail;
+                    }
                     if !match assertion {
                         Assertion::StartText => input
                             .start_text_override()
@@ -1418,7 +1423,7 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                 }
                 Insn::GoBack(count) => {
                     for _ in 0..count {
-                        if ix == 0 {
+                        if ix == 0 || past_end(haystack, ix) {
                             break 'fail;
                         }
                         ix = prev_ix(haystack, ix, prog.bytes_mode);
@@ -1453,8 +1458,9 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                         break 'fail;
                     }
                     let hi = state.get(slot + 1);
-                    if hi == usize::MAX {
-                        // Referenced group hasn't matched, so the backref doesn't match either
+                    if hi == usize::MAX || past_end(haystack, hi) {
+                        // Referenced group hasn't matched, or a look-around
+                        // captured it past the end, so the backref doesn't match
                         break 'fail;
                     }
                     let ref_text = &haystack.as_bytes()[lo..hi];
@@ -1487,6 +1493,9 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     ref capture_group_extraction_inner,
                     capture_groups,
                 }) => {
+                    if past_end(haystack, ix) {
+                        break 'fail;
+                    }
                     // Use regex-automata to search backwards from current position
                     let mut cache_guard = cache_pool.get();
                     let input = Input::new(haystack.as_bytes())
@@ -1537,6 +1546,9 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     pattern: _,
                     capture_groups,
                 }) => {
+                    if past_end(haystack, ix) {
+                        break 'fail;
+                    }
                     let input = Input::new(haystack.as_bytes())
                         .span(ix..haystack.len())
                         .anchored(Anchored::Yes);
@@ -1564,28 +1576,28 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     // If delegate matches, we've found the boundary and continue to next instruction
                     // If we reach end of string without delegate matching, we also continue
 
-                    // Check if delegate matches at current position
-                    let input = Input::new(haystack.as_bytes())
-                        .span(ix..haystack.len())
-                        .anchored(Anchored::Yes);
+                    // Check if delegate matches at current position; nothing
+                    // matches past the end
                     // capture groups in the delegate are always ignored, so we can use the quicker search_half method
-                    let delegate_matches_here = delegate.inner.search_half(&input).is_some();
+                    let delegate_matches_here = !past_end(haystack, ix) && {
+                        let input = Input::new(haystack.as_bytes())
+                            .span(ix..haystack.len())
+                            .anchored(Anchored::Yes);
+                        delegate.inner.search_half(&input).is_some()
+                    };
 
                     if delegate_matches_here {
                         // Delegate matches at current position - we've reached the boundary
                         // Continue to next instruction without consuming any characters
                         // Fall through via pc += 1 below
-                    } else if ix < haystack.len()
-                        && let Some(end) = char_end(haystack, ix, prog.bytes_mode)
-                    {
+                    } else if ix < haystack.len() {
                         // Try advancing one character and checking again
                         state.push(pc + 1, ix)?;
-                        ix = end;
+                        ix += advance_one(haystack, ix, prog.bytes_mode);
                         // Stay at same pc to check delegate match at new position
                         continue;
                     } else {
-                        // Reached end of string, or a truncated character that cannot
-                        // be consumed - delegate never matched, so we succeed
+                        // Reached end of string - delegate never matched, so we succeed
                         // Fall through via pc += 1 below
                     }
                 }

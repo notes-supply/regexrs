@@ -879,8 +879,10 @@ impl RegexOptionsBuilder {
     /// Setting a limit, even the default value, also keeps patterns that need
     /// the backtracking engine only for word boundaries on that engine, with
     /// its exact limit accounting. Without one, such patterns search with
-    /// automata wherever the results are provably identical, and those
-    /// searches never report a limit error.
+    /// automata wherever the results are provably identical. Those searches
+    /// never report a backtrack limit error: where the automata give up and the
+    /// backtracking engine runs and exceeds the limit, the automata answer
+    /// instead. Other errors, such as a backtrack stack overflow, are reported.
     pub fn backtrack_limit(&mut self, limit: usize) -> &mut Self {
         self.options.hard_regex_runtime_options.backtrack_limit = limit;
         self.options.explicit_backtrack_limit = true;
@@ -1794,16 +1796,16 @@ impl Regex {
                     }
                     None => vm::run_spans(prog, input, option_flags, options),
                 };
-                match (found, self.regular_route(input)) {
-                    (Err(error), Some(route)) => match route.regex() {
-                        Some(regex) => Ok(regular_find(
+                match found {
+                    Err(error) => match limit_recovery(self.regular_route(input), &error) {
+                        Some((route, regex)) => Ok(regular_find(
                             regex,
                             &ra_input(input),
                             cache.and_then(|cache| cache.route_meta(route)),
                         )),
                         None => Err(error),
                     },
-                    (found, _) => found,
+                    found => found,
                 }
             }
         }
@@ -2039,15 +2041,15 @@ impl Regex {
                     Some(scratch) => vm::run_cached(prog, input, option_flags, options, scratch),
                     None => vm::run(prog, input, option_flags, options),
                 };
-                let result = match (result, route) {
-                    (Err(error), Some(route)) => match route.regex() {
-                        Some(regex) => {
+                let result = match result {
+                    Err(error) => match limit_recovery(route, &error) {
+                        Some((route, regex)) => {
                             let meta = cache.and_then(|cache| cache.route_meta(route));
                             return Ok(routed(regular_captures(regex, &ra_input(input), meta)));
                         }
                         None => return Err(error),
                     },
-                    (result, _) => result?,
+                    Ok(result) => result,
                 };
                 Ok(result.map(|mut saves| {
                     saves.truncate(n_groups * 2);
@@ -2170,15 +2172,17 @@ impl Regex {
                     scratch,
                     (n_groups * 2, saves),
                 );
-                match (found, route) {
-                    (Err(error), Some(route)) => match route.regex() {
-                        Some(regex) => {
+                // The VM cleared `saves` before it ran, so an error leaves
+                // them empty and recovery refills them.
+                match found {
+                    Err(error) => match limit_recovery(route, &error) {
+                        Some((route, regex)) => {
                             let meta = cache.and_then(|cache| cache.route_meta(route));
                             Ok(regular_captures_into(regex, &ra_input(input), meta, saves))
                         }
                         None => Err(error),
                     },
-                    (found, _) => found,
+                    found => found,
                 }
             }
             // Clones of one regex share its named groups, so their storage
@@ -2508,6 +2512,26 @@ fn word_boundary_automata(
     };
     let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
     Some(RegularRoute::new(hir, compile_options, usage, ascii))
+}
+
+/// The route and meta engine that answer a routed search after the VM itself
+/// ran and exceeded the default backtrack limit, or `None` for that search to
+/// return `error`. Only that error is recovered: the automata cannot exceed a
+/// backtrack limit, while a backtrack stack overflow or a delegate's own failure
+/// is the VM's to report. Without a route, as with an explicit limit, nothing
+/// is recovered.
+fn limit_recovery<'r>(
+    route: Option<&'r Automata>,
+    error: &Error,
+) -> Option<(&'r Automata, &'r RaRegex)> {
+    if !matches!(
+        error,
+        Error::RuntimeError(RuntimeError::BacktrackLimitExceeded)
+    ) {
+        return None;
+    }
+    let route = route?;
+    Some((route, route.regex()?))
 }
 
 /// A searcher's cache and capture storage for an ordinary engine.

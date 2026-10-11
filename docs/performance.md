@@ -39,10 +39,12 @@ VM and also as `regex-automata` lazy DFAs. The DFAs answer a search when they
 provably give the VM's result: on text, from a character boundary, with a range
 that ends at the end of the haystack, or in ASCII bytes mode. With Unicode word
 boundaries they give up at non-ASCII bytes they would need to classify. That
-search then runs on native code, for a whole-text boolean, or on the VM; a
-limit error there is answered by the automata instead. Rich constructs and
-options, capture-group-zero rewrites such as `\K`, byte haystacks outside
-ASCII mode and an explicit `backtrack_limit` keep the VM alone. So does an
+search then runs on native code, for a whole-text boolean, or on the VM. If the
+VM exceeds the default backtrack limit there, the automata answer instead,
+since they never backtrack; other VM errors, such as a backtrack stack overflow,
+are still reported. Rich constructs and options, capture-group-zero rewrites
+such as `\K`, byte haystacks outside ASCII mode and an explicit
+`backtrack_limit` keep the VM alone. So does an
 unbounded repetition the VM runs over an expression that can match empty, such
 as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
 do, and automata can report other captures or spans. The automata are built on

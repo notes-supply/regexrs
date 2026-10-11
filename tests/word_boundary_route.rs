@@ -532,3 +532,40 @@ fn generated_patterns_equal_the_oracle() {
         }
     }
 }
+
+/// Only the default backtrack limit is recovered after the VM ran. Here the
+/// DFA gives up on non-ASCII text and the VM overflows its backtrack stack;
+/// every API reports that error, as the oracle does, retained capture storage
+/// is cleared, and the same searcher and storage then work again.
+#[test]
+fn vm_stack_overflow_is_reported_not_recovered() {
+    let pattern = r"\b\w*\b";
+    let text = "é".repeat(1_000_001);
+    let regex = Regex::new(pattern).unwrap();
+    let overflow = |e: &Error| matches!(e, Error::RuntimeError(RuntimeError::StackOverflow));
+    let oracle = oracle::Regex::new(pattern).unwrap();
+    assert!(oracle.find(&text).is_err());
+    assert!(overflow(&regex.find(&text).unwrap_err()));
+    assert!(overflow(&regex.is_match(&text).unwrap_err()));
+    assert!(overflow(&regex.captures(&text).unwrap_err()));
+    let mut search = regex.searcher();
+    let mut locations = regex.capture_locations();
+    assert!(
+        search
+            .captures_read(&mut locations, "ab cd")
+            .unwrap()
+            .is_some()
+    );
+    assert!(overflow(
+        &search
+            .captures_read(&mut locations, text.as_str())
+            .unwrap_err()
+    ));
+    assert_eq!(locations.get(0), None);
+    assert!(overflow(&search.find(text.as_str()).unwrap_err()));
+    assert!(overflow(&search.is_match(text.as_str()).unwrap_err()));
+    assert!(overflow(&search.captures(text.as_str()).unwrap_err()));
+    let found = search.captures_read(&mut locations, "é ab").unwrap();
+    assert_eq!(found.map(|m| m.range()), Some(0..2));
+    assert_eq!(locations.get(0), Some((0, 2)));
+}

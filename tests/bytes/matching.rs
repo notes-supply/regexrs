@@ -390,10 +390,11 @@ fn bytes_hard_mode_absent_repeater_lookahead_with_high_bytes() {
 
 // --- Truncated UTF-8 at the end of the haystack ---
 
-/// A lead byte at the end of the haystack can imply more bytes than remain. The
-/// VM must not step over it to a position past the end, where an assertion or a
-/// delegate search would index out of bounds. fancy-regex 0.19 panics on the
-/// first and third patterns; the other results equal it.
+/// A lead byte at the end of the haystack can imply more bytes than remain.
+/// Stepping over it leaves the haystack, where an assertion or a delegate
+/// search fails instead of indexing out of bounds. fancy-regex 0.19 panics on
+/// the first and third patterns; the other results equal it. `truncated.rs`
+/// compares look-arounds over such positions with the oracle.
 #[test]
 fn bytes_unicode_hard_mode_truncated_trailing_character() {
     type Case = (&'static str, &'static [u8], Option<(usize, usize)>);
