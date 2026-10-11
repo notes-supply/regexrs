@@ -43,6 +43,7 @@ const PATTERNS: &[&str] = &[
     "[ab]{3}c",
     // Inside the run, a later start passes the assertion an earlier one fails.
     r"(?m)^[a\n]{1,2}b",
+    r"(?m)^[a\n]{1,3}b",
     "a+b",
     r"x\d*y",
     "()a",
@@ -99,6 +100,7 @@ const TEXTS: &[&str] = &[
     "deadbeefcafe-1234 0123456789abcdef-abcd 12-3 1234567-8 ab1 abcde1 x abc1",
     "aaaabc abababc bbbc abc ababc",
     "a\n\nb x\na\nb",
+    "aa\n\nb",
 ];
 
 fn oracle_captures(
