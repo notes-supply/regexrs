@@ -33,10 +33,11 @@ url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9
 url_api = "https://api.github.com/repos/nextest-rs/nextest/releases/assets/579617057"
 
 [[tools.rust]]
-version = "nightly-2026-10-09"
+version = "nightly-2026-10-11"
 backend = "core:rust"
-specifiers = ["nightly-2026-10-09"]
+specifiers = ["nightly-2026-10-11"]
 
 [tools.rust.options]
 components = "clippy,rust-src,rustfmt"
 profile = "minimal"
+targets = "wasm32-unknown-unknown"

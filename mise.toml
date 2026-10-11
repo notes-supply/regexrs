@@ -1,7 +1,7 @@
 min_version = "2026.10.3"
 
 [tools]
-rust = { version = "nightly-2026-10-09", components = "rustfmt,clippy,rust-src", profile = "minimal" }
+rust = { version = "nightly-2026-10-11", components = "rustfmt,clippy,rust-src", targets = "wasm32-unknown-unknown", profile = "minimal" }
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 
 [tasks."fmt:check"]
