@@ -210,9 +210,12 @@ fn group_spans(groups: &dyn Groups, offset: usize) -> Vec<Option<Span>> {
 /// call for call by `--verify`.
 ///
 /// Engines with caller-owned storage keep it across records and iterations,
-/// as a worker would: `regexrs-searcher` one `Searcher` and one
-/// `CaptureLocations`, `regex` one `CaptureLocations`. The other engines
-/// return an owned capture snapshot per search.
+/// as a worker would: `regexrs-searcher` one `Searcher`, which every model
+/// searches through, and one `CaptureLocations`, `regex` one
+/// `CaptureLocations`. The other engines return an owned capture snapshot per
+/// search. Each store is created by the first call that uses it, so a model
+/// that never reads capture locations never allocates them, and a first run
+/// pays for exactly the storage its calls use.
 struct Workload<'a> {
     engine: &'a Engine,
     text: &'a str,
@@ -223,55 +226,45 @@ struct Workload<'a> {
 
 impl<'a> Workload<'a> {
     fn new(engine: &'a Engine, text: &'a str) -> Self {
-        let (searcher, locations) = match engine {
-            Engine::RegexrsSearcher(re) => (Some(re.searcher()), Some(re.capture_locations())),
-            _ => (None, None),
-        };
-        let regex_locations = match engine {
-            Engine::Regex(re) => Some(re.capture_locations()),
-            _ => None,
-        };
         Workload {
             engine,
             text,
-            searcher,
-            locations,
-            regex_locations,
+            searcher: None,
+            locations: None,
+            regex_locations: None,
         }
     }
 
     /// Visit every non-overlapping match in `text`, in order.
     fn for_each_match(&mut self, text: &str, mut visit: impl FnMut(Span)) -> Result<()> {
-        match (self.engine, self.searcher.as_mut()) {
-            (Engine::RegexrsSearcher(_), Some(search)) => {
-                for m in search.find_iter(text) {
+        match self.engine {
+            Engine::RegexrsSearcher(re) => {
+                for m in self
+                    .searcher
+                    .get_or_insert_with(|| re.searcher())
+                    .find_iter(text)
+                {
                     let m = m?;
                     visit((m.start(), m.end()));
                 }
             }
-            (
-                Engine::Regexrs(re)
-                | Engine::RegexrsNative(re)
-                | Engine::RegexrsSearcher(re)
-                | Engine::RegexrsSeek(re),
-                _,
-            ) => {
+            Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSeek(re) => {
                 for m in re.find_iter(text) {
                     let m = m?;
                     visit((m.start(), m.end()));
                 }
             }
-            (Engine::RegexrsRegular(re), _) => {
+            Engine::RegexrsRegular(re) => {
                 re.find_iter(text).for_each(|m| visit((m.start(), m.end())));
             }
-            (Engine::Regex(re), _) => re.find_iter(text).for_each(|m| visit((m.start(), m.end()))),
-            (Engine::Fancy(re) | Engine::FancySeek(re), _) => {
+            Engine::Regex(re) => re.find_iter(text).for_each(|m| visit((m.start(), m.end()))),
+            Engine::Fancy(re) | Engine::FancySeek(re) => {
                 for m in re.find_iter(text) {
                     let m = m?;
                     visit((m.start(), m.end()));
                 }
             }
-            (Engine::Resharp(re), _) => {
+            Engine::Resharp(re) => {
                 for m in re.find_all(text.as_bytes()).map_err(|e| anyhow!("{e}"))? {
                     visit((m.start, m.end));
                 }
@@ -282,31 +275,26 @@ impl<'a> Workload<'a> {
 
     /// Visit the groups of every non-overlapping match in `text`, in order.
     fn for_each_captures(&mut self, text: &str, mut visit: impl FnMut(&dyn Groups)) -> Result<()> {
-        match (self.engine, self.searcher.as_mut()) {
-            (Engine::RegexrsSearcher(_), Some(search)) => {
+        match self.engine {
+            Engine::RegexrsSearcher(re) => {
+                let search = self.searcher.get_or_insert_with(|| re.searcher());
                 for captures in search.captures_iter(text) {
                     visit(&captures?);
                 }
             }
-            (
-                Engine::Regexrs(re)
-                | Engine::RegexrsNative(re)
-                | Engine::RegexrsSearcher(re)
-                | Engine::RegexrsSeek(re),
-                _,
-            ) => {
+            Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSeek(re) => {
                 for captures in re.captures_iter(text) {
                     visit(&captures?);
                 }
             }
-            (Engine::RegexrsRegular(re), _) => re.captures_iter(text).for_each(|c| visit(&c)),
-            (Engine::Regex(re), _) => re.captures_iter(text).for_each(|c| visit(&c)),
-            (Engine::Fancy(re) | Engine::FancySeek(re), _) => {
+            Engine::RegexrsRegular(re) => re.captures_iter(text).for_each(|c| visit(&c)),
+            Engine::Regex(re) => re.captures_iter(text).for_each(|c| visit(&c)),
+            Engine::Fancy(re) | Engine::FancySeek(re) => {
                 for captures in re.captures_iter(text) {
                     visit(&captures?);
                 }
             }
-            (Engine::Resharp(_), _) => bail!("resharp does not report captures here"),
+            Engine::Resharp(_) => bail!("resharp does not report captures here"),
         }
         Ok(())
     }
@@ -314,19 +302,18 @@ impl<'a> Workload<'a> {
     /// Whether `line` matches, through the engine's boolean method (native
     /// code where the engine has it).
     fn is_match(&mut self, line: &str) -> Result<bool> {
-        Ok(match (self.engine, self.searcher.as_mut()) {
-            (Engine::RegexrsSearcher(_), Some(search)) => search.is_match(line)?,
-            (
-                Engine::Regexrs(re)
-                | Engine::RegexrsNative(re)
-                | Engine::RegexrsSearcher(re)
-                | Engine::RegexrsSeek(re),
-                _,
-            ) => re.is_match(line)?,
-            (Engine::RegexrsRegular(re), _) => re.is_match(line),
-            (Engine::Regex(re), _) => re.is_match(line),
-            (Engine::Fancy(re) | Engine::FancySeek(re), _) => re.is_match(line)?,
-            (Engine::Resharp(re), _) => re.is_match(line.as_bytes()).map_err(|e| anyhow!("{e}"))?,
+        Ok(match self.engine {
+            Engine::RegexrsSearcher(re) => self
+                .searcher
+                .get_or_insert_with(|| re.searcher())
+                .is_match(line)?,
+            Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSeek(re) => {
+                re.is_match(line)?
+            }
+            Engine::RegexrsRegular(re) => re.is_match(line),
+            Engine::Regex(re) => re.is_match(line),
+            Engine::Fancy(re) | Engine::FancySeek(re) => re.is_match(line)?,
+            Engine::Resharp(re) => re.is_match(line.as_bytes()).map_err(|e| anyhow!("{e}"))?,
         })
     }
 
@@ -338,35 +325,31 @@ impl<'a> Workload<'a> {
         line: &str,
         read: impl FnOnce(Option<&dyn Groups>) -> T,
     ) -> Result<T> {
-        Ok(
-            match (self.engine, self.searcher.as_mut(), self.locations.as_mut()) {
-                (Engine::RegexrsSearcher(_), Some(search), Some(locations)) => {
-                    let found = search.captures_read(locations, line)?.is_some();
-                    read(found.then_some(&*locations as &dyn Groups))
-                }
-                (
-                    Engine::Regexrs(re)
-                    | Engine::RegexrsNative(re)
-                    | Engine::RegexrsSearcher(re)
-                    | Engine::RegexrsSeek(re),
-                    ..,
-                ) => read(re.captures(line)?.as_ref().map(|c| c as &dyn Groups)),
-                (Engine::RegexrsRegular(re), ..) => {
-                    read(re.captures(line).as_ref().map(|c| c as &dyn Groups))
-                }
-                (Engine::Regex(re), ..) => match self.regex_locations.as_mut() {
-                    Some(locations) => {
-                        let found = re.captures_read(locations, line).is_some();
-                        read(found.then_some(&*locations as &dyn Groups))
-                    }
-                    None => read(re.captures(line).as_ref().map(|c| c as &dyn Groups)),
-                },
-                (Engine::Fancy(re) | Engine::FancySeek(re), ..) => {
-                    read(re.captures(line)?.as_ref().map(|c| c as &dyn Groups))
-                }
-                (Engine::Resharp(_), ..) => bail!("resharp does not report captures here"),
-            },
-        )
+        Ok(match self.engine {
+            Engine::RegexrsSearcher(re) => {
+                let search = self.searcher.get_or_insert_with(|| re.searcher());
+                let locations = self.locations.get_or_insert_with(|| re.capture_locations());
+                let found = search.captures_read(locations, line)?.is_some();
+                read(found.then_some(&*locations as &dyn Groups))
+            }
+            Engine::Regexrs(re) | Engine::RegexrsNative(re) | Engine::RegexrsSeek(re) => {
+                read(re.captures(line)?.as_ref().map(|c| c as &dyn Groups))
+            }
+            Engine::RegexrsRegular(re) => {
+                read(re.captures(line).as_ref().map(|c| c as &dyn Groups))
+            }
+            Engine::Regex(re) => {
+                let locations = self
+                    .regex_locations
+                    .get_or_insert_with(|| re.capture_locations());
+                let found = re.captures_read(locations, line).is_some();
+                read(found.then_some(&*locations as &dyn Groups))
+            }
+            Engine::Fancy(re) | Engine::FancySeek(re) => {
+                read(re.captures(line)?.as_ref().map(|c| c as &dyn Groups))
+            }
+            Engine::Resharp(_) => bail!("resharp does not report captures here"),
+        })
     }
 
     fn count_captures(&mut self, text: &str) -> Result<usize> {
@@ -827,6 +810,53 @@ ba bab
         verify("regexrs-seek", &b)
     }
 
+    /// Retained storage is created by the first call that uses it: models
+    /// that never read capture locations leave them unallocated, per-record
+    /// captures allocate them once, and the searcher engine's searcher serves
+    /// every model. First runs therefore pay for no storage their calls skip.
+    #[test]
+    fn retained_storage_is_created_only_by_its_first_use() -> Result<()> {
+        let text = "ab\nx\n";
+        let models = [
+            "count",
+            "count-spans",
+            "count-captures",
+            "grep",
+            "grep-captures",
+            "first-captures-per-line",
+        ];
+        for model in models {
+            for engine in ENGINE_NAMES {
+                let b = benchmark(r"(a)(b)?", model, text);
+                let compiled = Engine::compile(engine, &b)?;
+                let mut workload = Workload::new(&compiled, text);
+                let unallocated = workload.searcher.is_none()
+                    && workload.locations.is_none()
+                    && workload.regex_locations.is_none();
+                assert!(unallocated, "{engine} {model}");
+                workload.run(model)?;
+                let per_record = model == "first-captures-per-line";
+                let context = format!("{engine} {model}");
+                assert_eq!(
+                    workload.searcher.is_some(),
+                    engine == "regexrs-searcher",
+                    "{context}"
+                );
+                assert_eq!(
+                    workload.locations.is_some(),
+                    per_record && engine == "regexrs-searcher",
+                    "{context}"
+                );
+                assert_eq!(
+                    workload.regex_locations.is_some(),
+                    per_record && engine == "regex",
+                    "{context}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// `fresh-` and `startup-` models run the base model once per new
     /// instance, verify its first run against the oracle, and report the base
     /// model's count for every sample.
@@ -839,6 +869,7 @@ ba bab
             "count-captures",
             "grep",
             "grep-captures",
+            "first-captures-per-line",
         ] {
             let expected = {
                 let b = benchmark(r"(a)(b)?", base, text);

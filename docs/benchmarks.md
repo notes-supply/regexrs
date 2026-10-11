@@ -130,8 +130,11 @@ All rows use Unicode mode.
   controls and the routed keyword lines. Each case has `compile`,
   `fresh-MODEL` and `startup-MODEL` rows on a store of about a hundred lines,
   and the warmed model on the whole haystack; some also run `fresh-MODEL` on
-  the whole haystack. regexrs, regexrs-seek, fancy and fancy-seek are on every
-  case, and regexrs-regular, regex and resharp where their semantics match.
+  the whole haystack. regexrs, regexrs-seek and fancy are on every case.
+  fancy-seek is on the cases fancy runs on its backtracking VM, the lookaround,
+  repeated-word and keyword cases, but not on the class-run and literal
+  controls, where fancy delegates the whole pattern and seek does nothing.
+  regexrs-regular, regex and resharp only appear where their semantics match.
 
 The suite has 76 definitions and 351 engine rows; the 219 `planning/` rows can
 be selected or excluded with Rebar's `-f`/`-F '^planning/'`.
