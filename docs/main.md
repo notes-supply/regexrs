@@ -85,6 +85,21 @@ Using [`RegexInput`] preserves the original haystack for anchors, word
 boundaries, and lookaround while still constraining the reported match to a
 specific byte range.
 
+## Example: Guaranteed regular matching
+
+`RegularRegex` accepts only the regular subset of the syntax and searches it
+without backtracking, so its searches cannot fail. Rich constructs are rejected
+when the expression is built, whatever Cargo features are enabled.
+
+```rust
+use regexrs::RegularRegex;
+
+let date = RegularRegex::new(r"(?<year>\d{4})-(?<month>\d{2})").unwrap();
+let caps = date.captures("due 2026-10").expect("a date");
+assert_eq!(&caps["month"], "10");
+assert!(RegularRegex::new(r"(\w+) \1").is_err());
+```
+
 ## RegexSet notes for `regex` crate users
 
 `regexrs::RegexSet` is not a drop-in API replacement for `regex::RegexSet`.

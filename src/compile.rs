@@ -1004,6 +1004,9 @@ pub(crate) struct DelegateUsage {
     prefilter: bool,
     /// True if explicit capture-group spans must be reported by the engine.
     needs_captures: bool,
+    /// False for `RegularRegex`, whose engine must not use regex-automata's
+    /// bounded backtracker: bounded work is not the same as no backtracking.
+    bounded_backtracking: bool,
 }
 
 impl DelegateUsage {
@@ -1014,6 +1017,16 @@ impl DelegateUsage {
         DelegateUsage {
             prefilter: true,
             needs_captures: true,
+            bounded_backtracking: true,
+        }
+    }
+
+    /// The whole engine of a `RegularRegex`: searched unanchored with all
+    /// captures, using only DFAs and the PikeVM.
+    pub(crate) const fn regular_only() -> Self {
+        DelegateUsage {
+            bounded_backtracking: false,
+            ..Self::unanchored()
         }
     }
 
@@ -1024,7 +1037,7 @@ impl DelegateUsage {
     pub(crate) const fn unanchored_no_prefilter() -> Self {
         DelegateUsage {
             prefilter: false,
-            needs_captures: true,
+            ..Self::unanchored()
         }
     }
 
@@ -1034,6 +1047,7 @@ impl DelegateUsage {
         DelegateUsage {
             prefilter: false,
             needs_captures,
+            bounded_backtracking: true,
         }
     }
 }
@@ -1075,6 +1089,22 @@ pub(crate) fn compile_inner_from_hir(
 pub(crate) fn options_to_rabuilder(options: &CompileOptions, usage: DelegateUsage) -> RaBuilder {
     use regex_automata::util::syntax::Config as SyntaxConfig;
 
+    let mut builder = RaBuilder::new();
+    builder.configure(meta_config(options, usage));
+    // NOTE: our Expr to_str function handles creating the correct pattern string for regex-automata
+    //       using the default SyntaxConfig. If we were to set i.e. case sensitivity directly on
+    //       the SyntaxConfig here, and the pattern includes the (?-i) flag, then that flag would
+    //       effectively be ignored unless to_str would encode the flag for every node, even when it
+    //       is the default, which feels too verbose and hurts readability, is more to parse etc.
+    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+
+    let syntax = SyntaxConfig::new().utf8(utf8).unicode(options.unicode);
+    builder.syntax(syntax);
+
+    builder
+}
+
+fn meta_config(options: &CompileOptions, usage: DelegateUsage) -> RaConfig {
     let mut config = RaConfig::new();
     if let Some(limit) = options.delegate_size_limit {
         config = config.nfa_size_limit(Some(limit));
@@ -1101,20 +1131,10 @@ pub(crate) fn options_to_rabuilder(options: &CompileOptions, usage: DelegateUsag
         // search_half/search; skip compiling explicit capture-group slots.
         config = config.which_captures(WhichCaptures::Implicit);
     }
-
-    let mut builder = RaBuilder::new();
-    builder.configure(config);
-    // NOTE: our Expr to_str function handles creating the correct pattern string for regex-automata
-    //       using the default SyntaxConfig. If we were to set i.e. case sensitivity directly on
-    //       the SyntaxConfig here, and the pattern includes the (?-i) flag, then that flag would
-    //       effectively be ignored unless to_str would encode the flag for every node, even when it
-    //       is the default, which feels too verbose and hurts readability, is more to parse etc.
-    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
-
-    let syntax = SyntaxConfig::new().utf8(utf8).unicode(options.unicode);
-    builder.syntax(syntax);
-
-    builder
+    if !usage.bounded_backtracking {
+        config = config.backtrack(false);
+    }
+    config
 }
 
 /// Strip the `(?i:` prefix and `)` suffix that `Expr::to_str` wraps around
@@ -1485,6 +1505,14 @@ impl DelegateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_only_engines_disable_bounded_backtracking() {
+        let options = CompileOptions::default();
+        assert!(!meta_config(&options, DelegateUsage::regular_only()).get_backtrack());
+        assert!(meta_config(&options, DelegateUsage::unanchored()).get_backtrack());
+        assert!(meta_config(&options, DelegateUsage::anchored(true)).get_backtrack());
+    }
     use crate::analyze::{AnalyzeContext, analyze};
     use crate::parse::ExprTree;
     use crate::vm::Insn::*;

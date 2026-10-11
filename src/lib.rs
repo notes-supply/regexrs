@@ -62,6 +62,7 @@ mod optimize;
 mod parse;
 mod parse_flags;
 mod regexset;
+mod regular;
 mod replacer;
 mod searcher;
 mod seek;
@@ -82,6 +83,7 @@ pub use crate::error::{CompileError, Error, ParseError, Result, RuntimeError};
 pub use crate::expand::Expander;
 pub use crate::input::{Input, RegexInput};
 pub use crate::regexset::{RegexSet, RegexSetMatch, RegexSetOptions};
+pub use crate::regular::{RegularCaptureMatches, RegularMatches, RegularRegex};
 pub use crate::replacer::{NoExpand, Replacer, ReplacerRef};
 pub use crate::searcher::Searcher;
 pub use crate::seek::seek_pattern_is_useful;
@@ -754,6 +756,17 @@ impl RegexOptionsBuilder {
         Regex::new_options(pattern, &self.options)
     }
 
+    /// Build a [`RegularRegex`] from the given pattern with these options.
+    ///
+    /// # Errors
+    ///
+    /// As [`RegularRegex::new`], and [`CompileError::NotRegular`] for an option
+    /// that changes matching semantics only the backtracking engine
+    /// implements.
+    pub fn build_regular(&self, pattern: String) -> Result<RegularRegex> {
+        RegularRegex::new_options(pattern, &self.options)
+    }
+
     fn set_config(&mut self, func: impl Fn(SyntaxConfig) -> SyntaxConfig) -> &mut Self {
         self.options.syntaxc = func(self.options.syntaxc);
         self
@@ -1105,6 +1118,26 @@ impl RegexBuilder {
     /// Returns an [`Error`](enum.Error.html) if the pattern could not be parsed.
     pub fn build(&self) -> Result<Regex> {
         self.options.build(self.pattern.clone())
+    }
+
+    /// Build a [`RegularRegex`], which accepts only the regular subset of the
+    /// syntax and never backtracks.
+    ///
+    /// # Errors
+    ///
+    /// As [`RegularRegex::new`], and [`CompileError::NotRegular`] for an option
+    /// that changes matching semantics only the backtracking engine
+    /// implements, such as [`RegexBuilder::find_not_empty`].
+    ///
+    /// ```
+    /// use regexrs::RegexBuilder;
+    /// let words = RegexBuilder::new(r"\bcolou?r\b").case_insensitive(true).build_regular()?;
+    /// assert!(words.is_match("Colour"));
+    /// assert!(RegexBuilder::new("a+").find_not_empty(true).build_regular().is_err());
+    /// # Ok::<(), regexrs::Error>(())
+    /// ```
+    pub fn build_regular(&self) -> Result<RegularRegex> {
+        self.options.build_regular(self.pattern.clone())
     }
 
     /// Change the pattern to build. Useful when building multiple regexes from
@@ -1993,12 +2026,7 @@ impl Regex {
 
     /// Returns an iterator over the capture names.
     pub fn capture_names(&self) -> CaptureNames<'_> {
-        let mut names = Vec::new();
-        names.resize(self.captures_len(), None);
-        for (name, &i) in self.named_groups.iter() {
-            names[i] = Some(name.as_str());
-        }
-        CaptureNames(names.into_iter())
+        capture_names_of(&self.named_groups, self.captures_len())
     }
 
     // for debugging only
@@ -2211,60 +2239,15 @@ impl Regex {
         &self,
         text: &'t str,
         limit: usize,
-        mut rep: R,
+        rep: R,
     ) -> Result<Cow<'t, str>> {
-        // If we know that the replacement doesn't have any capture expansions,
-        // then we can fast path. The fast path can make a tremendous
-        // difference:
-        //
-        //   1) We use `find_iter` instead of `captures_iter`. Not asking for
-        //      captures generally makes the regex engines faster.
-        //   2) We don't need to look up all of the capture groups and do
-        //      replacements inside the replacement string. We just push it
-        //      at each match and be done with it.
-        if let Some(rep) = rep.no_expansion() {
-            let mut it = self.find_iter(text).enumerate().peekable();
-            if it.peek().is_none() {
-                return Ok(Cow::Borrowed(text));
-            }
-            let mut new = String::with_capacity(text.len());
-            let mut last_match = 0;
-            for (i, m) in it {
-                let m = m?;
-
-                if limit > 0 && i >= limit {
-                    break;
-                }
-                new.push_str(&text[last_match..m.start()]);
-                new.push_str(&rep);
-                last_match = m.end();
-            }
-            new.push_str(&text[last_match..]);
-            return Ok(Cow::Owned(new));
-        }
-
-        // The slower path, which we use if the replacement needs access to
-        // capture groups.
-        let mut it = self.captures_iter(text).enumerate().peekable();
-        if it.peek().is_none() {
-            return Ok(Cow::Borrowed(text));
-        }
-        let mut new = String::with_capacity(text.len());
-        let mut last_match = 0;
-        for (i, cap) in it {
-            let cap = cap?;
-
-            if limit > 0 && i >= limit {
-                break;
-            }
-            // unwrap on 0 is OK because captures only reports matches
-            let m = cap.get(0).unwrap();
-            new.push_str(&text[last_match..m.start()]);
-            rep.replace_append(&cap, &mut new);
-            last_match = m.end();
-        }
-        new.push_str(&text[last_match..]);
-        Ok(Cow::Owned(new))
+        replacen_with(
+            text,
+            limit,
+            rep,
+            || self.find_iter(text),
+            || self.captures_iter(text),
+        )
     }
 
     /// Splits the string by matches of the regex.
@@ -2329,6 +2312,83 @@ impl fmt::Display for DebugRegex<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.debug_print(f)
     }
+}
+
+/// The names of `len` capture groups, `None` for unnamed groups.
+fn capture_names_of(named_groups: &NamedGroups, len: usize) -> CaptureNames<'_> {
+    let mut names = Vec::new();
+    names.resize(len, None);
+    for (name, &i) in named_groups.iter() {
+        names[i] = Some(name.as_str());
+    }
+    CaptureNames(names.into_iter())
+}
+
+/// Shared body of the replacement methods. `matches` and `captures` start an
+/// iteration over `text`; only the one the replacer needs is used.
+fn replacen_with<'t, R, E, M, C>(
+    text: &'t str,
+    limit: usize,
+    mut rep: R,
+    matches: impl FnOnce() -> M,
+    captures: impl FnOnce() -> C,
+) -> core::result::Result<Cow<'t, str>, E>
+where
+    R: Replacer,
+    M: Iterator<Item = core::result::Result<Match<'t>, E>>,
+    C: Iterator<Item = core::result::Result<Captures<'t>, E>>,
+{
+    // If we know that the replacement doesn't have any capture expansions,
+    // then we can fast path. The fast path can make a tremendous
+    // difference:
+    //
+    //   1) We use `find_iter` instead of `captures_iter`. Not asking for
+    //      captures generally makes the regex engines faster.
+    //   2) We don't need to look up all of the capture groups and do
+    //      replacements inside the replacement string. We just push it
+    //      at each match and be done with it.
+    if let Some(rep) = rep.no_expansion() {
+        let mut it = matches().enumerate().peekable();
+        if it.peek().is_none() {
+            return Ok(Cow::Borrowed(text));
+        }
+        let mut new = String::with_capacity(text.len());
+        let mut last_match = 0;
+        for (i, m) in it {
+            let m = m?;
+
+            if limit > 0 && i >= limit {
+                break;
+            }
+            new.push_str(&text[last_match..m.start()]);
+            new.push_str(&rep);
+            last_match = m.end();
+        }
+        new.push_str(&text[last_match..]);
+        return Ok(Cow::Owned(new));
+    }
+
+    // The slower path, which we use if the replacement needs access to
+    // capture groups.
+    let mut it = captures().enumerate().peekable();
+    if it.peek().is_none() {
+        return Ok(Cow::Borrowed(text));
+    }
+    let mut new = String::with_capacity(text.len());
+    let mut last_match = 0;
+    for (i, cap) in it {
+        let cap = cap?;
+
+        if limit > 0 && i >= limit {
+            break;
+        }
+        let m = cap.get(0).expect("captures only report matches");
+        new.push_str(&text[last_match..m.start()]);
+        rep.replace_append(&cap, &mut new);
+        last_match = m.end();
+    }
+    new.push_str(&text[last_match..]);
+    Ok(Cow::Owned(new))
 }
 
 /// The `regex-automata` input for a search: same haystack, range, start and

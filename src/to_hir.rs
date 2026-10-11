@@ -106,9 +106,16 @@ pub(crate) fn expr_to_hir(expr: &Expr, ctx: &mut HirCtx) -> Option<Hir> {
                 Look::StartCRLF
             }
             Assertion::EndLine { crlf: true } => Look::EndCRLF,
-            // Word boundaries and \Z are hard and never reach a delegated
-            // subtree; be conservative if they somehow do.
-            _ => return None,
+            // The VM tests word boundaries with these Unicode definitions in
+            // every bytes mode; only `RegularRegex` translates them here.
+            Assertion::WordBoundary => Look::WordUnicode,
+            Assertion::NotWordBoundary => Look::WordUnicodeNegate,
+            Assertion::LeftWordBoundary => Look::WordStartUnicode,
+            Assertion::RightWordBoundary => Look::WordEndUnicode,
+            Assertion::LeftWordHalfBoundary => Look::WordStartHalfUnicode,
+            Assertion::RightWordHalfBoundary => Look::WordEndHalfUnicode,
+            // `\Z` needs custom trailing-newline handling.
+            Assertion::EndTextIgnoreTrailingNewlines { .. } => return None,
         }),
         Expr::Concat(ref children) => {
             let subs = children

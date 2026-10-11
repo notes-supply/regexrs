@@ -95,6 +95,10 @@ pub enum CompileError {
     PatternCanNeverMatch,
     /// An unresolved AST node was encountered during analysis (internal error)
     UnresolvedAstNode(usize, String),
+    /// [`RegularRegex`](crate::RegularRegex) rejects the named construct or
+    /// option, which needs the backtracking engine. [`Regex`](crate::Regex)
+    /// accepts it.
+    NotRegular(&'static str),
 }
 
 /// An error as the result of executing a regex.
@@ -196,6 +200,11 @@ impl fmt::Display for CompileError {
                     "Pattern can never match: the regex is zero-width only but find_not_empty is set"
                 )
             }
+            CompileError::NotRegular(construct) => write!(
+                f,
+                "{} is outside the regular subset accepted by RegularRegex; use Regex",
+                construct
+            ),
             CompileError::UnresolvedAstNode(ix, node) => {
                 write!(
                     f,
