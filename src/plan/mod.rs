@@ -126,9 +126,10 @@ struct Run {
     /// `usize::MAX` when unbounded.
     max: usize,
     lazy: bool,
-    /// Consume `min` characters only: a lazy run that nothing after it can
-    /// fail. Every other run consumes as much as it can, which is also what a
-    /// lazy run does when the next character must end it.
+    /// Consume `min` characters only: a run of fixed length, or a lazy run
+    /// that nothing after it can fail. Every other run consumes as much as it
+    /// can, which is also what a lazy run does when the next character must
+    /// end it.
     shortest: bool,
     /// For a class of every scalar value but at most three ASCII bytes, those
     /// bytes: in valid UTF-8 the run ends at the next of them.
@@ -410,7 +411,7 @@ impl Run {
             min,
             max,
             lazy: !greedy,
-            shortest: false,
+            shortest: min == max,
             stops,
         }
     }
@@ -1313,7 +1314,10 @@ impl Plan {
             && match &steps[first] {
                 // Retrying shorter runs costs little more than a window.
                 Step::Run(run)
-                    if run.max != usize::MAX && run.max > 2 && run.min > 0 && !run.shortest =>
+                    if run.max != usize::MAX
+                        && run.max > 2
+                        && run.min > 0
+                        && (run.min == run.max || !run.shortest) =>
                 {
                     let can_end = first_follow.end == Some(true);
                     (!can_end || !trailing.is_empty())
@@ -1705,7 +1709,9 @@ impl Plan {
         edges.behind.iter().all(|edge| edge.behind(haystack, at))
     }
 
-    /// Match `steps` from `state.pos`.
+    /// Match `steps` from `state.pos`. Steps without steps inside them are
+    /// matched in the loop itself: a call for each, as for a case-folded
+    /// letter, would cost more than its test.
     #[inline]
     fn sequence<'p, S: Slots + ?Sized>(
         &'p self,
@@ -1714,41 +1720,29 @@ impl Plan {
         state: &mut State<'p, '_, S>,
         earliest: bool,
     ) -> Result<(), Stop> {
-        for step in steps {
-            self.step(step, input, state, earliest)?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn step<'p, S: Slots + ?Sized>(
-        &'p self,
-        step: &'p Step,
-        input: &PlanInput<'_>,
-        state: &mut State<'p, '_, S>,
-        earliest: bool,
-    ) -> Result<(), Stop> {
         let (haystack, end) = (input.haystack, input.end);
-        match step {
-            Step::Literal(bytes) => {
-                if !literal_at(haystack, state.pos, end, bytes) {
-                    return Err(Stop::Fail);
+        for step in steps {
+            match step {
+                Step::Literal(bytes) => {
+                    if !literal_at(haystack, state.pos, end, bytes) {
+                        return Err(Stop::Fail);
+                    }
+                    state.pos += bytes.len();
                 }
-                state.pos += bytes.len();
-            }
-            Step::Run(run) => {
-                state.pos = Plan::run_end(run, input, state.pos, false).ok_or(Stop::Fail)?;
-            }
-            Step::Save(slot) => {
-                if let Some(slots) = state.slots.as_deref_mut() {
-                    slots.set(*slot, state.pos);
+                Step::Run(run) => {
+                    state.pos = Plan::run_end(run, input, state.pos, false).ok_or(Stop::Fail)?;
                 }
+                Step::Save(slot) => {
+                    if let Some(slots) = state.slots.as_deref_mut() {
+                        slots.set(*slot, state.pos);
+                    }
+                }
+                Step::Alt(alt) => {
+                    let branch = alt.branch(haystack, state.pos, end).ok_or(Stop::Fail)?;
+                    self.sequence(branch, input, state, earliest)?;
+                }
+                Step::Group(group) => self.group(group, input, state, earliest, false)?,
             }
-            Step::Alt(alt) => {
-                let branch = alt.branch(haystack, state.pos, end).ok_or(Stop::Fail)?;
-                self.sequence(branch, input, state, earliest)?;
-            }
-            Step::Group(group) => self.group(group, input, state, earliest, false)?,
         }
         Ok(())
     }
@@ -1882,8 +1876,11 @@ impl Plan {
                             break 'program Err(stop);
                         }
                     }
-                    Step::Alt(_) if BRANCHING => {
-                        if let Err(stop) = self.step(step, input, &mut state, earliest) {
+                    Step::Alt(alt) if BRANCHING => {
+                        let Some(branch) = alt.branch(haystack, state.pos, end) else {
+                            break 'program Err(Stop::Fail);
+                        };
+                        if let Err(stop) = self.sequence(branch, input, &mut state, earliest) {
                             break 'program Err(stop);
                         }
                     }
