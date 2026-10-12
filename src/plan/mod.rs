@@ -21,6 +21,11 @@
 //! is already decided. Patterns outside this shape keep their regex-automata
 //! engine, which no search through a plan consults.
 //!
+//! A pattern whose prefixes are exactly its matches, a finite set of literals
+//! without captures or assertions, needs no program at all. Its leftmost-first
+//! prefilter reports the matches in the pattern's order of preference, as the
+//! meta engine's literal strategy does, and so admission does not apply to it.
+//!
 //! Work stays linear in the haystack. Candidate starts are tried left to
 //! right. Between an attempt's start, or the last match it recorded, and any
 //! point where it can fail, it reads at most [`RESCAN_BOUND`] bytes where

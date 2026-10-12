@@ -62,8 +62,9 @@ literal after an unbounded first run that the run cannot take, as `@` in
 `\w+@\w+`, gives the candidates instead: at each of its occurrences the plan
 scans back over the run to the match start. A pattern that is a finite set of
 literals without captures or assertions is searched with its prefilter alone,
-as the meta engine's literal strategy does. Alternatives are chosen through a
-256-entry table of first bytes. Runs match
+as the meta engine's literal strategy does, whatever the shape of its
+alternatives, so `ab|ac` and `(?:a|)b` need no program. Alternatives are chosen
+through a 256-entry table of first bytes. Runs match
 maximally (or minimally for a lazy run nothing can fail after), and a failed
 attempt skips past a first run that cannot match. Captures, ranges, anchoring,
 `Searcher` and `CaptureLocations` give the meta engine's results with no
