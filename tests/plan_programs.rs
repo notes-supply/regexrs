@@ -323,7 +323,7 @@ fn generated_patterns_follow_byte_modes() {
         b"\n",
         b"ab",
     ];
-    let (mut planned, mut nullable, mut oracle_panics) = (0, 0, 0);
+    let (mut planned, mut nullable) = (0, 0);
     for _ in 0..2500 {
         let unicode = rng.below(2) == 0;
         let pattern = pattern(&mut rng, !unicode);
@@ -351,57 +351,34 @@ fn generated_patterns_follow_byte_modes() {
             continue;
         }
         planned += 1;
-        // Empty matches follow the meta engine regexrs configures, which
-        // skips those inside a UTF-8 sequence even in byte modes, unlike the
-        // regex crate's byte API.
+        // Empty matches inside a UTF-8 sequence are not reported, as by the
+        // meta engine regexrs configures, even in byte modes; the regex
+        // crate's byte API reports them.
         let can_be_empty = regex_syntax::ParserBuilder::new()
             .unicode(unicode)
             .utf8(false)
             .build()
             .parse(&oracle_pattern)
             .is_ok_and(|hir| hir.properties().minimum_len() == Some(0));
-        let meta = can_be_empty.then(|| {
-            Meta::builder()
-                .syntax(
-                    regex_automata::util::syntax::Config::new()
-                        .unicode(unicode)
-                        .utf8(false),
-                )
-                .build(&oracle_pattern)
-                .unwrap()
-        });
         nullable += usize::from(can_be_empty);
         for _ in 0..8 {
             let text: Vec<u8> = (0..rng.below(12))
                 .flat_map(|_| BYTES[rng.below(BYTES.len())].iter().copied())
                 .collect();
             let context = format!("{pattern:?} {mode:?} {text:?}");
-            let expected: Vec<Groups> = match &meta {
-                // regex-automata can panic here on invalid UTF-8, a defect
-                // the plans do not share; such texts have no oracle.
-                Some(meta) => {
-                    let run = || {
-                        meta.captures_iter(text.as_slice())
-                            .map(|c| {
-                                (0..c.group_len())
-                                    .map(|i| c.get_group(i).map(|s| (s.start, s.end)))
-                                    .collect()
-                            })
-                            .collect()
-                    };
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
-                        Ok(expected) => expected,
-                        Err(_) => {
-                            oracle_panics += 1;
-                            continue;
-                        }
-                    }
-                }
-                None => oracle
-                    .captures_iter(&text)
-                    .map(|c| c.iter().map(|m| m.map(|m| (m.start(), m.end()))).collect())
-                    .collect(),
-            };
+            let inside = |at: usize| text.get(at).is_some_and(|&b| b & 0xC0 == 0x80);
+            let expected: Vec<Groups> = oracle
+                .captures_iter(&text)
+                .map(|c| {
+                    c.iter()
+                        .map(|m| m.map(|m| (m.start(), m.end())))
+                        .collect::<Groups>()
+                })
+                .filter(|groups| {
+                    let (start, end) = groups[0].unwrap();
+                    !(can_be_empty && start == end && inside(start))
+                })
+                .collect();
             let found: Vec<Groups> = regular
                 .captures_iter(text.as_slice())
                 .map(|c| byte_groups(&c))
@@ -418,8 +395,6 @@ fn generated_patterns_follow_byte_modes() {
             }
         }
     }
-    eprintln!(
-        "byte modes: planned {planned}, of which can be empty {nullable}; oracle panics {oracle_panics}"
-    );
+    eprintln!("byte modes: planned {planned}, of which can be empty {nullable}");
     assert!(planned > 300, "{planned}");
 }

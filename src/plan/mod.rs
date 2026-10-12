@@ -1928,9 +1928,10 @@ impl Plan {
     }
 
     /// `search` for a pattern that can match nothing, which matches where the
-    /// search starts. A match ending inside a character is not reported: as
-    /// the meta engine does, an unanchored search then starts again a byte
-    /// later.
+    /// search starts. An empty match inside a UTF-8 sequence is not reported:
+    /// as the meta engine does, an unanchored search then starts again a byte
+    /// later. A match that is not empty is reported wherever it ends, as in
+    /// byte modes it may end inside a sequence.
     fn search_empty<S: Slots + ?Sized>(
         &self,
         input: &PlanInput<'_>,
@@ -1942,7 +1943,7 @@ impl Plan {
             let end = self
                 .attempt(input, start, earliest, slots.as_deref_mut())
                 .ok()?;
-            if char_boundary(input.haystack, end) {
+            if end > start || char_boundary(input.haystack, end) {
                 return Some((start, end));
             }
             if input.anchored || start >= input.end {

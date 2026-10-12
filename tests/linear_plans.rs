@@ -489,3 +489,39 @@ fn literal_plans_stay_inside_the_range() {
         }
     }
 }
+
+/// In byte modes a pattern that can match nothing reports a match that is not
+/// empty wherever it ends, as the regex crate's byte API does; the meta engine
+/// panicked on several of these. An empty match inside a UTF-8 sequence is
+/// still skipped, as the meta engine skips it.
+#[test]
+fn nullable_byte_plans_skip_only_empty_matches_inside_sequences() {
+    let spans = |pattern: &str, text: &[u8]| {
+        let regex = RegexBuilder::new(pattern)
+            .bytes_mode(BytesMode::Ascii)
+            .build()
+            .unwrap();
+        let regular = RegexBuilder::new(pattern)
+            .bytes_mode(BytesMode::Ascii)
+            .build_regular()
+            .unwrap();
+        assert!(regex.planned() && regular.planned());
+        let found: Vec<(usize, usize)> = regex
+            .find_iter(text)
+            .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
+            .collect();
+        let regular: Vec<(usize, usize)> = regular
+            .find_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(found, regular, "{pattern}");
+        found
+    };
+    assert_eq!(
+        spans(r"\W?", b"\xE2\x82\xAC\xE2\x82"),
+        [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+    );
+    assert_eq!(spans(r"\W?", b"\x80\x80a\x80"), [(0, 1), (1, 2), (3, 4)]);
+    assert_eq!(spans("a*", b"\x80"), [(1, 1)]);
+    assert_eq!(spans("a*", b"\x80a"), [(1, 2)]);
+}
