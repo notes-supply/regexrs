@@ -156,6 +156,10 @@ enum Whole {
     /// literals, without captures or assertions, which its leftmost-first
     /// prefilter reports in the pattern's order of preference.
     Literals,
+    /// The program is one unbounded run of at least one member, without
+    /// captures or assertions: a match is the maximal run from the first
+    /// candidate long enough.
+    Run,
 }
 
 /// No branch of an alternation starts with this byte.
@@ -1309,6 +1313,10 @@ impl Plan {
         }
         let group_info = GroupInfo::new([group_names]).ok()?;
         let checks_start = !leading.is_empty() || !edges.behind.is_empty();
+        let single_run = !checks_start
+            && !checks_end
+            && !start_only
+            && matches!(&*steps, [Step::Run(run)] if run.max == usize::MAX && run.min > 0);
         Some(Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
@@ -1323,6 +1331,8 @@ impl Plan {
                 Whole::Empty
             } else if exact {
                 Whole::Literals
+            } else if single_run {
+                Whole::Run
             } else {
                 Whole::Attempts
             },
@@ -1475,6 +1485,26 @@ impl Plan {
         }
     }
 
+    /// Where `run` ends from `at`, or `None` if it has fewer than `run.min`
+    /// members: after `run.min` members when it is shortest or `decided`, else
+    /// after as many as it can take. A single character, the commonest run
+    /// (a class or a case-folded letter), is tested directly.
+    #[inline(always)]
+    fn run_end(run: &Run, input: &PlanInput<'_>, at: usize, decided: bool) -> Option<usize> {
+        if run.max == 1 && run.min == 1 {
+            return run
+                .class
+                .match_len(input.haystack, at, input.end)
+                .map(|len| at + len);
+        }
+        let (stop, count) = if run.shortest || decided {
+            Plan::take(run, input.haystack, at, input.end, run.min)
+        } else {
+            Plan::scan(run, input.haystack, at, input.end, input.utf8)
+        };
+        (count >= run.min).then_some(stop)
+    }
+
     /// The end of the maximal run from `at`, up to `run.max` members, and how
     /// many members it has, counted only up to one when the run is unbounded
     /// and ends at a stop byte.
@@ -1583,22 +1613,19 @@ impl Plan {
     /// Whether every trailing assertion holds at `at`.
     #[inline]
     fn trailing_hold(&self, haystack: &[u8], at: usize) -> bool {
-        !self.checks_end || self.end_holds(haystack, at)
-    }
-
-    #[inline(never)]
-    fn end_holds(&self, haystack: &[u8], at: usize) -> bool {
-        self.trailing
-            .iter()
-            .all(|&look| self.look_at(look, haystack, at))
-            && self
-                .edges
-                .as_ref()
-                .is_none_or(|edges| edges.ahead.iter().all(|edge| edge.ahead(haystack, at)))
+        !self.checks_end
+            || self
+                .trailing
+                .iter()
+                .all(|&look| self.look_at(look, haystack, at))
+                && self
+                    .edges
+                    .as_ref()
+                    .is_none_or(|edges| Plan::ahead_holds(edges, haystack, at))
     }
 
     /// Whether every leading assertion holds at `at`.
-    #[inline(never)]
+    #[inline]
     fn start_holds(&self, haystack: &[u8], at: usize) -> bool {
         self.leading
             .iter()
@@ -1606,7 +1633,19 @@ impl Plan {
             && self
                 .edges
                 .as_ref()
-                .is_none_or(|edges| edges.behind.iter().all(|edge| edge.behind(haystack, at)))
+                .is_none_or(|edges| Plan::behind_holds(edges, haystack, at))
+    }
+
+    /// The lookaheads, out of line: ordinary assertions stay inline.
+    #[inline(never)]
+    fn ahead_holds(edges: &Edges, haystack: &[u8], at: usize) -> bool {
+        edges.ahead.iter().all(|edge| edge.ahead(haystack, at))
+    }
+
+    /// The lookbehinds, out of line: ordinary assertions stay inline.
+    #[inline(never)]
+    fn behind_holds(edges: &Edges, haystack: &[u8], at: usize) -> bool {
+        edges.behind.iter().all(|edge| edge.behind(haystack, at))
     }
 
     /// Match `steps` from `state.pos`.
@@ -1635,24 +1674,13 @@ impl Plan {
         let (haystack, end) = (input.haystack, input.end);
         match step {
             Step::Literal(bytes) => {
-                if !haystack
-                    .get(state.pos..end)
-                    .is_some_and(|rest| rest.starts_with(bytes))
-                {
+                if !literal_at(haystack, state.pos, end, bytes) {
                     return Err(Stop::Fail);
                 }
                 state.pos += bytes.len();
             }
             Step::Run(run) => {
-                let (stop, count) = if run.shortest {
-                    Plan::take(run, haystack, state.pos, end, run.min)
-                } else {
-                    Plan::scan(run, haystack, state.pos, end, input.utf8)
-                };
-                if count < run.min {
-                    return Err(Stop::Fail);
-                }
-                state.pos = stop;
+                state.pos = Plan::run_end(run, input, state.pos, false).ok_or(Stop::Fail)?;
             }
             Step::Save(slot) => {
                 if let Some(slots) = state.slots.as_deref_mut() {
@@ -1722,20 +1750,22 @@ impl Plan {
         slots: Option<&mut S>,
     ) -> Result<usize, usize> {
         if self.branching {
-            self.attempt_program::<true, S>(input, start, earliest, slots)
+            self.attempt_program::<true, S>(input, start, earliest, false, slots)
         } else {
-            self.attempt_program::<false, S>(input, start, earliest, slots)
+            self.attempt_program::<false, S>(input, start, earliest, false, slots)
         }
     }
 
     /// [`Plan::attempt`], compiled without alternatives and groups, and so
-    /// without recorded matches, unless `BRANCHING`.
+    /// without recorded matches, unless `BRANCHING`. `confirmed`: the
+    /// candidate finder already found the first literal at `start`.
     #[inline]
     fn attempt_program<const BRANCHING: bool, S: Slots + ?Sized>(
         &self,
         input: &PlanInput<'_>,
         start: usize,
         earliest: bool,
+        confirmed: bool,
         mut slots: Option<&mut S>,
     ) -> Result<usize, usize> {
         let (haystack, end) = (input.haystack, input.end);
@@ -1765,9 +1795,8 @@ impl Plan {
             for (index, step) in steps.iter().enumerate() {
                 match step {
                     Step::Literal(bytes) => {
-                        if !haystack
-                            .get(state.pos..end)
-                            .is_some_and(|rest| rest.starts_with(bytes))
+                        if !(confirmed && index == self.first)
+                            && !literal_at(haystack, state.pos, end, bytes)
                         {
                             break 'program Err(Stop::Fail);
                         }
@@ -1776,18 +1805,13 @@ impl Plan {
                     Step::Run(run) => {
                         let decided =
                             earliest && index + 1 == self.decisive && self.trailing.is_empty();
-                        let (stop, count) = if run.shortest || decided {
-                            Plan::take(run, haystack, state.pos, end, run.min)
-                        } else {
-                            Plan::scan(run, haystack, state.pos, end, input.utf8)
+                        let Some(stop) = Plan::run_end(run, input, state.pos, decided) else {
+                            break 'program Err(Stop::Fail);
                         };
                         if index == self.first {
                             first_run_end = stop;
                         }
                         state.pos = stop;
-                        if count < run.min {
-                            break 'program Err(Stop::Fail);
-                        }
                     }
                     Step::Save(slot) => {
                         if let Some(slots) = state.slots.as_deref_mut() {
@@ -1886,11 +1910,13 @@ impl Plan {
         &self,
         input: &PlanInput<'_>,
         earliest: bool,
-        mut slots: Option<&mut S>,
+        slots: Option<&mut S>,
     ) -> Option<(usize, usize)> {
         let start = input.start;
-        if self.whole != Whole::Attempts {
-            return self.search_whole(input, earliest, slots);
+        match self.whole {
+            Whole::Attempts => {}
+            Whole::Run => return self.search_run(input, earliest),
+            Whole::Empty | Whole::Literals => return self.search_whole(input, earliest, slots),
         }
         if input.anchored || self.start_only {
             let found = self.attempt(input, start, earliest, slots);
@@ -1904,32 +1930,100 @@ impl Plan {
         if self.window {
             return self.search_windows(input, earliest, slots);
         }
-        let mut from = start;
+        if self.branching {
+            self.search_candidates::<true, S>(input, earliest, slots)
+        } else {
+            self.search_candidates::<false, S>(input, earliest, slots)
+        }
+    }
+
+    /// Attempts at each candidate start in turn, compiled per kind of program
+    /// as [`Plan::attempt_program`] is.
+    #[inline(always)]
+    fn search_candidates<const BRANCHING: bool, S: Slots + ?Sized>(
+        &self,
+        input: &PlanInput<'_>,
+        earliest: bool,
+        mut slots: Option<&mut S>,
+    ) -> Option<(usize, usize)> {
+        // A literal finder only reports where the first literal occurs.
+        let confirmed = matches!(self.candidates, Candidates::Literal(_));
+        let mut from = input.start;
         loop {
             let candidate = self.next_candidate(input, from)?;
-            let resume = match self.attempt(input, candidate, earliest, slots.as_deref_mut()) {
+            let attempt = self.attempt_program::<BRANCHING, S>(
+                input,
+                candidate,
+                earliest,
+                confirmed,
+                slots.as_deref_mut(),
+            );
+            let resume = match attempt {
                 Ok(match_end) => return Some((candidate, match_end)),
-                // Every later start inside an unbounded first run ends it at
-                // the same place, and so fails the same way.
-                Err(run_end) if self.skip_first_run && run_end != LOOK_MISS => {
-                    run_end.max(candidate + 1)
-                }
-                // A lookbehind failing at the start of the first run fails
-                // throughout it.
-                Err(_) if self.look_skip => {
-                    let Step::Run(run) = &self.steps[self.first] else {
-                        unreachable!("a lookbehind skips past a first run");
-                    };
-                    let (run_end, _) =
-                        Plan::take(run, input.haystack, candidate, input.end, usize::MAX);
-                    run_end.max(candidate + 1)
-                }
-                Err(_) => candidate + 1,
+                Err(failure) => self.resume_after(input, candidate, failure),
             };
             if resume >= input.end {
                 return None;
             }
             from = resume;
+        }
+    }
+
+    /// Where to look for the next candidate after an attempt at `candidate`
+    /// failed with `failure` (see [`Plan::attempt`]).
+    #[inline]
+    fn resume_after(&self, input: &PlanInput<'_>, candidate: usize, failure: usize) -> usize {
+        if failure != LOOK_MISS {
+            // Every later start inside an unbounded first run ends it at the
+            // same place, and so fails the same way.
+            if self.skip_first_run {
+                return failure.max(candidate + 1);
+            }
+        } else if self.look_skip {
+            // A lookbehind failing at the start of the first run fails
+            // throughout it.
+            return self.past_first_run(input, candidate);
+        }
+        candidate + 1
+    }
+
+    /// Where the maximal run of the first step's class from `candidate` ends,
+    /// at least a byte later: where to look next when no start inside that
+    /// run can match. Out of line, so that the run scan does not enlarge
+    /// every search loop.
+    #[cold]
+    #[inline(never)]
+    fn past_first_run(&self, input: &PlanInput<'_>, candidate: usize) -> usize {
+        let Step::Run(run) = &self.steps[self.first] else {
+            unreachable!("only a plan starting with a run skips past it");
+        };
+        let (run_end, _) = Plan::take(run, input.haystack, candidate, input.end, usize::MAX);
+        run_end.max(candidate + 1)
+    }
+
+    /// `search` for a program that is one unbounded run: no attempt, just the
+    /// run from each candidate. A membership test needs only its minimum.
+    #[inline]
+    fn search_run(&self, input: &PlanInput<'_>, earliest: bool) -> Option<(usize, usize)> {
+        let Step::Run(run) = &self.steps[0] else {
+            unreachable!("a plan of one run has a run");
+        };
+        if input.anchored {
+            let end = Plan::run_end(run, input, input.start, earliest)?;
+            return Some((input.start, end));
+        }
+        let mut from = input.start;
+        loop {
+            let candidate = self.next_candidate(input, from)?;
+            if let Some(end) = Plan::run_end(run, input, candidate, earliest) {
+                return Some((candidate, end));
+            }
+            // Shorter than its minimum, or not a member after all: so is
+            // every later start inside the same run.
+            from = self.past_first_run(input, candidate);
+            if from >= input.end {
+                return None;
+            }
         }
     }
 
@@ -2076,6 +2170,19 @@ impl<'p, S: Slots + ?Sized> State<'p, '_, S> {
 /// An attempt's failure at a leading assertion, which says nothing about
 /// later starts.
 const LOOK_MISS: usize = usize::MAX;
+
+/// Whether `bytes` occur at `at`, ending by `end`. A single byte, the
+/// commonest literal between runs, is compared directly rather than through a
+/// slice comparison call.
+#[inline(always)]
+fn literal_at(haystack: &[u8], at: usize, end: usize, bytes: &[u8]) -> bool {
+    match bytes {
+        [byte] => at < end && haystack[at] == *byte,
+        _ => haystack
+            .get(at..end)
+            .is_some_and(|rest| rest.starts_with(bytes)),
+    }
+}
 
 /// Where a plan searches: `start..end` of `haystack`, which is valid UTF-8
 /// when `utf8` is set, only at `start` when `anchored`. Assertions see the
