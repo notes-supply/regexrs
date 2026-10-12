@@ -918,7 +918,10 @@ impl Exposure {
             // Every repetition after the first leaves the same exposure.
             return self.times(2);
         }
-        (self.limit == usize::MAX).then_some(Exposure {
+        // Unbounded: the next point where the attempt can fail, which a
+        // repetition that records no match always has after it, rejects the
+        // program.
+        Some(Exposure {
             add: usize::MAX,
             floor: usize::MAX,
             limit: usize::MAX,

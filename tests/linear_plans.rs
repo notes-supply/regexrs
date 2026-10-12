@@ -69,6 +69,8 @@ const PATTERNS: &[&str] = &[
     "(?i)holmes|watson",
     "(a)|(b)c|(d)",
     "x(?:y|(z))w",
+    // Alternatives whose first characters share a UTF-8 lead byte.
+    "(é)|(ê)x",
     // Optional and repeated groups, greedy and lazy, with captures.
     "colou?r",
     "(a)?(b*)",
@@ -150,6 +152,7 @@ const TEXTS: &[&str] = &[
     "let mut x; fn impl pub structs pub(crate)",
     "aabacb abcabc bc ac",
     "xyw xzw xw xyzw",
+    "é êx ê ex éêx",
 ];
 
 fn oracle_captures(
