@@ -1652,13 +1652,11 @@ impl Plan {
             | Look::WordEndHalfUnicode => {
                 // An ASCII byte is a whole character on either side.
                 if (before | after) >= 0x80 {
-                    return self.look_matcher.matches(look, haystack, at);
+                    return self.look_decoded(look, haystack, at);
                 }
                 (word(before), word(after))
             }
-            Look::StartCRLF | Look::EndCRLF => {
-                return self.look_matcher.matches(look, haystack, at);
-            }
+            Look::StartCRLF | Look::EndCRLF => return self.look_decoded(look, haystack, at),
         };
         match look {
             Look::WordAscii | Look::WordUnicode => before != after,
@@ -1669,6 +1667,15 @@ impl Plan {
             Look::WordEndHalfAscii | Look::WordEndHalfUnicode => !after,
             _ => unreachable!("only word assertions reach here"),
         }
+    }
+
+    /// `look` at `at` as regex-automata decides it, decoding the characters
+    /// around it: one copy of its tests, rather than one wherever
+    /// [`Plan::look_at`] is inlined.
+    #[cold]
+    #[inline(never)]
+    fn look_decoded(&self, look: Look, haystack: &[u8], at: usize) -> bool {
+        self.look_matcher.matches(look, haystack, at)
     }
 
     /// Whether every trailing assertion holds at `at`.
