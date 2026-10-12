@@ -150,6 +150,17 @@ pub(super) fn insert_byte(set: &mut [u64; 4], b: u8) {
     set[usize::from(b >> 6)] |= 1 << (b & 63);
 }
 
+/// The bytes in `set` in increasing order, visiting only its members.
+pub(super) fn bytes_in(set: [u64; 4]) -> impl Iterator<Item = u8> {
+    (0u8..).zip(set).flat_map(|(word, mut bits)| {
+        core::iter::from_fn(move || {
+            let bit = (bits != 0).then(|| bits.trailing_zeros() as u8)?;
+            bits &= bits - 1;
+            Some(word * 64 + bit)
+        })
+    })
+}
+
 /// Bit `b` of `bits`, for `b` below 128, read from one 64-bit half: a
 /// variable 128-bit shift costs several instructions per character.
 #[inline]
@@ -391,7 +402,7 @@ impl Class {
     pub(super) fn single(&self) -> Option<Vec<u8>> {
         match self {
             Class::Bytes(set) => {
-                let mut members = (0..=255u8).filter(|&b| has_byte(set, b));
+                let mut members = bytes_in(*set);
                 match (members.next(), members.next()) {
                     (Some(b), None) => Some(Vec::from([b])),
                     _ => None,
@@ -445,7 +456,8 @@ impl Class {
         {
             return None;
         }
-        Stops::of(&mut (0..0x80u8).filter(|&b| (set.ascii >> b) & 1 == 0))
+        let excluded = [!set.ascii as u64, (!set.ascii >> 64) as u64, 0, 0];
+        Stops::of(&mut bytes_in(excluded))
     }
 
     /// The bytes members can start with.

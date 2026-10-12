@@ -35,6 +35,7 @@
 //! regex-automata prefilter, memchr over at most three bytes, a word-at-a-time
 //! test of byte ranges or a class scan, in that order of preference.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use regex_automata::util::captures::{Captures as RaCaptures, GroupInfo};
@@ -48,7 +49,9 @@ use crate::vm::char_at;
 
 mod class;
 
-use class::{ByteRanges, Class, Stops, WORD_BYTE, bit128, char_boundary, class_units, has_byte};
+use class::{
+    ByteRanges, Class, Stops, WORD_BYTE, bit128, bytes_in, char_boundary, class_units, has_byte,
+};
 
 /// A regular pattern searched as one deterministic program of steps.
 #[derive(Clone, Debug)]
@@ -459,16 +462,16 @@ impl Step {
     }
 
     /// The characters the step's first consumed character can be.
-    fn first(&self) -> Option<Class> {
+    fn first(&self) -> Option<Cow<'_, Class>> {
         match self {
             Step::Literal(bytes) => {
                 let len = char_at(bytes, 0).map_or(1, |(_, len)| len);
-                Class::from_literal(&bytes[..len])
+                Class::from_literal(&bytes[..len]).map(Cow::Owned)
             }
-            Step::Run(run) => Some(run.class.clone()),
+            Step::Run(run) => Some(Cow::Borrowed(&run.class)),
             Step::Save(_) => None,
-            Step::Alt(alt) => Some(alt.first.clone()),
-            Step::Group(group) => Some(group.first.clone()),
+            Step::Alt(alt) => Some(Cow::Borrowed(&alt.first)),
+            Step::Group(group) => Some(Cow::Borrowed(&group.first)),
         }
     }
 
@@ -491,7 +494,7 @@ fn starts(steps: &[Step]) -> Option<(Option<Class>, bool)> {
         if let Some(class) = step.first() {
             first = Some(match first {
                 Some(first) => first.union(&class)?,
-                None => class,
+                None => class.into_owned(),
             });
         }
         if step.consumes() {
@@ -531,12 +534,9 @@ impl Alt {
         let mut table = Box::new([NO_BRANCH; 256]);
         let mut by_byte = branches.len() < usize::from(NO_BRANCH);
         for (index, first) in firsts.iter().enumerate() {
-            let bytes = first.first_bytes();
-            for b in 0..=255u8 {
-                if has_byte(&bytes, b) {
-                    by_byte &= table[usize::from(b)] == NO_BRANCH;
-                    table[usize::from(b)] = index as u8;
-                }
+            for b in bytes_in(first.first_bytes()) {
+                by_byte &= table[usize::from(b)] == NO_BRANCH;
+                table[usize::from(b)] = index as u8;
             }
         }
         // Branches sharing a first byte need their characters compared, which
@@ -694,11 +694,11 @@ fn flatten(
     Some(())
 }
 
-/// What can come after a step.
+/// What can come after a step, borrowing the classes of later steps.
 #[derive(Clone)]
-struct Follow {
+struct Follow<'a> {
     /// The characters that can come next, if any.
-    next: Option<Class>,
+    next: Option<Cow<'a, Class>>,
     /// Whether the rest of the pattern can match nothing here: `None` where
     /// that depends on how often an enclosing group has repeated.
     end: Option<bool>,
@@ -710,7 +710,7 @@ struct Follow {
     later: Option<Vec<usize>>,
 }
 
-impl Follow {
+impl<'a> Follow<'a> {
     /// Whether a character of `class` could come next.
     fn overlaps(&self, class: &Class) -> bool {
         self.next.as_ref().is_some_and(|next| next.overlaps(class))
@@ -718,12 +718,22 @@ impl Follow {
 
     /// `class` can come next as well; `None` if the characters do not fit
     /// one class.
-    fn add(&mut self, class: Class) -> Option<()> {
+    fn add(&mut self, class: Cow<'a, Class>) -> Option<()> {
         self.next = Some(match self.next.take() {
-            Some(next) => next.union(&class)?,
+            Some(next) => Cow::Owned(next.union(&class)?),
             None => class,
         });
         Some(())
+    }
+
+    /// The same follow, owning its class.
+    fn into_owned(self) -> Follow<'static> {
+        Follow {
+            next: self.next.map(|next| Cow::Owned(next.into_owned())),
+            end: self.end,
+            completion: self.completion,
+            later: self.later,
+        }
     }
 }
 
@@ -740,27 +750,36 @@ fn extend(list: &mut Option<Vec<usize>>, slots: impl IntoIterator<Item = usize>)
 /// Admit `steps`, followed by `outer`, where the next character decides every
 /// choice: mark lazy runs that stop at their minimum and groups that record
 /// where they could stop. Returns what follows the step at `want`.
-fn admit(
-    steps: &mut [Step],
-    outer: &Follow,
+fn admit<'a>(
+    steps: &'a mut [Step],
+    outer: &Follow<'a>,
     trailing: &[Look],
     want: Option<usize>,
-) -> Option<Option<Follow>> {
+) -> Option<Option<Follow<'static>>> {
     let mut wanted = None;
     let mut follow = outer.clone();
-    for index in (0..steps.len()).rev() {
-        if want == Some(index) {
-            wanted = Some(follow.clone());
+    let mut rest = steps;
+    while let Some((step, before)) = rest.split_last_mut() {
+        if want == Some(before.len()) {
+            wanted = Some(follow.clone().into_owned());
         }
-        admit_step(&mut steps[index], &follow, trailing)?;
-        let step = &steps[index];
-        if let Step::Save(slot) = step {
-            extend(&mut follow.completion, [*slot]);
-            continue;
+        admit_step(step, &follow, trailing)?;
+        // Admitted, the step's classes can be borrowed by the follows of
+        // the steps before it.
+        let step: &'a Step = step;
+        rest = before;
+        match step {
+            Step::Save(slot) => {
+                extend(&mut follow.completion, [*slot]);
+                continue;
+            }
+            Step::Alt(_) | Step::Group(_) => {
+                let mut nested = Vec::new();
+                saves(core::slice::from_ref(step), &mut nested);
+                extend(&mut follow.later, nested);
+            }
+            Step::Literal(_) | Step::Run(_) => {}
         }
-        let mut nested = Vec::new();
-        saves(core::slice::from_ref(step), &mut nested);
-        extend(&mut follow.later, nested);
         let first = step.first()?;
         if step.consumes() {
             follow = Follow {
@@ -776,7 +795,7 @@ fn admit(
     Some(wanted)
 }
 
-fn admit_step(step: &mut Step, follow: &Follow, trailing: &[Look]) -> Option<()> {
+fn admit_step(step: &mut Step, follow: &Follow<'_>, trailing: &[Look]) -> Option<()> {
     match step {
         Step::Literal(_) | Step::Save(_) => {}
         Step::Run(run) => {
@@ -809,7 +828,7 @@ fn admit_step(step: &mut Step, follow: &Follow, trailing: &[Look]) -> Option<()>
             }
             let mut inner = follow.clone();
             if group.max > 1 {
-                inner.add(group.first.clone())?;
+                inner.add(Cow::Borrowed(&group.first))?;
             }
             let mut nested = Vec::new();
             saves(&group.body, &mut nested);
@@ -1052,6 +1071,17 @@ fn suffix(steps: &[Step], first: usize, unasserted: bool) -> Option<(Box<[u8]>, 
 
 /// The prefixes of `hir` regex-automata's meta engine extracts for a
 /// leftmost-first prefilter, optimized by preference as it does.
+/// Whether `hir` can be a set of literals its prefixes find exactly: only a
+/// pattern of bounded length that cannot match nothing, without captures or
+/// assertions, can be.
+fn may_be_exact(hir: &Hir) -> bool {
+    let properties = hir.properties();
+    properties.maximum_len().is_some()
+        && properties.minimum_len().is_some_and(|len| len > 0)
+        && properties.explicit_captures_len() == 0
+        && properties.look_set().is_empty()
+}
+
 fn prefixes(hir: &Hir) -> literal::Seq {
     let mut extractor = literal::Extractor::new();
     extractor.kind(literal::ExtractKind::Prefix);
@@ -1079,6 +1109,18 @@ impl Plan {
         // refuse to build, and the look-around matcher would panic.
         if hir.properties().look_set().contains_word_unicode() {
             LookSet::singleton(Look::WordUnicode).available().ok()?;
+        }
+        // Prefixes that are not exactly the matches can still find candidates.
+        let mut extracted = None;
+        if prefilter && edges.behind.is_empty() && edges.ahead.is_empty() && may_be_exact(hir) {
+            let prefixes = match hir.kind() {
+                HirKind::Literal(hir::Literal(bytes)) => literal::Seq::new([bytes]),
+                _ => prefixes(hir),
+            };
+            if let Some(plan) = Plan::literals(hir, &prefixes) {
+                return Some(plan);
+            }
+            extracted = Some(prefixes);
         }
         let mut nodes = Vec::new();
         let mut names = Vec::new();
@@ -1128,7 +1170,7 @@ impl Plan {
             }
             outer.end = Some(false);
             for alternative in &*edge.alternatives {
-                outer.add(alternative[0].clone())?;
+                outer.add(Cow::Borrowed(&alternative[0]))?;
             }
         }
         let first_follow = admit(&mut steps, &outer, &trailing, Some(first))??;
@@ -1178,23 +1220,7 @@ impl Plan {
                 _ => break,
             }
         }
-        // As the meta engine's literal strategy does, a pattern whose prefixes
-        // are exactly its matches needs only a literal search.
-        let prefixes = (prefilter && !nullable).then(|| prefixes(hir));
-        let exact_prefilter = prefixes
-            .as_ref()
-            .filter(|prefixes| {
-                !edged
-                    && prefixes.is_exact()
-                    && hir.properties().explicit_captures_len() == 0
-                    && hir.properties().look_set().is_empty()
-            })
-            .and_then(|prefixes| Prefilter::new(MatchKind::LeftmostFirst, prefixes.literals()?));
-        let exact = exact_prefilter.is_some();
         let candidates = match (&steps[first], inner) {
-            _ if exact_prefilter.is_some() => {
-                Candidates::Prefilter(exact_prefilter.expect("checked above"))
-            }
             (Step::Run(_), Some((offset, bytes))) => Candidates::Offset(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
@@ -1209,14 +1235,13 @@ impl Plan {
                     Step::Run(run) => run.min == run.max,
                     _ => true,
                 };
-                let prefilter = prefixes
+                let prefilter = (prefilter && short && !nullable)
+                    .then(|| extracted.unwrap_or_else(|| prefixes(hir)))
                     .as_ref()
-                    .filter(|_| short)
-                    .and_then(|prefixes| prefixes.literals())
+                    .and_then(literal::Seq::literals)
                     .and_then(|literals| Prefilter::new(MatchKind::LeftmostFirst, literals));
                 let first_bytes = first_class.first_bytes();
-                let mut bytes = (0..=255u8).filter(|&b| has_byte(&first_bytes, b));
-                let stops = Stops::of(&mut bytes);
+                let stops = Stops::of(&mut bytes_in(first_bytes));
                 match (prefilter, stops) {
                     (Some(prefilter), _) if prefilter.is_fast() => Candidates::Prefilter(prefilter),
                     (_, Some(stops)) => Candidates::Bytes(stops),
@@ -1329,8 +1354,6 @@ impl Plan {
             start_only,
             whole: if nullable {
                 Whole::Empty
-            } else if exact {
-                Whole::Literals
             } else if single_run {
                 Whole::Run
             } else {
@@ -1346,6 +1369,40 @@ impl Plan {
             look_matcher: LookMatcher::new(),
             group_info,
             nfa_units,
+        })
+    }
+
+    /// The plan for a pattern whose `prefixes` are exactly its matches, as
+    /// the meta engine's literal strategy finds them: a finite set of
+    /// literals, without captures or assertions (see [`may_be_exact`]), that
+    /// its leftmost-first prefilter reports in the pattern's order of
+    /// preference. It needs no program.
+    fn literals(hir: &Hir, prefixes: &literal::Seq) -> Option<Plan> {
+        if !prefixes.is_exact() {
+            return None;
+        }
+        let prefilter = Prefilter::new(MatchKind::LeftmostFirst, prefixes.literals()?)?;
+        Some(Plan {
+            steps: Box::new([]),
+            leading: Box::new([]),
+            trailing: Box::new([]),
+            edges: None,
+            checks_start: false,
+            checks_end: false,
+            candidates: Candidates::Prefilter(prefilter),
+            required: None,
+            start_only: false,
+            whole: Whole::Literals,
+            skip_first_run: false,
+            first: 0,
+            look_skip: false,
+            window: false,
+            decisive: 0,
+            conditional: Box::new([]),
+            branching: false,
+            look_matcher: LookMatcher::new(),
+            group_info: GroupInfo::new([[None::<&str>]]).ok()?,
+            nfa_units: nfa_bound(hir),
         })
     }
 
@@ -2266,6 +2323,8 @@ mod tests {
             r"\w*",
             "ab|cd",
             "Holmes|Watson|Lestrade",
+            "ab|ac",
+            "(?:a|)b",
             r"\b(?:fn|let|mut)\b",
             "(?i)holmes|watson",
             "(?:ab)+",
@@ -2288,9 +2347,9 @@ mod tests {
             "a{1,70}b",
             r"\w+-\w+-x",
             r"x[a-z]*\d",
-            "ab|ac",
+            "ab+|ac",
             "(a|ab)c",
-            "(?:a|)b",
+            "(?:a|)b+",
             "(?:a*)*",
             "(?:ab)*a",
             r"x(?:ab)*?\b",

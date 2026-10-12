@@ -71,6 +71,12 @@ const PATTERNS: &[&str] = &[
     "x(?:y|(z))w",
     // Alternatives whose first characters share a UTF-8 lead byte.
     "(é)|(ê)x",
+    // Finite literal sets in any order of preference, searched for directly.
+    "ab|ac",
+    "a|ab",
+    "ab|a",
+    "foo|f",
+    "(?:a|)b",
     // Optional and repeated groups, greedy and lazy, with captures.
     "colou?r",
     "(a)?(b*)",
@@ -96,10 +102,10 @@ const PATTERNS: &[&str] = &[
     r"(?m)[^a]+$",
     "[a-z]+?x",
     r"\d+$",
-    "ab|ac",
+    "ab+|ac",
     "(a|ab)c",
     "(?:ab)*a",
-    "(?:a|)b",
+    "(?:a|)b+",
     // Attempts could rescan unbounded repetitions holding other starts.
     "(?:a(b)?)+c",
     r"\b(?:ab)+\b",
@@ -455,6 +461,33 @@ fn nullable_plans_answer_where_the_engine_panicked() {
         .map(|m| (m.start(), m.end()))
         .collect();
     assert_eq!(found, [(0, 2)]);
+}
+
+/// A literal that repeats its own start is searched for directly however
+/// long it is: no attempt rereads it from each start inside it.
+#[test]
+fn long_repeating_literals_take_literal_plans() {
+    for unit in ["ab", "aab", "é"] {
+        let literal = unit.repeat(40);
+        let text = format!("x{}y{}", unit.repeat(100), unit.repeat(39));
+        let regex = Regex::new(&literal).unwrap();
+        let regular = RegularRegex::new(&literal).unwrap();
+        assert!(regex.planned() && regular.planned(), "{unit}");
+        let expected: Vec<_> = text
+            .match_indices(&*literal)
+            .map(|(at, found)| (at, at + found.len()))
+            .collect();
+        let found: Vec<_> = regex
+            .find_iter(&text)
+            .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
+            .collect();
+        assert_eq!(found, expected, "Regex {unit}");
+        let found: Vec<_> = regular
+            .find_iter(&text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(found, expected, "RegularRegex {unit}");
+    }
 }
 
 /// A pattern that is a set of literals is searched with its prefilter alone,
