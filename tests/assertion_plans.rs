@@ -26,6 +26,9 @@ const PLANNED: &[&str] = &[
     r"\b(?<=-)\w+",
     r"(?<=ab|cd)x\d*",
     r"(?<!x)(?<=a)\d",
+    // A lookbehind class that the first run can also hold: starts inside the
+    // run can pass it after its start fails.
+    r"(?<=[a-c])\w+",
 ];
 
 const UNPLANNED: &[&str] = &[
@@ -55,6 +58,7 @@ const TEXTS: &[&str] = &[
     "a-b -cd --e f-",
     "abx1 cdx22 ax3 x4",
     "a1 xa2 a3",
+    "xbz qay abc -cd",
 ];
 
 fn groups(c: &regexrs::Captures<'_>) -> Groups {
@@ -195,6 +199,7 @@ fn generated_assertions_equal_the_vm_and_fancy_regex() {
         "(?<=x)(?<!yx)",
         r"\b(?<=-)",
         r"(?<=a)\b",
+        "(?<=[a-c])",
     ];
     const CORE: &[&str] = &[
         r"\w+",
