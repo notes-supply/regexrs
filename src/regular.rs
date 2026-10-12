@@ -14,10 +14,9 @@ use core::str::FromStr;
 
 use crate::compile::{CompileOptions, DelegateUsage, compile_inner, compile_inner_from_hir};
 use crate::parse::NamedGroups;
-use crate::searcher;
 use crate::{
     Assertion, BytesMode, CaptureNames, Captures, CapturesImpl, CompileError, Error, Expr, Input,
-    IterCache, IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, WrapEngine,
+    IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, WrapEngine,
     capture_names_of, plan_captures_into, plan_find, plan_is_match, ra_input, replacen_with,
     to_hir,
 };
@@ -110,9 +109,6 @@ pub struct RegularRegex {
     /// candidate positions, which only needs to over-approximate.
     set_pattern: String,
     named_groups: Arc<NamedGroups>,
-    /// Working memory iterators take for their whole iteration; `None` for a
-    /// plan, which needs none.
-    caches: Option<Arc<searcher::CachePool>>,
 }
 
 /// An iterator over the non-overlapping matches of a [`RegularRegex`].
@@ -123,7 +119,6 @@ pub struct RegularRegex {
 pub struct RegularMatches<'r, 't, S: Input + ?Sized> {
     regex: &'r RegularRegex,
     state: IterState<'t, S>,
-    cache: IterCache<'r>,
 }
 
 /// An iterator over the captures of successive non-overlapping matches of a
@@ -188,7 +183,6 @@ impl RegularRegex {
             }
         })?;
         Ok(RegularRegex {
-            caches: searcher::Cache::engine_pool(&engine),
             engine,
             pattern,
             set_pattern,
@@ -226,7 +220,7 @@ impl RegularRegex {
         &self,
         input: RegexInput<'t, S>,
     ) -> Option<S::Match<'t>> {
-        self.find_span(&input, None)
+        self.find_span(&input)
             .map(|(start, end)| input.haystack().make_match(start, end))
     }
 
@@ -244,7 +238,6 @@ impl RegularRegex {
         input: RegexInput<'t, S>,
     ) -> RegularMatches<'r, 't, S> {
         RegularMatches {
-            cache: IterCache::Unset,
             regex: self,
             state: IterState::new(input),
         }
@@ -261,27 +254,13 @@ impl RegularRegex {
         &self,
         input: RegexInput<'t, S>,
     ) -> Option<Captures<'t, S>> {
-        self.captures_cached(input, None)
-    }
-
-    /// [`RegularRegex::captures_input`], with an iterator's working memory.
-    fn captures_cached<'t, S: Input + ?Sized>(
-        &self,
-        input: RegexInput<'t, S>,
-        cache: Option<&mut searcher::Cache>,
-    ) -> Option<Captures<'t, S>> {
         if input.is_done() {
             return None;
         }
         let mut locations = self.engine.create_captures();
-        match (&self.engine, cache.and_then(searcher::Cache::regular)) {
-            (WrapEngine::Plan(plan), _) => plan_captures_into(plan, &input, &mut locations),
-            (WrapEngine::Meta(inner), Some((cache, _))) => {
-                inner.search_captures_with(cache, &ra_input(&input), &mut locations);
-            }
-            (WrapEngine::Meta(inner), None) => {
-                inner.search_captures(&ra_input(&input), &mut locations);
-            }
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_captures_into(plan, &input, &mut locations),
+            WrapEngine::Meta(inner) => inner.search_captures(&ra_input(&input), &mut locations),
         }
         locations.is_match().then(|| Captures {
             inner: CapturesImpl::Wrap {
@@ -347,20 +326,13 @@ impl RegularRegex {
         }
     }
 
-    fn find_span<S: Input + ?Sized>(
-        &self,
-        input: &RegexInput<'_, S>,
-        cache: Option<&mut searcher::Cache>,
-    ) -> Option<(usize, usize)> {
+    fn find_span<S: Input + ?Sized>(&self, input: &RegexInput<'_, S>) -> Option<(usize, usize)> {
         if input.is_done() {
             return None;
         }
-        match (&self.engine, cache.and_then(searcher::Cache::regular)) {
-            (WrapEngine::Plan(plan), _) => plan_find(plan, input, None),
-            (WrapEngine::Meta(inner), Some((cache, _))) => inner
-                .search_with(cache, &ra_input(input))
-                .map(|found| (found.start(), found.end())),
-            (WrapEngine::Meta(inner), None) => inner
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_find(plan, input, None),
+            WrapEngine::Meta(inner) => inner
                 .search(&ra_input(input))
                 .map(|found| (found.start(), found.end())),
         }
@@ -371,17 +343,12 @@ impl<'r, 't, S: Input + ?Sized> Iterator for RegularMatches<'r, 't, S> {
     type Item = S::Match<'t>;
 
     fn next(&mut self) -> Option<S::Match<'t>> {
-        let RegularMatches {
-            regex,
-            state,
-            cache,
-        } = self;
-        let regex: &'r RegularRegex = regex;
+        let RegularMatches { regex, state } = self;
         let haystack = state.input.haystack();
         let found = state.next_with(|input, _| {
             Ok::<_, Infallible>(
                 regex
-                    .find_span(input, cache.get(regex.caches.as_deref()))
+                    .find_span(input)
                     .map(|(start, end)| (haystack.make_match(start, end), (start, end))),
             )
         })?;
@@ -396,16 +363,9 @@ impl<'r, 't, S: Input + ?Sized> Iterator for RegularCaptureMatches<'r, 't, S> {
     type Item = Captures<'t, S>;
 
     fn next(&mut self) -> Option<Captures<'t, S>> {
-        let RegularMatches {
-            regex,
-            state,
-            cache,
-        } = &mut self.0;
-        let regex: &'r RegularRegex = regex;
+        let RegularMatches { regex, state } = &mut self.0;
         let found = state.next_with(|input, _| {
-            let pool = regex.caches.as_deref();
-            let captures = regex.captures_cached(input.clone(), cache.get(pool));
-            Ok::<_, Infallible>(captures.map(|captures| {
+            Ok::<_, Infallible>(regex.captures_input(input.clone()).map(|captures| {
                 let span = captures.get_span(0).expect("a match always has group 0");
                 (captures, span)
             }))
@@ -422,15 +382,13 @@ impl From<RegularRegex> for Regex {
     /// [`Regex::searcher`] or [`crate::RegexSet::from_regexes`]. The result
     /// matches exactly as the regular expression did.
     fn from(regex: RegularRegex) -> Regex {
-        let inner = RegexImpl::Wrap {
-            engine: regex.engine,
-            pattern: regex.pattern,
-            explicit_capture_group_0: false,
-            delegated_pattern: regex.set_pattern,
-        };
         Regex {
-            caches: crate::searcher::Cache::pool(&inner),
-            inner,
+            inner: RegexImpl::Wrap {
+                engine: regex.engine,
+                pattern: regex.pattern,
+                explicit_capture_group_0: false,
+                delegated_pattern: regex.set_pattern,
+            },
             named_groups: regex.named_groups,
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
             native: None,

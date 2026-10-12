@@ -1,8 +1,8 @@
-//! Iterators over engines with working memory (the meta engine and the
-//! backtracking VM) take it from the regex's pool once and keep it until they
-//! are dropped. Results must not depend on which iteration holds which
-//! memory: nested iterations over one regex, iterations interleaved with
-//! single searches, and iterations on several threads at once.
+//! Engines with working memory (the meta engine, the backtracking VM and a
+//! route's automata) check it out of their pools for each search. Results
+//! must not depend on which search holds which memory: nested iterations over
+//! one regex, iterations interleaved with single searches, and iterations on
+//! several threads at once.
 
 use regexrs::{Regex, RegularRegex};
 
