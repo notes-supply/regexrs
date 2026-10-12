@@ -42,7 +42,7 @@ use regex_automata::util::look::{Look, LookMatcher, LookSet};
 use regex_automata::util::prefilter::Prefilter;
 use regex_automata::util::primitives::NonMaxUsize;
 use regex_automata::{MatchKind, PatternID, Span};
-use regex_syntax::hir::{self, Hir, HirKind};
+use regex_syntax::hir::{self, Hir, HirKind, literal};
 
 use crate::vm::char_at;
 
@@ -64,9 +64,8 @@ pub(crate) struct Plan {
     required: Option<Box<memchr::memmem::Finder<'static>>>,
     /// A leading `\A`: only the search's start can begin a match.
     start_only: bool,
-    /// The pattern can match nothing, so a match starts wherever a search
-    /// does, unless it would end inside a character.
-    nullable: bool,
+    /// How a search proceeds, decided once.
+    whole: Whole,
     /// The first consuming step is an unbounded run: an attempt that fails
     /// after it fails from every later start inside the same run.
     skip_first_run: bool,
@@ -132,6 +131,20 @@ struct Alt {
     by_byte: Option<Box<[u8; 256]>>,
     /// The characters any branch starts with.
     first: Class,
+}
+
+/// How a plan searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Whole {
+    /// Attempts at candidate starts.
+    Attempts,
+    /// The pattern can match nothing, so a match starts wherever a search
+    /// does, unless it would end inside a character.
+    Empty,
+    /// The candidates are the matches: the pattern is a finite set of
+    /// literals, without captures or assertions, which its leftmost-first
+    /// prefilter reports in the pattern's order of preference.
+    Literals,
 }
 
 /// No branch of an alternation starts with this byte.
@@ -849,6 +862,16 @@ impl Rescan<'_> {
     }
 }
 
+/// The prefixes of `hir` regex-automata's meta engine extracts for a
+/// leftmost-first prefilter, optimized by preference as it does.
+fn prefixes(hir: &Hir) -> literal::Seq {
+    let mut extractor = literal::Extractor::new();
+    extractor.kind(literal::ExtractKind::Prefix);
+    let mut prefixes = extractor.extract(hir);
+    prefixes.optimize_for_prefix_by_preference();
+    prefixes
+}
+
 impl Plan {
     /// The plan for `hir`, or `None` when its matches do not follow one
     /// deterministic path the next character decides. With `prefilter`, a
@@ -933,7 +956,22 @@ impl Plan {
                 _ => break,
             }
         }
+        // As the meta engine's literal strategy does, a pattern whose prefixes
+        // are exactly its matches needs only a literal search.
+        let prefixes = (prefilter && !nullable).then(|| prefixes(hir));
+        let exact_prefilter = prefixes
+            .as_ref()
+            .filter(|prefixes| {
+                prefixes.is_exact()
+                    && hir.properties().explicit_captures_len() == 0
+                    && hir.properties().look_set().is_empty()
+            })
+            .and_then(|prefixes| Prefilter::new(MatchKind::LeftmostFirst, prefixes.literals()?));
+        let exact = exact_prefilter.is_some();
         let candidates = match (&steps[first], inner) {
+            _ if exact_prefilter.is_some() => {
+                Candidates::Prefilter(exact_prefilter.expect("checked above"))
+            }
             (Step::Run(_), Some((offset, bytes))) => Candidates::Offset(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
@@ -942,24 +980,33 @@ impl Plan {
                 Candidates::Literal(Box::new(memchr::memmem::Finder::new(bytes).into_owned()))
             }
             (step, _) => {
-                let fixed = match step {
+                // Prefixes of a run of variable length are no better than
+                // its class; other steps have a short set of prefixes.
+                let short = match step {
                     Step::Run(run) => run.min == run.max,
                     _ => true,
                 };
-                let prefilter = if prefilter && fixed && !nullable {
-                    Prefilter::from_hir_prefix(MatchKind::LeftmostFirst, hir)
-                        .filter(Prefilter::is_fast)
-                } else {
-                    None
-                };
+                let prefilter = prefixes
+                    .as_ref()
+                    .filter(|_| short)
+                    .and_then(|prefixes| prefixes.literals())
+                    .and_then(|literals| Prefilter::new(MatchKind::LeftmostFirst, literals));
                 let first_bytes = first_class.first_bytes();
                 let mut bytes = (0..=255u8).filter(|&b| has_byte(&first_bytes, b));
-                match (prefilter, Stops::of(&mut bytes)) {
-                    (Some(prefilter), _) => Candidates::Prefilter(prefilter),
-                    (None, Some(stops)) => Candidates::Bytes(stops),
-                    (None, None) => match ByteRanges::of(&first_bytes) {
-                        Some(ranges) => Candidates::Ranges(ranges, first_class.clone()),
-                        None => Candidates::Class(first_class.clone()),
+                let stops = Stops::of(&mut bytes);
+                match (prefilter, stops) {
+                    (Some(prefilter), _) if prefilter.is_fast() => Candidates::Prefilter(prefilter),
+                    (_, Some(stops)) => Candidates::Bytes(stops),
+                    (prefilter, None) => match (ByteRanges::of(&first_bytes), prefilter) {
+                        (Some(ranges), _) => Candidates::Ranges(ranges, first_class.clone()),
+                        // Even with prefixes too short for regex-automata to
+                        // call it fast, as two-byte keywords, a literal
+                        // search beats testing every byte. Fixed runs keep
+                        // their class scan, as before.
+                        (None, Some(prefilter)) if !matches!(step, Step::Run(_)) => {
+                            Candidates::Prefilter(prefilter)
+                        }
+                        (None, _) => Candidates::Class(first_class.clone()),
                     },
                 }
             }
@@ -1014,7 +1061,13 @@ impl Plan {
             candidates,
             required,
             start_only,
-            nullable,
+            whole: if nullable {
+                Whole::Empty
+            } else if exact {
+                Whole::Literals
+            } else {
+                Whole::Attempts
+            },
             skip_first_run,
             first,
             window,
@@ -1327,6 +1380,23 @@ impl Plan {
         input: &PlanInput<'_>,
         start: usize,
         earliest: bool,
+        slots: Option<&mut S>,
+    ) -> Result<usize, usize> {
+        if self.branching {
+            self.attempt_program::<true, S>(input, start, earliest, slots)
+        } else {
+            self.attempt_program::<false, S>(input, start, earliest, slots)
+        }
+    }
+
+    /// [`Plan::attempt`], compiled without alternatives and groups, and so
+    /// without recorded matches, unless `BRANCHING`.
+    #[inline]
+    fn attempt_program<const BRANCHING: bool, S: Slots + ?Sized>(
+        &self,
+        input: &PlanInput<'_>,
+        start: usize,
+        earliest: bool,
         mut slots: Option<&mut S>,
     ) -> Result<usize, usize> {
         let (haystack, end) = (input.haystack, input.end);
@@ -1354,39 +1424,67 @@ impl Plan {
             saved: None,
         };
         let mut first_run_end = start;
-        let mut outcome = Ok(());
-        for (index, step) in steps.iter().enumerate() {
-            let decided = earliest && index + 1 == self.decisive && self.trailing.is_empty();
-            outcome = match step {
-                Step::Run(run) => {
-                    let (stop, count) = if run.shortest || decided {
-                        Plan::take(run, haystack, state.pos, end, run.min)
-                    } else {
-                        Plan::scan(run, haystack, state.pos, end, input.utf8)
-                    };
-                    if index == self.first {
-                        first_run_end = stop;
+        // Literals, runs and saves, which linear plans consist of, are
+        // matched here; alternatives and groups recurse.
+        let outcome = 'program: {
+            for (index, step) in steps.iter().enumerate() {
+                match step {
+                    Step::Literal(bytes) => {
+                        if !haystack
+                            .get(state.pos..end)
+                            .is_some_and(|rest| rest.starts_with(bytes))
+                        {
+                            break 'program Err(Stop::Fail);
+                        }
+                        state.pos += bytes.len();
                     }
-                    state.pos = stop;
-                    if count < run.min {
-                        Err(Stop::Fail)
-                    } else {
-                        Ok(())
+                    Step::Run(run) => {
+                        let decided =
+                            earliest && index + 1 == self.decisive && self.trailing.is_empty();
+                        let (stop, count) = if run.shortest || decided {
+                            Plan::take(run, haystack, state.pos, end, run.min)
+                        } else {
+                            Plan::scan(run, haystack, state.pos, end, input.utf8)
+                        };
+                        if index == self.first {
+                            first_run_end = stop;
+                        }
+                        state.pos = stop;
+                        if count < run.min {
+                            break 'program Err(Stop::Fail);
+                        }
+                    }
+                    Step::Save(slot) => {
+                        if let Some(slots) = state.slots.as_deref_mut() {
+                            slots.set(*slot, state.pos);
+                        }
+                    }
+                    Step::Group(group) if BRANCHING => {
+                        let decided =
+                            earliest && index + 1 == self.decisive && self.trailing.is_empty();
+                        if let Err(stop) = self.group(group, input, &mut state, earliest, decided) {
+                            break 'program Err(stop);
+                        }
+                    }
+                    Step::Alt(_) if BRANCHING => {
+                        if let Err(stop) = self.step(step, input, &mut state, earliest) {
+                            break 'program Err(stop);
+                        }
+                    }
+                    Step::Group(_) | Step::Alt(_) => {
+                        unreachable!("a plan without alternatives or groups has none")
                     }
                 }
-                Step::Group(group) => self.group(group, input, &mut state, earliest, decided),
-                step => self.step(step, input, &mut state, earliest),
-            };
-            if outcome.is_err() {
-                break;
             }
-        }
+            Ok(())
+        };
         #[cfg(all(test, feature = "std"))]
         tests::COVERED.with(|covered| covered.set(covered.get() + state.pos - start + 1));
         match outcome {
             Ok(()) if self.trailing_hold(haystack, state.pos) => Ok(state.pos),
-            Err(Stop::Found(at)) => Ok(at),
-            _ => state.fall_back().ok_or(first_run_end),
+            Err(Stop::Found(at)) if BRANCHING => Ok(at),
+            _ if BRANCHING => state.fall_back().ok_or(first_run_end),
+            _ => Err(first_run_end),
         }
     }
 
@@ -1456,8 +1554,8 @@ impl Plan {
         mut slots: Option<&mut S>,
     ) -> Option<(usize, usize)> {
         let start = input.start;
-        if self.nullable {
-            return self.search_empty(input, earliest, slots);
+        if self.whole != Whole::Attempts {
+            return self.search_whole(input, earliest, slots);
         }
         if input.anchored || self.start_only {
             let found = self.attempt(input, start, earliest, slots);
@@ -1490,11 +1588,41 @@ impl Plan {
         }
     }
 
+    /// `search` for a plan whose candidates are its matches, or whose
+    /// pattern can match nothing.
+    #[inline(never)]
+    fn search_whole<S: Slots + ?Sized>(
+        &self,
+        input: &PlanInput<'_>,
+        earliest: bool,
+        slots: Option<&mut S>,
+    ) -> Option<(usize, usize)> {
+        if self.whole == Whole::Empty {
+            return self.search_empty(input, earliest, slots);
+        }
+        let Candidates::Prefilter(prefilter) = &self.candidates else {
+            unreachable!("a plan of literals searches with its prefilter");
+        };
+        let span = Span {
+            start: input.start,
+            end: input.end,
+        };
+        let found = if input.anchored {
+            // A single-byte prefilter tests the byte at the start even
+            // when the range ends there.
+            prefilter
+                .prefix(input.haystack, span)
+                .filter(|found| found.end <= input.end)
+        } else {
+            prefilter.find(input.haystack, span)
+        };
+        found.map(|found| (found.start, found.end))
+    }
+
     /// `search` for a pattern that can match nothing, which matches where the
     /// search starts. A match ending inside a character is not reported: as
     /// the meta engine does, an unanchored search then starts again a byte
     /// later.
-    #[inline(never)]
     fn search_empty<S: Slots + ?Sized>(
         &self,
         input: &PlanInput<'_>,

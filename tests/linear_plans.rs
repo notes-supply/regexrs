@@ -453,3 +453,39 @@ fn nullable_plans_answer_where_the_engine_panicked() {
         .collect();
     assert_eq!(found, [(0, 2)]);
 }
+
+/// A pattern that is a set of literals is searched with its prefilter alone,
+/// whose single-byte form tests the byte at the start of an anchored search
+/// even where the range ends there.
+#[test]
+fn literal_plans_stay_inside_the_range() {
+    for pattern in ["1", "(?:1)", "ab|cd", "[ab]x"] {
+        let regex = Regex::new(pattern).unwrap();
+        let regular = RegularRegex::new(pattern).unwrap();
+        let meta = Meta::new(pattern).unwrap();
+        assert!(regex.planned() && regular.planned(), "{pattern}");
+        for text in ["1", "ab", "ax", "1ax"] {
+            for end in 0..=text.len() {
+                for anchored in [false, true] {
+                    let mode = if anchored {
+                        Anchored::Yes
+                    } else {
+                        Anchored::No
+                    };
+                    let expected = meta
+                        .find(Input::new(text).span(0..end).anchored(mode))
+                        .map(|m| (m.start(), m.end()));
+                    let input = || RegexInput::new(text).range(0..end).anchored(anchored);
+                    let at = format!("{pattern} {text} 0..{end} {anchored}");
+                    let found = regular.find_input(input()).map(|m| (m.start(), m.end()));
+                    assert_eq!(found, expected, "{at}");
+                    let found = regex
+                        .find_input(input())
+                        .unwrap()
+                        .map(|m| (m.start(), m.end()));
+                    assert_eq!(found, expected, "{at}");
+                }
+            }
+        }
+    }
+}
