@@ -43,6 +43,10 @@ const PATTERNS: &[&str] = &[
     r"\b[a-z]{2,4}\d",
     r"[a-z]{2,3}\b",
     "[ab]{3}c",
+    // Unbounded first runs with a minimum, skipped whole where they fall short.
+    r"[a-z]{3,}\d",
+    r"([a-z]{3,})(\d)",
+    r"\w{4,}",
     // Inside the run, a later start passes the assertion an earlier one fails.
     r"(?m)^[a\n]{1,2}b",
     r"(?m)^[a\n]{1,3}b",
@@ -144,6 +148,7 @@ const TEXTS: &[&str] = &[
     "aaabbbc aabbc abc ac bc",
     "abababababababababababababababababababab",
     "deadbeefcafe-1234 0123456789abcdef-abcd 12-3 1234567-8 ab1 abcde1 x abc1",
+    "a_ab_abc_abcd1 ab1 abcdef_ abc",
     "aaaabc abababc bbbc abc ababc",
     "a\n\nb x\na\nb",
     "aa\n\nb",

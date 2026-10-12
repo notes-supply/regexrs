@@ -87,6 +87,48 @@ fn bytes_ascii_char_classes_are_ascii_only() {
     assert!(!re.is_match("café".as_bytes()).unwrap());
 }
 
+/// ASCII mode keeps character classes ASCII-only, but its word boundaries use
+/// Unicode word characters, as in the other modes: on the UTF-8 bytes of
+/// `café x` there is no boundary inside `café`, while an invalid byte is never
+/// a word character. The plan, the regular engine and the backtracking VM
+/// (with a lookahead) agree.
+#[test]
+fn bytes_ascii_word_boundaries_use_unicode_word_characters() {
+    let text = "café x".as_bytes();
+    let invalid = b"a\xffb";
+    let spans = |pattern: &str, haystack: &[u8]| -> Vec<(usize, usize)> {
+        let regex = RegexBuilder::new(pattern)
+            .bytes_mode(BytesMode::Ascii)
+            .build()
+            .unwrap();
+        let found: Vec<_> = regex
+            .find_iter(haystack)
+            .map(|m| m.map(|m| (m.start(), m.end())).unwrap())
+            .collect();
+        if let Ok(regular) = RegexBuilder::new(pattern)
+            .bytes_mode(BytesMode::Ascii)
+            .build_regular()
+        {
+            let regular: Vec<_> = regular
+                .find_iter(haystack)
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            assert_eq!(regular, found, "RegularRegex {pattern}");
+        }
+        found
+    };
+    assert_eq!(spans(r"\b", text), [(0, 0), (5, 5), (6, 6), (7, 7)]);
+    assert_eq!(spans(r"(?-u:\b)", text), [(0, 0), (5, 5), (6, 6), (7, 7)]);
+    assert_eq!(spans(r"\B", text), [(1, 1), (2, 2), (3, 3)]);
+    assert_eq!(spans(r"\<", text), [(0, 0), (6, 6)]);
+    assert_eq!(spans(r"\>", text), [(5, 5), (7, 7)]);
+    assert_eq!(spans(r"\bcaf\b", text), []);
+    assert_eq!(spans(r"\b\w+\b", text), [(6, 7)]);
+    assert_eq!(spans(r"\b\w+\b(?!q)", text), [(6, 7)]);
+    assert_eq!(spans(r"\w+", text), [(0, 3), (6, 7)]);
+    assert_eq!(spans(r"\b", invalid), [(0, 0), (1, 1), (2, 2), (3, 3)]);
+}
+
 #[test]
 fn bytes_find_returns_matchbytes() {
     let re = RegexBuilder::new(r"\d+")

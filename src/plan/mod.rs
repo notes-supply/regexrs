@@ -1551,24 +1551,29 @@ impl Plan {
         }
     }
 
-    /// Where `run` ends from `at`, or `None` if it has fewer than `run.min`
-    /// members: after `run.min` members when it is shortest or `decided`, else
-    /// after as many as it can take. A single character, the commonest run
-    /// (a class or a case-folded letter), is tested directly.
+    /// Move `pos` past `run`, after `run.min` members when it is shortest or
+    /// `decided`, else after as many as it can take, and return whether the
+    /// run has at least `run.min` members. Either way `pos` ends where the run
+    /// stopped: for a run that falls short, the end of the maximal run, which
+    /// no later start inside it gets past, so a failed first run is skipped
+    /// whole. A single character, the commonest run (a class or a case-folded
+    /// letter), is tested directly.
     #[inline(always)]
-    fn run_end(run: &Run, input: &PlanInput<'_>, at: usize, decided: bool) -> Option<usize> {
+    fn run_end(run: &Run, input: &PlanInput<'_>, pos: &mut usize, decided: bool) -> bool {
         if run.max == 1 && run.min == 1 {
-            return run
-                .class
-                .match_len(input.haystack, at, input.end)
-                .map(|len| at + len);
+            let Some(len) = run.class.match_len(input.haystack, *pos, input.end) else {
+                return false;
+            };
+            *pos += len;
+            return true;
         }
         let (stop, count) = if run.shortest || decided {
-            Plan::take(run, input.haystack, at, input.end, run.min)
+            Plan::take(run, input.haystack, *pos, input.end, run.min)
         } else {
-            Plan::scan(run, input.haystack, at, input.end, input.utf8)
+            Plan::scan(run, input.haystack, *pos, input.end, input.utf8)
         };
-        (count >= run.min).then_some(stop)
+        *pos = stop;
+        count >= run.min
     }
 
     /// The end of the maximal run from `at`, up to `run.max` members, and how
@@ -1586,6 +1591,8 @@ impl Plan {
             let stop = stops
                 .find(&haystack[at..end])
                 .map_or(end, |offset| at + offset);
+            #[cfg(all(test, feature = "std"))]
+            tests::SCANNED.with(|scanned| scanned.set(scanned.get() + stop - at));
             return (stop, usize::from(stop > at));
         }
         Plan::take(run, haystack, at, end, run.max)
@@ -1627,6 +1634,8 @@ impl Plan {
                 }
             }
         }
+        #[cfg(all(test, feature = "std"))]
+        tests::SCANNED.with(|scanned| scanned.set(scanned.get() + pos - at));
         (pos, count)
     }
 
@@ -1748,7 +1757,9 @@ impl Plan {
                     state.pos += bytes.len();
                 }
                 Step::Run(run) => {
-                    state.pos = Plan::run_end(run, input, state.pos, false).ok_or(Stop::Fail)?;
+                    if !Plan::run_end(run, input, &mut state.pos, false) {
+                        return Err(Stop::Fail);
+                    }
                 }
                 Step::Save(slot) => {
                     if let Some(slots) = state.slots.as_deref_mut() {
@@ -1874,13 +1885,17 @@ impl Plan {
                     Step::Run(run) => {
                         let decided =
                             earliest && index + 1 == self.decisive && self.trailing.is_empty();
-                        let Some(stop) = Plan::run_end(run, input, state.pos, decided) else {
-                            break 'program Err(Stop::Fail);
-                        };
+                        let mut stop = state.pos;
+                        let found = Plan::run_end(run, input, &mut stop, decided);
+                        // Where even a failed first run stopped tells the
+                        // search how far to skip.
                         if index == self.first {
                             first_run_end = stop;
                         }
                         state.pos = stop;
+                        if !found {
+                            break 'program Err(Stop::Fail);
+                        }
                     }
                     Step::Save(slot) => {
                         if let Some(slots) = state.slots.as_deref_mut() {
@@ -2081,18 +2096,25 @@ impl Plan {
             unreachable!("a plan of one run has a run");
         };
         if input.anchored {
-            let end = Plan::run_end(run, input, input.start, earliest)?;
-            return Some((input.start, end));
+            let mut end = input.start;
+            let found = Plan::run_end(run, input, &mut end, earliest);
+            #[cfg(all(test, feature = "std"))]
+            tests::cover(input.start, end);
+            return found.then_some((input.start, end));
         }
         let mut from = input.start;
         loop {
             let candidate = self.next_candidate(input, from)?;
-            if let Some(end) = Plan::run_end(run, input, candidate, earliest) {
+            let mut end = candidate;
+            let found = Plan::run_end(run, input, &mut end, earliest);
+            #[cfg(all(test, feature = "std"))]
+            tests::cover(candidate, end);
+            if found {
                 return Some((candidate, end));
             }
-            // Shorter than its minimum, or not a member after all: so is
-            // every later start inside the same run.
-            from = self.past_first_run(input, candidate);
+            // Shorter than its minimum, or not a member after all: so is every
+            // later start inside the same run.
+            from = end.max(candidate + 1);
             if from >= input.end {
                 return None;
             }
@@ -2311,6 +2333,15 @@ mod tests {
     std::thread_local! {
         /// The bytes attempts have read past their starts, plus one each.
         pub(super) static COVERED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+        /// The members every run scan has read, counted where they are read,
+        /// whatever the attempt then records.
+        pub(super) static SCANNED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Counts an attempt from `start` that is one run, which reached `stop`.
+    #[cfg(feature = "std")]
+    pub(super) fn cover(start: usize, stop: usize) {
+        COVERED.with(|covered| covered.set(covered.get() + stop - start + 1));
     }
 
     fn plan(pattern: &str) -> Option<Plan> {
@@ -2428,6 +2459,88 @@ mod tests {
         assert!(units(&"ab".repeat(5000)) > NFA_UNIT_BUDGET);
     }
 
+    /// A first run shorter than its minimum is skipped whole after one scan,
+    /// since every later start inside it ends where it did. Each such run, or
+    /// a short run inside an alternative, is read once by an iteration, a
+    /// search with captures, a membership test or a ranged search, over misses
+    /// and before a final match. The members are counted where runs read them,
+    /// so an attempt that lost where its run stopped, and so resumed a byte
+    /// later, would rescan the rest of the run from every start; the attempt
+    /// accounting must then cover those reads.
+    #[cfg(feature = "std")]
+    #[test]
+    fn short_first_runs_are_scanned_once() {
+        use alloc::format;
+        use alloc::vec::Vec;
+        let scanned = |f: &mut dyn FnMut()| {
+            SCANNED.with(|scanned| scanned.set(0));
+            COVERED.with(|covered| covered.set(0));
+            f();
+            (
+                SCANNED.with(core::cell::Cell::get),
+                COVERED.with(core::cell::Cell::get),
+            )
+        };
+        for minimum in [2, 8, 64] {
+            for (pattern, lead, tail) in [
+                (format!(r"[a-z]{{{minimum},}}\d"), "", 1),
+                (format!(r"([a-z]{{{minimum},}})(\d)"), "", 1),
+                (format!("[a-z]{{{minimum},}}"), "", 0),
+                (format!(r"-(?:[a-z]{{{minimum},}}\d|_)"), "-", 1),
+            ] {
+                let plan = plan(&pattern).expect("each run is planned");
+                let misses = format!("{lead}{}_", "a".repeat(minimum - 1)).repeat(32);
+                let hit = format!("{misses}{lead}{}1", "a".repeat(minimum));
+                for text in [&misses, &hit] {
+                    let len = text.len();
+                    let expected = (text == &hit)
+                        .then(|| (misses.len(), misses.len() + lead.len() + minimum + tail));
+                    let input = |start: usize, end: usize| PlanInput {
+                        haystack: text.as_bytes(),
+                        start,
+                        end,
+                        anchored: false,
+                        utf8: true,
+                    };
+                    let at = format!("{pattern} on {len} bytes");
+                    let mut found = Vec::new();
+                    let (read, covered) = scanned(&mut || {
+                        let mut start = 0;
+                        while let Some(span) = plan.find::<[usize]>(&input(start, len), None) {
+                            found.push(span);
+                            start = span.1;
+                        }
+                    });
+                    assert_eq!(found, Vec::from_iter(expected), "{at}");
+                    assert!(read <= len, "{at}: iteration read {read} run members");
+                    assert!(
+                        covered >= read,
+                        "{at}: attempts cover {covered} of {read} reads"
+                    );
+                    assert!(covered <= 2 * (len + 1), "{at}: attempts cover {covered}");
+                    let mut slots = [usize::MAX; 6];
+                    let (read, _) = scanned(&mut || {
+                        let slots = &mut slots[..plan.slot_len()];
+                        assert_eq!(plan.find(&input(0, len), Some(slots)), expected, "{at}");
+                    });
+                    assert!(read <= len, "{at}: captures read {read} run members");
+                    let (read, _) = scanned(&mut || {
+                        assert_eq!(plan.is_match(&input(0, len)), expected.is_some(), "{at}");
+                    });
+                    assert!(read <= len, "{at}: membership read {read} run members");
+                    // A range starting inside the first run and ending before
+                    // the final digit.
+                    let ranged = expected.filter(|_| tail == 0);
+                    let (read, _) = scanned(&mut || {
+                        let found = plan.find::<[usize]>(&input(1, len - 1), None);
+                        assert_eq!(found, ranged, "{at}");
+                    });
+                    assert!(read <= len, "{at}: ranged search read {read} run members");
+                }
+            }
+        }
+    }
+
     /// Every admitted program reads each byte a bounded number of times over
     /// a whole iteration, on text built to make attempts fail late: repeated
     /// partial matches. Patterns whose attempts could fail after unbounded
@@ -2455,6 +2568,8 @@ mod tests {
             r"[a-c]{1,40}d",
             r"\w+(?:,\w+)*;",
             r"(?:\w\.)+x",
+            r"[a-z]{3,}\d",
+            r"\w{4,}",
         ];
         let fragments = [
             "ab", "abab", "foo", "bar", "qu", "a.", "1.", "x", "ba", "-", "Ho", "c", "a,", "b",
@@ -2484,6 +2599,7 @@ mod tests {
                     }
                 }
                 COVERED.with(|covered| covered.set(0));
+                SCANNED.with(|scanned| scanned.set(0));
                 let mut start = 0;
                 while start <= text.len() {
                     let input = PlanInput {
@@ -2499,9 +2615,11 @@ mod tests {
                     }
                 }
                 let covered = COVERED.with(core::cell::Cell::get);
+                let scanned = SCANNED.with(core::cell::Cell::get);
                 assert!(
-                    covered <= (RESCAN_BOUND + 8) * (text.len() + 1),
-                    "{pattern}: {covered} bytes read for {} on {unit:?}",
+                    covered <= (RESCAN_BOUND + 8) * (text.len() + 1)
+                        && scanned <= (RESCAN_BOUND + 8) * (text.len() + 1),
+                    "{pattern}: {covered} bytes read, {scanned} run members, for {} on {unit:?}",
                     text.len()
                 );
             }

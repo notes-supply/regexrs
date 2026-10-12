@@ -119,7 +119,12 @@ pub use crate::seek::seek_pattern_is_useful;
 /// - `\d` matches `[0-9]` only (ASCII)
 /// - `\s` matches ASCII whitespace only
 /// - Unicode properties are **not available**
-/// - Word boundaries (`\b`) use ASCII-only word characters
+/// - Word boundaries (`\b`, `\B`, `\<`, `\>`, the half boundaries, and
+///   `(?-u:\b)` too) are **not** ASCII-only. As in the other modes, a valid
+///   UTF-8 encoding of a Unicode word character counts as a word character, and
+///   any other byte that is not an ASCII word character does not. So in `café x`
+///   there is no boundary between `caf` and `é`, and `\b\w+\b` finds only `x`,
+///   although `\w` alone matches `caf`.
 ///
 /// Use this mode when matching raw binary data or filenames that may contain
 /// non-UTF-8 bytes and you don't need Unicode character classes.
@@ -140,7 +145,8 @@ pub enum BytesMode {
     /// (utf8=true, unicode=true)
     #[default]
     Unicode,
-    /// ASCII bytes mode: `.` matches any byte, character classes are ASCII-only.
+    /// ASCII bytes mode: `.` matches any byte, character classes are ASCII-only,
+    /// word boundaries still use Unicode word characters.
     /// (utf8=false, unicode=false)
     Ascii,
     /// Unicode-aware bytes mode: input can be non-UTF-8, character classes
