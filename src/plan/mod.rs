@@ -1683,18 +1683,24 @@ impl Plan {
         self.look_matcher.matches(look, haystack, at)
     }
 
-    /// Whether every trailing assertion holds at `at`.
-    #[inline]
+    /// Whether every trailing assertion holds at `at`. Most programs have
+    /// none, and groups ask at every repetition, so that test is always
+    /// inline.
+    #[inline(always)]
     fn trailing_hold(&self, haystack: &[u8], at: usize) -> bool {
-        !self.checks_end
-            || self
-                .trailing
-                .iter()
-                .all(|&look| self.look_at(look, haystack, at))
-                && self
-                    .edges
-                    .as_ref()
-                    .is_none_or(|edges| Plan::ahead_holds(edges, haystack, at))
+        !self.checks_end || self.end_holds(haystack, at)
+    }
+
+    /// The trailing assertions and lookaheads, tested where the program ends.
+    #[inline]
+    fn end_holds(&self, haystack: &[u8], at: usize) -> bool {
+        self.trailing
+            .iter()
+            .all(|&look| self.look_at(look, haystack, at))
+            && self
+                .edges
+                .as_ref()
+                .is_none_or(|edges| Plan::ahead_holds(edges, haystack, at))
     }
 
     /// Whether every leading assertion holds at `at`.
