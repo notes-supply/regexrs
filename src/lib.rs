@@ -1450,8 +1450,12 @@ impl Regex {
             let utf8 = matches!(compile_options.bytes_mode, BytesMode::Unicode);
             let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
             let hir = to_hir::expr_to_hir(&tree.expr, &mut hir_ctx);
-            // A rewritten capture group zero keeps the engine, which reports it.
-            let planned = hir.as_ref().filter(|_| !requires_capture_group_fixup);
+            // A plan reports a rewritten capture group zero as group 1, within
+            // fixed slot storage.
+            let planned = hir.as_ref().filter(|hir| {
+                !requires_capture_group_fixup
+                    || 2 * (hir.properties().explicit_captures_len() + 1) <= FIXUP_SLOTS
+            });
             let engine = WrapEngine::new(planned, &compile_options, usage, || match &hir {
                 Some(hir) => compile::compile_inner_from_hir(hir, &compile_options, usage),
                 None => compile::compile_inner(&re_cooked, &compile_options, usage),
@@ -1485,13 +1489,14 @@ impl Regex {
             },
         )?;
         let n_groups = info.end_group();
-        let regular = if requires_capture_group_fixup
-            || options.explicit_backtrack_limit
-            || prog.repeats_empty_matches()
-        {
+        let regular = if options.explicit_backtrack_limit || prog.repeats_empty_matches() {
             None
+        } else if requires_capture_group_fixup {
+            assertion_route(&pattern, flags, options, n_groups).map(Arc::new)
         } else {
-            word_boundary_automata(&tree.expr, options, n_groups).map(Arc::new)
+            word_boundary_automata(&tree.expr, options, n_groups)
+                .or_else(|| assertion_route(&pattern, flags, options, n_groups))
+                .map(Arc::new)
         };
         Ok(Regex {
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
@@ -1808,8 +1813,18 @@ impl Regex {
         match &self.inner {
             RegexImpl::Wrap {
                 engine: WrapEngine::Plan(plan),
+                explicit_capture_group_0,
                 ..
-            } => Ok(plan_find(plan, input, None)),
+            } => {
+                if !*explicit_capture_group_0 {
+                    return Ok(plan_find(plan, input, None));
+                }
+                // The optimizer consumed a final lookahead, so group 1 holds
+                // the match.
+                let mut slots = [usize::MAX; FIXUP_SLOTS];
+                let found = plan.find(&plan_input(input), Some(&mut slots[..plan.slot_len()]));
+                Ok(found.and((slots[2] != usize::MAX).then_some((slots[2], slots[3]))))
+            }
             RegexImpl::Wrap {
                 engine: WrapEngine::Meta(inner),
                 explicit_capture_group_0,
@@ -2077,6 +2092,7 @@ impl Regex {
         match &self.inner {
             RegexImpl::Wrap {
                 engine: WrapEngine::Plan(plan),
+                explicit_capture_group_0,
                 ..
             } => {
                 let mut locations = plan.create_captures();
@@ -2084,7 +2100,7 @@ impl Regex {
                 Ok(locations.is_match().then_some(Captures {
                     inner: CapturesImpl::Wrap {
                         locations,
-                        explicit_capture_group_0: false,
+                        explicit_capture_group_0: *explicit_capture_group_0,
                     },
                     named_groups,
                     input: haystack,
@@ -2687,7 +2703,108 @@ fn word_boundary_automata(
         compile::DelegateUsage::unanchored_no_prefilter()
     };
     let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
-    Some(RegularRoute::new(hir, compile_options, usage, ascii))
+    Some(RegularRoute::new(hir, compile_options, usage, ascii, None))
+}
+
+/// A route to a plan for a regular pattern between fixed-width lookbehinds
+/// at its start and lookaheads at its end, or `None`. It is built from the
+/// pattern as written, before the optimizer turns a final lookahead into a
+/// rewritten capture group zero, so its groups are those `Regex` reports.
+fn assertion_route(
+    pattern: &str,
+    flags: u32,
+    options: &RegexOptions,
+    n_groups: usize,
+) -> Option<RegularRoute> {
+    if regular::rich_option(options).is_some() {
+        return None;
+    }
+    let tree = Expr::parse_tree_with_flags(pattern, flags).ok()?;
+    let Expr::Concat(children) = &tree.expr else {
+        return None;
+    };
+    // Assertions next to the lookarounds test the same position, so they
+    // stay with the core, at its edges.
+    let edge = |child: &&Expr, kinds: [LookAround; 2]| match child {
+        Expr::LookAround(_, kind) => kinds.contains(kind),
+        Expr::Assertion(_) => true,
+        _ => false,
+    };
+    let front = children
+        .iter()
+        .take_while(|child| edge(child, [LookAround::LookBehind, LookAround::LookBehindNeg]))
+        .count();
+    let back = children[front..]
+        .iter()
+        .rev()
+        .take_while(|child| edge(child, [LookAround::LookAhead, LookAround::LookAheadNeg]))
+        .count();
+    let is_lookaround = |child: &&Expr| matches!(child, Expr::LookAround(..));
+    let (behind, ahead): (Vec<&Expr>, Vec<&Expr>) = (
+        children[..front].iter().filter(is_lookaround).collect(),
+        children[children.len() - back..]
+            .iter()
+            .filter(is_lookaround)
+            .collect(),
+    );
+    if behind.len() + ahead.len() == 0 || front + back == children.len() {
+        return None;
+    }
+    // Lookarounds anywhere between the edges stay in the core, which then
+    // has a rich construct.
+    let middle = &children[front..children.len() - back];
+    let core = Expr::Concat(
+        children[..front]
+            .iter()
+            .filter(|child| !is_lookaround(child))
+            .chain(middle)
+            .chain(
+                children[children.len() - back..]
+                    .iter()
+                    .filter(|child| !is_lookaround(child)),
+            )
+            .cloned()
+            .collect(),
+    );
+    if regular::rich_construct(&core).is_some() {
+        return None;
+    }
+    let unicode = options.syntaxc.get_unicode() && !matches!(options.bytes_mode, BytesMode::Ascii);
+    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+    let hir = to_hir::expr_to_hir(&core, &mut to_hir::HirCtx::new(unicode, utf8))
+        .filter(|hir| hir.properties().explicit_captures_len() + 1 == n_groups)?;
+    let lookaround = |child: &Expr| {
+        let Expr::LookAround(body, kind) = child else {
+            return None;
+        };
+        let negated = matches!(kind, LookAround::LookAheadNeg | LookAround::LookBehindNeg);
+        let body = to_hir::expr_to_hir(body, &mut to_hir::HirCtx::new(unicode, utf8))?;
+        plan::Edge::new(&body, negated)
+    };
+    let edges = plan::Edges {
+        behind: behind.into_iter().map(lookaround).collect::<Option<_>>()?,
+        ahead: ahead.into_iter().map(lookaround).collect::<Option<_>>()?,
+    };
+    let compile_options = CompileOptions {
+        bytes_mode: options.bytes_mode,
+        unicode,
+        delegate_size_limit: options.delegate_size_limit,
+        delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+        ..CompileOptions::default()
+    };
+    let usage = if options.delegate_prefilter {
+        compile::DelegateUsage::unanchored()
+    } else {
+        compile::DelegateUsage::unanchored_no_prefilter()
+    };
+    let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
+    Some(RegularRoute::new(
+        hir,
+        compile_options,
+        usage,
+        ascii,
+        Some(edges),
+    ))
 }
 
 /// The route and meta engine that answer a routed search after the VM itself
@@ -2869,6 +2986,10 @@ fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInp
     }
     ra_input
 }
+
+/// The most capture slots a plan for a pattern with a rewritten capture
+/// group zero may have, so that a search for its span needs no allocation.
+const FIXUP_SLOTS: usize = 32;
 
 /// Where a plan searches `input`, which must not be done: the same
 /// span and anchoring as [`ra_input`].

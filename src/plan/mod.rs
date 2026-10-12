@@ -58,6 +58,9 @@ pub(crate) struct Plan {
     leading: Box<[Look]>,
     /// Assertions tested where the last step ends.
     trailing: Box<[Look]>,
+    /// Lookbehinds tested where a candidate starts and lookaheads where the
+    /// last step ends, when there are any.
+    edges: Option<Box<Edges>>,
     candidates: Candidates,
     /// The longest literal after the first step, which every match contains:
     /// a search where it does not occur ends at once.
@@ -71,6 +74,10 @@ pub(crate) struct Plan {
     skip_first_run: bool,
     /// The index of the first consuming step.
     first: usize,
+    /// A lookbehind fails inside the maximal run of the unbounded first
+    /// step's class wherever it fails at the run's start: every alternative
+    /// ends with a character outside that class.
+    look_skip: bool,
     /// The first step is a bounded run that nothing after it can continue:
     /// within one maximal run of its class, only starts whose run reaches the
     /// end of it can match, and all of them continue alike from there.
@@ -200,6 +207,143 @@ enum Candidates {
     Offset(Box<memchr::memmem::Finder<'static>>, usize),
     /// Every match starts with a character of this class.
     Class(Class),
+    /// Every match is preceded by one of a prefilter's literals, all of this
+    /// many bytes: a lookbehind.
+    Behind(Prefilter, usize),
+    /// Every match starts with the maximal run of this class that ends where
+    /// this literal, whose first character is outside the class, starts.
+    Suffix(Box<memchr::memmem::Finder<'static>>, Class),
+}
+
+/// A look-around assertion at an edge of a plan, over a fixed number of
+/// characters in each alternative: a lookbehind tested where an attempt
+/// starts, or a lookahead where it ends. Testing one reads at most that many
+/// characters next to the position and decides no choice.
+#[derive(Clone, Debug)]
+pub(crate) struct Edge {
+    negated: bool,
+    /// Each alternative's characters, in order.
+    alternatives: Box<[Box<[Class]>]>,
+}
+
+/// The most characters an edge assertion may test in all.
+const EDGE_CHARS: usize = 256;
+
+/// Look-around assertions around a regular pattern.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Edges {
+    pub(crate) behind: Vec<Edge>,
+    pub(crate) ahead: Vec<Edge>,
+}
+
+impl Edge {
+    /// The assertion `body` makes, negated if `negated`, or `None` unless each
+    /// of its alternatives is a fixed sequence of characters, without
+    /// captures or assertions.
+    pub(crate) fn new(body: &Hir, negated: bool) -> Option<Edge> {
+        let branches = match body.kind() {
+            HirKind::Alternation(subs) => subs.iter().collect(),
+            _ => Vec::from([body]),
+        };
+        let mut total = 0;
+        let alternatives = branches
+            .into_iter()
+            .map(|branch| {
+                let mut nodes = Vec::new();
+                let mut names = Vec::new();
+                flatten(branch, &mut nodes, &mut names)?;
+                let mut classes = Vec::new();
+                for node in nodes {
+                    match node {
+                        Node::Literal(bytes) => {
+                            let mut at = 0;
+                            while at < bytes.len() {
+                                let len = char_at(&bytes, at).map_or(1, |(_, len)| len);
+                                classes.push(Class::from_literal(&bytes[at..at + len])?);
+                                at += len;
+                            }
+                        }
+                        Node::Run(run) if run.min == run.max && run.min <= EDGE_CHARS => {
+                            classes.extend(core::iter::repeat_n(run.class, run.min));
+                        }
+                        _ => return None,
+                    }
+                }
+                total += classes.len();
+                Some(classes.into_boxed_slice())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (total <= EDGE_CHARS).then(|| Edge {
+            negated,
+            alternatives: alternatives.into_boxed_slice(),
+        })
+    }
+
+    /// Whether the assertion holds as a lookbehind at `at`.
+    #[inline]
+    fn behind(&self, haystack: &[u8], at: usize) -> bool {
+        let found = self.alternatives.iter().any(|alternative| {
+            let mut pos = at;
+            alternative.iter().rev().all(|class| {
+                class
+                    .len_before(haystack, pos)
+                    .map(|len| pos -= len)
+                    .is_some()
+            })
+        });
+        found != self.negated
+    }
+
+    /// Whether the assertion holds as a lookahead at `at`.
+    #[inline]
+    fn ahead(&self, haystack: &[u8], at: usize) -> bool {
+        let found = self.alternatives.iter().any(|alternative| {
+            let mut pos = at;
+            alternative.iter().all(|class| {
+                class
+                    .match_len(haystack, pos, haystack.len())
+                    .map(|len| pos += len)
+                    .is_some()
+            })
+        });
+        found != self.negated
+    }
+
+    /// For a positive assertion with no empty alternative, the characters
+    /// its alternatives end with.
+    fn last_classes(&self) -> Option<Class> {
+        if self.negated {
+            return None;
+        }
+        let mut lasts = self
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.last());
+        let first = lasts.next()??.clone();
+        lasts.try_fold(first, |union, last| union.union(last?))
+    }
+
+    /// The literals of a positive assertion whose alternatives each hold
+    /// single characters, when they all have the same non-zero byte length.
+    fn literals(&self) -> Option<(Vec<Vec<u8>>, usize)> {
+        if self.negated {
+            return None;
+        }
+        let literals = self
+            .alternatives
+            .iter()
+            .map(|alternative| {
+                alternative
+                    .iter()
+                    .try_fold(Vec::new(), |mut literal, class| {
+                        literal.extend(class.single()?);
+                        Some(literal)
+                    })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let len = literals.first()?.len();
+        (len > 0 && literals.iter().all(|literal| literal.len() == len)).then_some((literals, len))
+    }
 }
 
 /// An upper bound on the size of the Thompson NFA regex-automata compiles from
@@ -793,6 +937,9 @@ struct Rescan<'a> {
     skip: Option<usize>,
     /// The top-level index of a first literal the candidates confirm.
     confirmed: Option<usize>,
+    /// The characters a lookbehind needs right before every match start: no
+    /// attempt can start after a character outside them.
+    before: Option<Class>,
 }
 
 impl Rescan<'_> {
@@ -819,7 +966,13 @@ impl Rescan<'_> {
                 Exposure::read(held, fails.then_some(held))
             }
             Step::Run(run) => {
-                let held = run.class.overlaps(self.first);
+                // Inside a run of characters a lookbehind cannot end with,
+                // attempts fail at once.
+                let held = run.class.overlaps(self.first)
+                    && self
+                        .before
+                        .as_ref()
+                        .is_none_or(|before| before.overlaps(&run.class));
                 let width = if held { run.class.max_len() } else { 0 };
                 let fails_after = (run.min > 0).then(|| run.min.saturating_mul(width));
                 let add = if run.max != usize::MAX {
@@ -862,6 +1015,30 @@ impl Rescan<'_> {
     }
 }
 
+/// For a program starting with an unbounded run that a literal follows,
+/// whose first character the run cannot take, that literal and the run's
+/// class. Every match then starts with the maximal run ending where the
+/// literal starts, so its occurrences give the candidates. `unasserted`: no
+/// assertion is tested where a match starts, which could fail at the run's
+/// start but hold later in it.
+fn suffix(steps: &[Step], first: usize, unasserted: bool) -> Option<(Box<[u8]>, Class)> {
+    let Step::Run(run) = &steps[first] else {
+        return None;
+    };
+    if !unasserted || run.max != usize::MAX || run.min == 0 {
+        return None;
+    }
+    match steps[first + 1..]
+        .iter()
+        .find(|step| !matches!(step, Step::Save(_)))?
+    {
+        step @ Step::Literal(bytes) if !step.first()?.overlaps(&run.class) => {
+            Some((bytes.clone(), run.class.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// The prefixes of `hir` regex-automata's meta engine extracts for a
 /// leftmost-first prefilter, optimized by preference as it does.
 fn prefixes(hir: &Hir) -> literal::Seq {
@@ -879,6 +1056,14 @@ impl Plan {
     /// classes looks for its prefixes with a regex-automata prefilter, as the
     /// meta engine would.
     pub(crate) fn new(hir: &Hir, prefilter: bool) -> Option<Plan> {
+        Plan::with_edges(hir, prefilter, &Edges::default())
+    }
+
+    /// [`Plan::new`] for `hir` between look-around `edges`. A lookahead is
+    /// admitted where the end of the match is already decided: its first
+    /// characters follow the last step as a step would, and a negative one
+    /// only follows a step of fixed length.
+    pub(crate) fn with_edges(hir: &Hir, prefilter: bool, edges: &Edges) -> Option<Plan> {
         // Unicode word boundaries without their data tables: the engines
         // refuse to build, and the look-around matcher would panic.
         if hir.properties().look_set().contains_word_unicode() {
@@ -910,18 +1095,44 @@ impl Plan {
             .position(|step| !matches!(step, Step::Save(_)))?;
         let (first_class, nullable) = starts(&steps)?;
         let first_class = first_class?;
+        let edged = !edges.behind.is_empty() || !edges.ahead.is_empty();
         // Assertions would decide where a match that can be empty starts.
-        if nullable && (!leading.is_empty() || !trailing.is_empty()) {
+        if nullable && (!leading.is_empty() || !trailing.is_empty() || edged) {
             return None;
         }
-        let outer = Follow {
+        let mut outer = Follow {
             next: None,
             end: Some(true),
             completion: Some(Vec::new()),
             later: Some(Vec::new()),
         };
+        for edge in edges.ahead.iter().filter(|edge| !edge.negated) {
+            // An empty alternative always holds.
+            if edge
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.is_empty())
+            {
+                continue;
+            }
+            outer.end = Some(false);
+            for alternative in &*edge.alternatives {
+                outer.add(alternative[0].clone())?;
+            }
+        }
         let first_follow = admit(&mut steps, &outer, &trailing, Some(first))??;
-        let decisive = if trailing.is_empty() {
+        if edges.ahead.iter().any(|edge| edge.negated) {
+            let last = steps
+                .iter()
+                .rposition(|step| !matches!(step, Step::Save(_)))?;
+            match &steps[last] {
+                Step::Literal(_) => {}
+                Step::Run(run) if run.min == run.max => {}
+                _ => return None,
+            }
+        }
+        let checks_end = !trailing.is_empty() || !edges.ahead.is_empty();
+        let decisive = if !checks_end {
             steps
                 .iter()
                 .rposition(Step::consumes)
@@ -962,7 +1173,8 @@ impl Plan {
         let exact_prefilter = prefixes
             .as_ref()
             .filter(|prefixes| {
-                prefixes.is_exact()
+                !edged
+                    && prefixes.is_exact()
                     && hir.properties().explicit_captures_len() == 0
                     && hir.properties().look_set().is_empty()
             })
@@ -1012,21 +1224,56 @@ impl Plan {
             }
         };
         let skip_first_run = matches!(&steps[first], Step::Run(run) if run.max == usize::MAX);
+        let candidates = match candidates {
+            candidates @ (Candidates::Literal(_) | Candidates::Offset(..)) => candidates,
+            Candidates::Prefilter(prefilter) if prefilter.is_fast() => {
+                Candidates::Prefilter(prefilter)
+            }
+            weaker => match (
+                edges.behind.iter().find_map(Edge::literals),
+                suffix(&steps, first, leading.is_empty() && edges.behind.is_empty()),
+            ) {
+                // The literals of a lookbehind end where matches start.
+                (Some((literals, len)), _) => Prefilter::new(MatchKind::LeftmostFirst, &literals)
+                    .map_or(weaker, |prefilter| Candidates::Behind(prefilter, len)),
+                (None, Some((literal, class))) => Candidates::Suffix(
+                    Box::new(memchr::memmem::Finder::new(&literal).into_owned()),
+                    class,
+                ),
+                (None, None) => weaker,
+            },
+        };
+        let look_skip = skip_first_run
+            && leading.is_empty()
+            && !edges.behind.is_empty()
+            && match &steps[first] {
+                Step::Run(run) => edges.behind.iter().all(|edge| {
+                    !edge.negated
+                        && edge.alternatives.iter().all(|alternative| {
+                            alternative
+                                .last()
+                                .is_some_and(|class| !class.overlaps(&run.class))
+                        })
+                }),
+                _ => false,
+            };
         let rescan = Rescan {
             first: &first_class,
-            trailing: !trailing.is_empty(),
+            trailing: checks_end,
             skip: skip_first_run.then_some(first),
             confirmed: matches!(candidates, Candidates::Literal(_)).then_some(first),
+            before: edges.behind.iter().find_map(Edge::last_classes),
         };
         // A search tries one start when only its start can begin a match.
         if !start_only {
             let exposure = rescan.sequence(&steps, true)?;
-            if !trailing.is_empty() {
+            if checks_end {
                 // The assertions can fail where the last step ends.
                 exposure.then(Exposure::read(0, Some(0))?)?;
             }
         }
-        let window = !matches!(candidates, Candidates::Offset(..))
+        let window = !edged
+            && !matches!(candidates, Candidates::Offset(..))
             && match &steps[first] {
                 // Retrying shorter runs costs little more than a window.
                 Step::Run(run)
@@ -1058,6 +1305,7 @@ impl Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
             trailing: trailing.into_boxed_slice(),
+            edges: edged.then(|| Box::new(edges.clone())),
             candidates,
             required,
             start_only,
@@ -1069,6 +1317,7 @@ impl Plan {
                 Whole::Attempts
             },
             skip_first_run,
+            look_skip,
             first,
             window,
             decisive,
@@ -1109,7 +1358,8 @@ impl Plan {
     /// The first position in `from..end` where the first consuming step can
     /// match.
     #[inline]
-    fn next_candidate(&self, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
+    fn next_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        let (haystack, end) = (input.haystack, input.end);
         let found = match &self.candidates {
             Candidates::Literal(finder) => finder.find(&haystack[from..end]),
             Candidates::Prefilter(prefilter) => {
@@ -1135,10 +1385,51 @@ impl Plan {
                 }
                 return None;
             }
-            Candidates::Class(Class::Bytes(set)) => {
-                haystack[from..end].iter().position(|&b| has_byte(set, b))
+            Candidates::Class(class) => return Plan::find_class(class, haystack, from, end),
+            Candidates::Behind(prefilter, len) => {
+                // A literal ending at or after `from`, perhaps before the
+                // search's start; all have the same length, so their ends
+                // come in order.
+                let start = from.saturating_sub(*len);
+                return prefilter
+                    .find(haystack, Span { start, end })
+                    .map(|found| found.start + len);
             }
-            Candidates::Class(class @ Class::Chars(set)) => {
+            Candidates::Suffix(finder, class) => {
+                // Decoding backwards needs valid UTF-8 to agree with a
+                // forward run.
+                if !input.utf8 && matches!(class, Class::Chars(_)) {
+                    return Plan::find_class(class, haystack, from, end);
+                }
+                let mut at = from;
+                while let Some(offset) = finder.find(&haystack[at..end]) {
+                    let suffix = at + offset;
+                    let mut start = suffix;
+                    while let Some(len) = class.len_before(haystack, start)
+                        && start - len >= from
+                    {
+                        start -= len;
+                    }
+                    if start < suffix {
+                        return Some(start);
+                    }
+                    at = suffix + 1;
+                }
+                return None;
+            }
+        };
+        found.map(|offset| from + offset)
+    }
+
+    /// The first position in `from..end` holding a member of `class`.
+    #[inline]
+    fn find_class(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
+        match class {
+            Class::Bytes(set) => haystack[from..end]
+                .iter()
+                .position(|&b| has_byte(set, b))
+                .map(|offset| from + offset),
+            Class::Chars(set) => {
                 let mut at = from;
                 while at < end {
                     let b = haystack[at];
@@ -1151,10 +1442,9 @@ impl Plan {
                     }
                     at += 1;
                 }
-                return None;
+                None
             }
-        };
-        found.map(|offset| from + offset)
+        }
     }
 
     /// The end of the maximal run from `at`, up to `run.max` members, and how
@@ -1268,6 +1558,10 @@ impl Plan {
         self.trailing
             .iter()
             .all(|&look| self.look_at(look, haystack, at))
+            && self
+                .edges
+                .as_ref()
+                .is_none_or(|edges| edges.ahead.iter().all(|edge| edge.ahead(haystack, at)))
     }
 
     /// Match `steps` from `state.pos`.
@@ -1404,6 +1698,10 @@ impl Plan {
             .leading
             .iter()
             .all(|&look| self.look_at(look, haystack, start))
+            || self
+                .edges
+                .as_ref()
+                .is_some_and(|edges| !edges.behind.iter().all(|edge| edge.behind(haystack, start)))
         {
             return Err(LOOK_MISS);
         }
@@ -1571,12 +1869,22 @@ impl Plan {
         }
         let mut from = start;
         loop {
-            let candidate = self.next_candidate(input.haystack, from, input.end)?;
+            let candidate = self.next_candidate(input, from)?;
             let resume = match self.attempt(input, candidate, earliest, slots.as_deref_mut()) {
                 Ok(match_end) => return Some((candidate, match_end)),
                 // Every later start inside an unbounded first run ends it at
                 // the same place, and so fails the same way.
                 Err(run_end) if self.skip_first_run && run_end != LOOK_MISS => {
+                    run_end.max(candidate + 1)
+                }
+                // A lookbehind failing at the start of the first run fails
+                // throughout it.
+                Err(_) if self.look_skip => {
+                    let Step::Run(run) = &self.steps[self.first] else {
+                        unreachable!("a lookbehind skips past a first run");
+                    };
+                    let (run_end, _) =
+                        Plan::take(run, input.haystack, candidate, input.end, usize::MAX);
                     run_end.max(candidate + 1)
                 }
                 Err(_) => candidate + 1,
@@ -1655,7 +1963,7 @@ impl Plan {
     ) -> Option<(usize, usize)> {
         let mut from = input.start;
         loop {
-            let candidate = self.next_candidate(input.haystack, from, input.end)?;
+            let candidate = self.next_candidate(input, from)?;
             match self.window_attempt(input, candidate, earliest, slots.as_deref_mut()) {
                 Ok(found) => return Some(found),
                 Err(resume) if resume >= input.end => return None,

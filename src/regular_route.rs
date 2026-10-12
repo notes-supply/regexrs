@@ -1,7 +1,13 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
 //! Automata for patterns that need the backtracking VM only for word
-//! boundaries. `Regex::regular_route` decides per search whether their
+//! boundaries, and plans for regular patterns between look-around
+//! assertions. `Regex::regular_route` decides per search whether their
 //! results provably equal the VM's.
+//!
+//! A pattern between fixed-width lookbehinds and lookaheads has no automata.
+//! Its plan tests each assertion by reading the characters next to the
+//! position it applies to; every other search, and every pattern the plan
+//! cannot take, stays on the VM.
 //!
 //! The automata are built on the first search that can use them, so
 //! constructing a `Regex` stays as cheap as compiling its VM program.
@@ -38,7 +44,7 @@ use regex_automata::{Input, MatchError, MatchKind};
 use regex_syntax::hir::{Hir, Look};
 
 use crate::compile::{self, CompileOptions, DelegateUsage};
-use crate::plan::{NFA_UNIT_BUDGET, Plan, PlanInput, Slots};
+use crate::plan::{Edges, NFA_UNIT_BUDGET, Plan, PlanInput, Slots};
 
 type BuildFn = Box<dyn Fn() -> Option<Automata> + Send + Sync + UnwindSafe + RefUnwindSafe>;
 type MetaFn = Box<dyn Fn() -> Option<RaRegex> + Send + Sync + UnwindSafe + RefUnwindSafe>;
@@ -75,6 +81,7 @@ impl RegularRoute {
         options: CompileOptions,
         usage: DelegateUsage,
         ascii: bool,
+        edges: Option<Edges>,
     ) -> Self {
         let hir = Arc::new(hir);
         let engine: EngineFn = Box::new(move || {
@@ -85,9 +92,13 @@ impl RegularRoute {
             let default_limits =
                 options.delegate_size_limit.is_none() && options.delegate_dfa_size_limit.is_none();
             let plan = default_limits
-                .then(|| RoutePlan::new(&hir, usage.prefilter(), ascii))
+                .then(|| RoutePlan::new(&hir, usage.prefilter(), ascii, edges.as_ref()))
                 .flatten();
-            let build: BuildFn = Box::new(move || Automata::new(&hir, &options, usage));
+            // Look-around assertions have no automata.
+            let build: BuildFn = match edges {
+                Some(_) => Box::new(|| None),
+                None => Box::new(move || Automata::new(&hir, &options, usage)),
+            };
             match plan {
                 Some(plan) => RouteEngine::Plan(plan, Lazy::new(build)),
                 None => RouteEngine::Automata(build()),
@@ -129,8 +140,11 @@ impl RouteEngine {
 impl RoutePlan {
     /// The plan for `hir`, when the automata it stands in for certainly fit
     /// within the default limits. `ascii` is ASCII mode.
-    fn new(hir: &Hir, prefilter: bool, ascii: bool) -> Option<RoutePlan> {
-        let plan = Plan::new(hir, prefilter)?;
+    fn new(hir: &Hir, prefilter: bool, ascii: bool, edges: Option<&Edges>) -> Option<RoutePlan> {
+        let plan = match edges {
+            Some(edges) => Plan::with_edges(hir, prefilter, edges)?,
+            None => Plan::new(hir, prefilter)?,
+        };
         (plan.nfa_units() <= NFA_UNIT_BUDGET).then(|| RoutePlan {
             plan,
             ascii_only: ascii && hir.properties().look_set().contains_word_unicode(),

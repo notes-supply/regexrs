@@ -57,8 +57,13 @@ stays linear per search and per iteration. Patterns such as `(?:foo|bar)+qux`,
 whose attempts could rescan unbounded repetitions, keep their engine.
 
 The plan finds candidates with memmem, a literal at a fixed offset, a
-`regex-automata` prefilter, memchr or a word-at-a-time byte-range test.
-Alternatives are chosen through a 256-entry table of first bytes. Runs match
+`regex-automata` prefilter, memchr or a word-at-a-time byte-range test. A
+literal after an unbounded first run that the run cannot take, as `@` in
+`\w+@\w+`, gives the candidates instead: at each of its occurrences the plan
+scans back over the run to the match start. A pattern that is a finite set of
+literals without captures or assertions is searched with its prefilter alone,
+as the meta engine's literal strategy does. Alternatives are chosen through a
+256-entry table of first bytes. Runs match
 maximally (or minimally for a lazy run nothing can fail after), and a failed
 attempt skips past a first run that cannot match. Captures, ranges, anchoring,
 `Searcher` and `CaptureLocations` give the meta engine's results with no
@@ -96,6 +101,27 @@ on such text, such as a backtrack stack overflow, can therefore become the
 correct answer instead. In ASCII mode, where the VM classifies single bytes, a
 plan answers only searches that read ASCII alone, and patterns with
 alternatives or groups leave those searches to the automata.
+
+A regular pattern between fixed-width lookbehinds at its start and lookaheads
+at its end, as `(?<=Mr\. |Dr\. )[A-Z]\w+`, `(?<=\s)\w+`,
+`(?<=\.)[a-z][a-z0-9]*(?=\()` or `(?<!\w)\d+`, is searched by a plan as well.
+The plan tests each assertion by reading the characters next to the position
+it applies to, so the assertion decides no choice. A lookahead is admitted
+where the end of the match is already decided: its first characters must not
+continue the last step, and a negative one only follows a step of fixed
+length. The candidates are where a lookbehind's literals of one byte length
+end, as found by a `regex-automata` prefilter. After a failed lookbehind the
+plan skips the run of the first step's class, inside which the lookbehind
+fails too. A final positive lookahead such as `\w+(?=!)`, which the optimizer
+turns into a consumed suffix and a rewritten capture group zero, is planned
+on that form. Lookarounds elsewhere, bodies of varying width, captures inside
+them, rich options and an explicit `backtrack_limit` keep the VM.
+
+This changes results only where the VM failed under the default limit. A
+search whose VM exceeded the default backtrack limit, such as
+`(?<=Mr\. )[A-Z]` over a million capitals without `seek`, now returns its
+correct answer; that limit only bounded incidental work. An explicit limit
+keeps the VM and its exact errors.
 
 Unanchored portable searches, including `find`, captures, iteration and
 replacement, skip start positions where the program's leading literal or class

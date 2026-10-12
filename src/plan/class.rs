@@ -368,6 +368,52 @@ impl Class {
         }
     }
 
+    /// The length of the member that ends at `at`: the character starting at
+    /// the last byte before `at` that is not a UTF-8 continuation byte, as
+    /// decoding forward from any earlier boundary would also find.
+    #[inline]
+    pub(super) fn len_before(&self, haystack: &[u8], at: usize) -> Option<usize> {
+        match self {
+            Class::Bytes(set) => {
+                let b = *haystack.get(at.checked_sub(1)?)?;
+                has_byte(set, b).then_some(1)
+            }
+            Class::Chars(_) => {
+                let start = (at.saturating_sub(4)..at)
+                    .rev()
+                    .find(|&i| haystack[i] & 0xC0 != 0x80)?;
+                (self.match_len(haystack, start, at) == Some(at - start)).then_some(at - start)
+            }
+        }
+    }
+
+    /// The encoding of the one member of the class, if it has one.
+    pub(super) fn single(&self) -> Option<Vec<u8>> {
+        match self {
+            Class::Bytes(set) => {
+                let mut members = (0..=255u8).filter(|&b| has_byte(set, b));
+                match (members.next(), members.next()) {
+                    (Some(b), None) => Some(Vec::from([b])),
+                    _ => None,
+                }
+            }
+            Class::Chars(set) => {
+                let count = set.ascii.count_ones()
+                    + set.two.iter().map(|bits| bits.count_ones()).sum::<u32>();
+                let c = match (count, &*set.wide) {
+                    (1, []) if set.ascii != 0 => char::from(set.ascii.trailing_zeros() as u8),
+                    (1, []) => {
+                        let (word, bits) = set.two.iter().enumerate().find(|(_, b)| **b != 0)?;
+                        char::from_u32(0x80 + 64 * word as u32 + bits.trailing_zeros())?
+                    }
+                    (0, [(lo, hi)]) if lo == hi => *lo,
+                    _ => return None,
+                };
+                Some(Vec::from(c.encode_utf8(&mut [0; 4]).as_bytes()))
+            }
+        }
+    }
+
     pub(super) fn has_ascii(&self, b: u8) -> bool {
         match self {
             Class::Chars(set) => bit128(set.ascii, b),
