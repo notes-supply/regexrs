@@ -6,7 +6,17 @@ use crate::{
     Result, WrapEngine, vm,
 };
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::panic::{RefUnwindSafe, UnwindSafe};
+use regex_automata::util::pool::Pool;
 use regex_automata::{hybrid, meta, util::captures::Captures as RaCaptures};
+
+/// Creates a pattern's working memory for its pool.
+pub(crate) type CacheFn = Box<dyn Fn() -> Cache + Send + Sync + UnwindSafe + RefUnwindSafe>;
+
+/// A pattern's working memory, which an iterator takes once for its whole
+/// iteration instead of once per search.
+pub(crate) type CachePool = Pool<Cache, CacheFn>;
 
 pub(crate) enum Cache {
     /// A plan searches without working memory.
@@ -41,6 +51,34 @@ impl core::fmt::Debug for Cache {
 }
 
 impl Cache {
+    /// A pool of working memory for searches with `inner`'s engine, or `None`
+    /// for a plan, which needs none.
+    pub(crate) fn pool(inner: &RegexImpl) -> Option<Arc<CachePool>> {
+        match inner {
+            RegexImpl::Wrap { engine, .. } => Cache::engine_pool(engine),
+            RegexImpl::Fancy { .. } => {
+                let create: CacheFn = Box::new(|| Cache::Rich {
+                    scratch: vm::new_scratch(),
+                    route: None,
+                });
+                Some(Arc::new(Pool::new(create)))
+            }
+        }
+    }
+
+    /// A pool of working memory for `engine`, or `None` for a plan.
+    pub(crate) fn engine_pool(engine: &WrapEngine) -> Option<Arc<CachePool>> {
+        let WrapEngine::Meta(regex) = engine else {
+            return None;
+        };
+        let regex = regex.clone();
+        let create: CacheFn = Box::new(move || Cache::Regular {
+            cache: Box::new(regex.create_cache()),
+            captures: regex.create_captures(),
+        });
+        Some(Arc::new(Pool::new(create)))
+    }
+
     pub(crate) fn regular(&mut self) -> Option<(&mut meta::Cache, &mut RaCaptures)> {
         match self {
             Self::Regular { cache, captures } => Some((cache.as_mut(), captures)),

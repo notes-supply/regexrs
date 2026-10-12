@@ -48,6 +48,7 @@ use regex_automata::Anchored as RaAnchored;
 use regex_automata::Input as RaInput;
 use regex_automata::meta::Regex as RaRegex;
 use regex_automata::util::captures::Captures as RaCaptures;
+use regex_automata::util::pool::PoolGuard;
 use regex_automata::util::primitives::NonMaxUsize;
 use regex_automata::util::syntax::Config as SyntaxConfig;
 
@@ -171,6 +172,9 @@ pub struct RegexOptionsBuilder {
 pub struct Regex {
     inner: RegexImpl,
     named_groups: Arc<NamedGroups>,
+    /// Working memory iterators take for their whole iteration; `None` for a
+    /// plan, which needs none.
+    caches: Option<Arc<searcher::CachePool>>,
     #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
     native: Option<Arc<native::LazyNative>>,
 }
@@ -270,8 +274,39 @@ pub struct Match<'t> {
 pub struct Matches<'r, 't, S: input::Input + ?Sized> {
     re: &'r Regex,
     state: IterState<'t, S>,
-    /// A [`Searcher`]'s exclusive scratch, when iterating through one.
-    cache: Option<&'r mut searcher::Cache>,
+    cache: IterCache<'r>,
+}
+
+/// The working memory an iteration searches with.
+#[derive(Debug)]
+pub(crate) enum IterCache<'r> {
+    /// None yet: it is taken from the regex's pool, if it has one, by the
+    /// first search.
+    Unset,
+    /// A [`Searcher`]'s exclusive scratch.
+    Borrowed(&'r mut searcher::Cache),
+    /// Taken from the regex's pool for the rest of the iteration, and
+    /// returned when the iterator is dropped.
+    Pooled(PoolGuard<'r, searcher::Cache, searcher::CacheFn>),
+}
+
+impl<'r> IterCache<'r> {
+    /// The working memory for the next search, taken from `pool` the first
+    /// time.
+    #[inline]
+    pub(crate) fn get(
+        &mut self,
+        pool: Option<&'r searcher::CachePool>,
+    ) -> Option<&mut searcher::Cache> {
+        if let (IterCache::Unset, Some(pool)) = (&*self, pool) {
+            *self = IterCache::Pooled(pool.get());
+        }
+        match self {
+            IterCache::Unset => None,
+            IterCache::Borrowed(cache) => Some(cache),
+            IterCache::Pooled(cache) => Some(cache),
+        }
+    }
 }
 
 impl<'r, 't, S: input::Input + ?Sized> Matches<'r, 't, S> {
@@ -283,7 +318,7 @@ impl<'r, 't, S: input::Input + ?Sized> Matches<'r, 't, S> {
         Matches {
             re,
             state: IterState::new(input),
-            cache,
+            cache: cache.map_or(IterCache::Unset, IterCache::Borrowed),
         }
     }
 
@@ -383,8 +418,9 @@ impl<'r, 't, S: input::Input + ?Sized> Iterator for Matches<'r, 't, S> {
     fn next(&mut self) -> Option<Self::Item> {
         let Matches { re, state, cache } = self;
         let text = state.input.haystack();
+        let re: &'r Regex = re;
         state.next_with(|input, flags| {
-            re.find_input_raw_cached(input, flags, cache.as_deref_mut())
+            re.find_input_raw_cached(input, flags, cache.get(re.caches.as_deref()))
                 .map(|opt| opt.map(|(s, e)| (text.make_match(s, e), (s, e))))
         })
     }
@@ -417,8 +453,10 @@ impl<'r, 't, S: input::Input + ?Sized> Iterator for CaptureMatches<'r, 't, S> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let Matches { re, state, cache } = &mut self.0;
+        let re: &'r Regex = re;
         state.next_with(|input, flags| {
-            let captures = re.captures_input_cached(input, flags, cache.as_deref_mut())?;
+            let captures =
+                re.captures_input_cached(input, flags, cache.get(re.caches.as_deref()))?;
             Ok(captures.map(|c| {
                 let (start, end) = c
                     .inner
@@ -1460,13 +1498,15 @@ impl Regex {
                 Some(hir) => compile::compile_inner_from_hir(hir, &compile_options, usage),
                 None => compile::compile_inner(&re_cooked, &compile_options, usage),
             })?;
+            let inner = RegexImpl::Wrap {
+                engine,
+                pattern,
+                explicit_capture_group_0: requires_capture_group_fixup,
+                delegated_pattern: re_cooked,
+            };
             return Ok(Regex {
-                inner: RegexImpl::Wrap {
-                    engine,
-                    pattern,
-                    explicit_capture_group_0: requires_capture_group_fixup,
-                    delegated_pattern: re_cooked,
-                },
+                caches: searcher::Cache::pool(&inner),
+                inner,
                 named_groups: Arc::new(tree.named_groups),
                 #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
                 native: None,
@@ -1498,17 +1538,19 @@ impl Regex {
                 .or_else(|| assertion_route(&pattern, flags, options, n_groups))
                 .map(Arc::new)
         };
+        let inner = RegexImpl::Fancy {
+            prog: Arc::new(prog),
+            n_groups,
+            options: options.hard_regex_runtime_options,
+            pattern,
+            flags,
+            regular,
+        };
         Ok(Regex {
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
             native: native_pattern.map(|pattern| Arc::new(native::LazyNative::new(pattern))),
-            inner: RegexImpl::Fancy {
-                prog: Arc::new(prog),
-                n_groups,
-                options: options.hard_regex_runtime_options,
-                pattern,
-                flags,
-                regular,
-            },
+            caches: searcher::Cache::pool(&inner),
+            inner,
             named_groups: Arc::new(tree.named_groups),
         })
     }
