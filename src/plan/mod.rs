@@ -61,6 +61,10 @@ pub(crate) struct Plan {
     /// Lookbehinds tested where a candidate starts and lookaheads where the
     /// last step ends, when there are any.
     edges: Option<Box<Edges>>,
+    /// Some assertion or lookbehind is tested where an attempt starts.
+    checks_start: bool,
+    /// Some assertion or lookahead is tested where the last step ends.
+    checks_end: bool,
     candidates: Candidates,
     /// The longest literal after the first step, which every match contains:
     /// a search where it does not occur ends at once.
@@ -1304,10 +1308,13 @@ impl Plan {
             *group_names.get_mut(index)? = name;
         }
         let group_info = GroupInfo::new([group_names]).ok()?;
+        let checks_start = !leading.is_empty() || !edges.behind.is_empty();
         Some(Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
             trailing: trailing.into_boxed_slice(),
+            checks_start,
+            checks_end,
             edges: edged.then(|| Box::new(edges.clone())),
             candidates,
             required,
@@ -1388,7 +1395,24 @@ impl Plan {
                 }
                 return None;
             }
-            Candidates::Class(class) => return Plan::find_class(class, haystack, from, end),
+            Candidates::Class(Class::Bytes(set)) => {
+                haystack[from..end].iter().position(|&b| has_byte(set, b))
+            }
+            Candidates::Class(class @ Class::Chars(set)) => {
+                let mut at = from;
+                while at < end {
+                    let b = haystack[at];
+                    if b < 0x80 {
+                        if bit128(set.ascii, b) {
+                            return Some(at);
+                        }
+                    } else if class.match_len(haystack, at, end).is_some() {
+                        return Some(at);
+                    }
+                    at += 1;
+                }
+                return None;
+            }
             Candidates::Behind(prefilter, len) => {
                 // A literal ending at or after `from`, perhaps before the
                 // search's start; all have the same length, so their ends
@@ -1424,8 +1448,9 @@ impl Plan {
         found.map(|offset| from + offset)
     }
 
-    /// The first position in `from..end` holding a member of `class`.
-    #[inline]
+    /// The first position in `from..end` holding a member of `class`, for
+    /// candidates that cannot use their faster search on this input.
+    #[inline(never)]
     fn find_class(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
         match class {
             Class::Bytes(set) => haystack[from..end]
@@ -1558,6 +1583,11 @@ impl Plan {
     /// Whether every trailing assertion holds at `at`.
     #[inline]
     fn trailing_hold(&self, haystack: &[u8], at: usize) -> bool {
+        !self.checks_end || self.end_holds(haystack, at)
+    }
+
+    #[inline(never)]
+    fn end_holds(&self, haystack: &[u8], at: usize) -> bool {
         self.trailing
             .iter()
             .all(|&look| self.look_at(look, haystack, at))
@@ -1565,6 +1595,18 @@ impl Plan {
                 .edges
                 .as_ref()
                 .is_none_or(|edges| edges.ahead.iter().all(|edge| edge.ahead(haystack, at)))
+    }
+
+    /// Whether every leading assertion holds at `at`.
+    #[inline(never)]
+    fn start_holds(&self, haystack: &[u8], at: usize) -> bool {
+        self.leading
+            .iter()
+            .all(|&look| self.look_at(look, haystack, at))
+            && self
+                .edges
+                .as_ref()
+                .is_none_or(|edges| edges.behind.iter().all(|edge| edge.behind(haystack, at)))
     }
 
     /// Match `steps` from `state.pos`.
@@ -1697,15 +1739,7 @@ impl Plan {
         mut slots: Option<&mut S>,
     ) -> Result<usize, usize> {
         let (haystack, end) = (input.haystack, input.end);
-        if !self
-            .leading
-            .iter()
-            .all(|&look| self.look_at(look, haystack, start))
-            || self
-                .edges
-                .as_ref()
-                .is_some_and(|edges| !edges.behind.iter().all(|edge| edge.behind(haystack, start)))
-        {
+        if self.checks_start && !self.start_holds(haystack, start) {
             return Err(LOOK_MISS);
         }
         if let Some(slots) = slots.as_deref_mut() {

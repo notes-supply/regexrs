@@ -1819,11 +1819,7 @@ impl Regex {
                 if !*explicit_capture_group_0 {
                     return Ok(plan_find(plan, input, None));
                 }
-                // The optimizer consumed a final lookahead, so group 1 holds
-                // the match.
-                let mut slots = [usize::MAX; FIXUP_SLOTS];
-                let found = plan.find(&plan_input(input), Some(&mut slots[..plan.slot_len()]));
-                Ok(found.and((slots[2] != usize::MAX).then_some((slots[2], slots[3]))))
+                Ok(plan_find_rewritten(plan, input))
             }
             RegexImpl::Wrap {
                 engine: WrapEngine::Meta(inner),
@@ -3011,6 +3007,19 @@ fn plan_find<S: input::Input + ?Sized>(
     slots: Option<&mut [Option<NonMaxUsize>]>,
 ) -> Option<(usize, usize)> {
     plan.find(&plan_input(input), slots)
+}
+
+/// The span of a plan for a pattern whose final lookahead the optimizer
+/// consumed: group 1 holds the match. Kept out of line, so that the common
+/// search keeps its small frame.
+#[inline(never)]
+fn plan_find_rewritten<S: input::Input + ?Sized>(
+    plan: &Plan,
+    input: &RegexInput<'_, S>,
+) -> Option<(usize, usize)> {
+    let mut slots = [usize::MAX; FIXUP_SLOTS];
+    let found = plan.find(&plan_input(input), Some(&mut slots[..plan.slot_len()]));
+    found.and((slots[2] != usize::MAX).then_some((slots[2], slots[3])))
 }
 
 /// Whether a plan matches in `input`, which must not be done.
