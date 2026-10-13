@@ -282,7 +282,7 @@ impl CaseiLiteral {
 /// The character starting at `ix` and its length in bytes; `None` at the end
 /// of input or where the bytes there are not one valid UTF-8 character.
 #[inline]
-fn char_at(bytes: &[u8], ix: usize) -> Option<(char, usize)> {
+pub(crate) fn char_at(bytes: &[u8], ix: usize) -> Option<(char, usize)> {
     let lead = *bytes.get(ix)?;
     if lead < 0x80 {
         return Some((char::from(lead), 1));
@@ -297,7 +297,7 @@ fn char_at(bytes: &[u8], ix: usize) -> Option<(char, usize)> {
 
 /// Binary-searches `ranges` (sorted, non-overlapping, inclusive) for `needle`.
 #[inline]
-fn range_contains<T: Ord + Copy>(ranges: &[(T, T)], needle: T) -> bool {
+pub(crate) fn range_contains<T: Ord + Copy>(ranges: &[(T, T)], needle: T) -> bool {
     ranges
         .binary_search_by(|&(lo, hi)| {
             if needle < lo {

@@ -1010,6 +1010,11 @@ pub(crate) struct DelegateUsage {
 }
 
 impl DelegateUsage {
+    /// Whether the engine is searched unanchored, so a prefilter can help.
+    pub(crate) const fn prefilter(self) -> bool {
+        self.prefilter
+    }
+
     /// An engine searched unanchored and expected to report full captures: the
     /// top-level `Wrap` engine and the seek pre-filter. Matches the historical
     /// default (prefilter on, all captures).

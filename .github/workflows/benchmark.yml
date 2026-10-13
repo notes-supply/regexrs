@@ -1,0 +1,72 @@
+name: Benchmark comparison
+
+on:
+  push:
+    branches: [benchmark/ci-*]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Representative regression check or complete matrix
+        type: choice
+        options: [quick, full]
+        default: quick
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Five rotated comparisons (${{ inputs.mode || 'quick' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      BENCH_MODE: ${{ inputs.mode || 'quick' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+        with:
+          version: 2026.10.3
+          install_args: --locked rust
+          cache: true
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> benchmarks/target
+          shared-key: regexrs-benchmark
+          key: ${{ hashFiles('benchmarks/runner/Cargo.lock', 'mise.lock') }}
+          save-if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      - name: Compare frozen sources and competitors
+        run: |
+          if [[ "$BENCH_MODE" == full ]]; then
+            mise run bench:rebar:compare -- \
+              candidate="$GITHUB_SHA" \
+              hybrid=5cc5ce9f485de0e5b16cefa2209340b739ac4a36 \
+              regular=8e0304a6584eaf2dde15681004d09ec9a7120e50 \
+              released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
+          else
+            mise run bench:rebar:compare -- \
+              candidate="$GITHUB_SHA" \
+              released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
+          fi
+      - name: Save raw results and verification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-comparison
+          path: |
+            .benchmark-results/comparison/*.csv
+            .benchmark-results/comparison/*.tsv
+            .benchmark-results/comparison/*.txt
+            .benchmark-results/comparison/*.sha256
+            .benchmark-results/comparison/logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

@@ -193,11 +193,15 @@ fn retained_storage_follows_composed_seeks() {
     }
 }
 
-/// Plain seeking attempts every capitalized letter here, and each attempt fails
-/// once at the lookbehind; past a million of them the default limit is
-/// exceeded, as the exhaustive scan exceeds it. When the lookbehind's literals
-/// lead the seek there are no candidates, so the true answer is returned. An
-/// explicit limit keeps seeking alone and its exact error.
+/// Plain seeking would attempt every capitalized letter here, each failing
+/// once at the lookbehind, and past a million of them exceed the default
+/// limit, as the exhaustive scan does. Under the default limit the pattern
+/// is instead searched by its plan, whose candidates are where the
+/// lookbehind's literals end: there are none, so the true answer is
+/// returned. That was once a limit error; the default limit only bounded
+/// incidental work. When the lookbehind's literals lead the seek there are no
+/// candidates either. An explicit limit keeps seeking alone and its exact
+/// error.
 #[test]
 fn lookbehind_literals_lead_seek_only_under_the_default_limit() {
     let pattern = r"(?<=Mr\. )[A-Z]";
@@ -205,7 +209,9 @@ fn lookbehind_literals_lead_seek_only_under_the_default_limit() {
     let find =
         |regex: &Regex, text: &str| format!("{:?}", regex.find(text).map(|m| m.map(|m| m.range())));
     let limit_error = "Err(RuntimeError(BacktrackLimitExceeded))";
-    assert_eq!(find(&build(pattern, "default", None), &text), limit_error);
+    let default = build(pattern, "default", None);
+    assert!(default.planned());
+    assert_eq!(find(&default, &text), "Ok(None)");
     assert_eq!(find(&build(pattern, "seek", None), &text), "Ok(None)");
     assert_eq!(
         find(&build(pattern, "seek", Some(1_000_000)), &text),

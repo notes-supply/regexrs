@@ -1,6 +1,8 @@
 // Copyright 2026 Notes Supply AB. Distributed under the MIT license.
-//! Expressions restricted to the regular subset of the syntax, searched by
-//! regex-automata's automata and PikeVM only.
+//! Expressions restricted to the regular subset of the syntax, searched
+//! without backtracking: by a one-pass plan where the next character decides
+//! every choice the pattern makes, and otherwise by regex-automata's automata
+//! and PikeVM.
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -10,14 +12,13 @@ use core::convert::Infallible;
 use core::fmt;
 use core::str::FromStr;
 
-use regex_automata::meta::Regex as RaRegex;
-
 use crate::compile::{CompileOptions, DelegateUsage, compile_inner, compile_inner_from_hir};
 use crate::parse::NamedGroups;
 use crate::{
     Assertion, BytesMode, CaptureNames, Captures, CapturesImpl, CompileError, Error, Expr, Input,
-    IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, capture_names_of,
-    ra_input, replacen_with, to_hir,
+    IterState, Regex, RegexImpl, RegexInput, RegexOptions, Replacer, Result, WrapEngine,
+    capture_names_of, plan_captures_into, plan_find, plan_is_match, ra_input, replacen_with,
+    to_hir,
 };
 
 /// A compiled expression from the regular subset of the syntax, searched
@@ -57,13 +58,29 @@ use crate::{
 ///
 /// # Complexity
 ///
-/// The engine is regex-automata's meta regex with its bounded backtracker
-/// disabled, leaving DFAs, a one-pass DFA and the PikeVM. One search
-/// (`is_match`, `find`, `captures`) takes `O(m * n)` time for a compiled
-/// pattern of size `m` and a haystack of length `n`. Iterators run one search
-/// per match from the end of the previous one, so a complete iteration can take
-/// `O(m * n^2)` in the worst case, as in the `regex` crate; no linear bound is
-/// claimed for whole iterations.
+/// A pattern whose every choice the next character decides is searched by a
+/// one-pass plan: literals, character runs, alternatives and optional or
+/// repeated groups where the characters that can start each alternative,
+/// each further run character and each further repetition differ from those
+/// that can follow instead, as in `\w+`, `"[^"]*"`, `\bfn\s+(\w+)`,
+/// `Holmes|Watson` or `(\d+)(?:\.(\d+))?`. An attempt reads forward from
+/// a candidate start once and never returns to an earlier position or
+/// alternative: where the rest of the pattern could match nothing, a greedy
+/// repetition remembers that position as the match to report if it cannot
+/// continue, as a one-pass DFA does. Attempts may fail only after a bounded
+/// stretch of text where other attempts could start, so a search, and a
+/// whole iteration, takes time linear in the haystack for a given pattern.
+///
+/// Any other pattern uses regex-automata's meta regex with its bounded
+/// backtracker disabled, leaving DFAs, a one-pass DFA and the PikeVM. One
+/// search (`is_match`, `find`, `captures`) takes `O(m * n)` time for a
+/// compiled pattern of size `m` and a haystack of length `n`. Iterators run one
+/// search per match from the end of the previous one, so a complete iteration
+/// can take `O(m * n^2)` in the worst case, as in the `regex` crate; no linear
+/// bound is claimed for whole iterations on this engine.
+///
+/// Either way, construction accepts and rejects exactly the patterns the meta
+/// engine's size limits do, with the same errors.
 ///
 /// # Example
 ///
@@ -84,7 +101,8 @@ use crate::{
 /// ```
 #[derive(Clone)]
 pub struct RegularRegex {
-    inner: RaRegex,
+    /// The meta engine, or a plan, which never backtracks either.
+    engine: WrapEngine,
     pattern: String,
     /// The pattern in regex-automata syntax with word boundaries removed. A
     /// `RegexSet` member converted from this expression uses it to find
@@ -109,6 +127,13 @@ pub struct RegularMatches<'r, 't, S: Input + ?Sized> {
 pub struct RegularCaptureMatches<'r, 't, S: Input + ?Sized>(RegularMatches<'r, 't, S>);
 
 impl RegularRegex {
+    /// Whether searches run on a plan rather than the meta engine. For tests
+    /// and diagnostics, not part of the supported interface.
+    #[doc(hidden)]
+    pub fn planned(&self) -> bool {
+        matches!(self.engine, WrapEngine::Plan(_))
+    }
+
     /// Compile `pattern` with default options.
     ///
     /// # Errors
@@ -140,8 +165,9 @@ impl RegularRegex {
         let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
         let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
         let usage = DelegateUsage::regular_only();
-        let inner = match to_hir::expr_to_hir(&tree.expr, &mut hir_ctx) {
-            Some(hir) => compile_inner_from_hir(&hir, &compile_options, usage)?,
+        let hir = to_hir::expr_to_hir(&tree.expr, &mut hir_ctx);
+        let engine = WrapEngine::new(hir.as_ref(), &compile_options, usage, || match &hir {
+            Some(hir) => compile_inner_from_hir(hir, &compile_options, usage),
             // Translation only fails for input the engine rejects, whose own
             // error is the useful one. Word boundaries have no faithful string
             // form, so they never take this path.
@@ -153,11 +179,11 @@ impl RegularRegex {
                     )
                     .into());
                 }
-                inner
+                Ok(inner)
             }
-        };
+        })?;
         Ok(RegularRegex {
-            inner,
+            engine,
             pattern,
             set_pattern,
             named_groups: Arc::new(tree.named_groups),
@@ -176,7 +202,11 @@ impl RegularRegex {
 
     /// Whether the expression matches within a ranged or anchored input.
     pub fn is_match_input<S: Input + ?Sized>(&self, input: RegexInput<'_, S>) -> bool {
-        !input.is_done() && self.inner.is_match(ra_input(&input))
+        !input.is_done()
+            && match &self.engine {
+                WrapEngine::Plan(plan) => plan_is_match(plan, &input),
+                WrapEngine::Meta(inner) => inner.is_match(ra_input(&input)),
+            }
     }
 
     /// The leftmost-first match in `haystack`.
@@ -227,9 +257,11 @@ impl RegularRegex {
         if input.is_done() {
             return None;
         }
-        let mut locations = self.inner.create_captures();
-        self.inner
-            .search_captures(&ra_input(&input), &mut locations);
+        let mut locations = self.engine.create_captures();
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_captures_into(plan, &input, &mut locations),
+            WrapEngine::Meta(inner) => inner.search_captures(&ra_input(&input), &mut locations),
+        }
         locations.is_match().then(|| Captures {
             inner: CapturesImpl::Wrap {
                 locations,
@@ -258,7 +290,7 @@ impl RegularRegex {
 
     /// The number of capture groups, including the implicit group 0.
     pub fn captures_len(&self) -> usize {
-        self.inner.captures_len()
+        self.engine.captures_len()
     }
 
     /// The names of the capture groups, in group order; `None` for unnamed
@@ -298,9 +330,12 @@ impl RegularRegex {
         if input.is_done() {
             return None;
         }
-        self.inner
-            .search(&ra_input(input))
-            .map(|found| (found.start(), found.end()))
+        match &self.engine {
+            WrapEngine::Plan(plan) => plan_find(plan, input, None),
+            WrapEngine::Meta(inner) => inner
+                .search(&ra_input(input))
+                .map(|found| (found.start(), found.end())),
+        }
     }
 }
 
@@ -349,7 +384,7 @@ impl From<RegularRegex> for Regex {
     fn from(regex: RegularRegex) -> Regex {
         Regex {
             inner: RegexImpl::Wrap {
-                inner: regex.inner,
+                engine: regex.engine,
                 pattern: regex.pattern,
                 explicit_capture_group_0: false,
                 delegated_pattern: regex.set_pattern,

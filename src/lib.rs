@@ -48,6 +48,7 @@ use regex_automata::Anchored as RaAnchored;
 use regex_automata::Input as RaInput;
 use regex_automata::meta::Regex as RaRegex;
 use regex_automata::util::captures::Captures as RaCaptures;
+use regex_automata::util::primitives::NonMaxUsize;
 use regex_automata::util::syntax::Config as SyntaxConfig;
 
 mod analyze;
@@ -61,6 +62,7 @@ mod native;
 mod optimize;
 mod parse;
 mod parse_flags;
+mod plan;
 mod regexset;
 mod regular;
 mod regular_route;
@@ -77,7 +79,8 @@ use crate::compile::{CompileOptions, compile};
 use crate::optimize::optimize;
 use crate::parse::{ExprTree, NamedGroups, Parser};
 use crate::parse_flags::*;
-use crate::regular_route::{Automata, RegularRoute};
+use crate::plan::{NFA_UNIT_BUDGET, Plan, PlanInput};
+use crate::regular_route::{Automata, RegularRoute, RouteEngine};
 use crate::vm::{OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH, Prog};
 
 pub use crate::bytes::MatchBytes;
@@ -116,7 +119,12 @@ pub use crate::seek::seek_pattern_is_useful;
 /// - `\d` matches `[0-9]` only (ASCII)
 /// - `\s` matches ASCII whitespace only
 /// - Unicode properties are **not available**
-/// - Word boundaries (`\b`) use ASCII-only word characters
+/// - Word boundaries (`\b`, `\B`, `\<`, `\>`, the half boundaries, and
+///   `(?-u:\b)` too) are **not** ASCII-only. As in the other modes, a valid
+///   UTF-8 encoding of a Unicode word character counts as a word character, and
+///   any other byte that is not an ASCII word character does not. So in `café x`
+///   there is no boundary between `caf` and `é`, and `\b\w+\b` finds only `x`,
+///   although `\w` alone matches `caf`.
 ///
 /// Use this mode when matching raw binary data or filenames that may contain
 /// non-UTF-8 bytes and you don't need Unicode character classes.
@@ -137,7 +145,8 @@ pub enum BytesMode {
     /// (utf8=true, unicode=true)
     #[default]
     Unicode,
-    /// ASCII bytes mode: `.` matches any byte, character classes are ASCII-only.
+    /// ASCII bytes mode: `.` matches any byte, character classes are ASCII-only,
+    /// word boundaries still use Unicode word characters.
     /// (utf8=false, unicode=false)
     Ascii,
     /// Unicode-aware bytes mode: input can be non-UTF-8, character classes
@@ -177,7 +186,7 @@ pub struct Regex {
 enum RegexImpl {
     // Do we want to box this? It's pretty big...
     Wrap {
-        inner: RaRegex,
+        engine: WrapEngine,
         /// The original pattern which the regex was constructed from
         pattern: String,
         /// Some optimizations avoid the VM, but need to use an extra capture group to represent the match boundaries
@@ -199,6 +208,53 @@ enum RegexImpl {
         /// results cannot differ from the VM's.
         regular: Option<Arc<RegularRoute>>,
     },
+}
+
+/// How a pattern without rich constructs is searched.
+#[derive(Clone)]
+pub(crate) enum WrapEngine {
+    /// regex-automata's meta engine.
+    Meta(RaRegex),
+    /// A pattern whose matches follow one deterministic path: its plan
+    /// gives the meta engine's results, so that engine is not kept.
+    Plan(Arc<Plan>),
+}
+
+impl WrapEngine {
+    /// The plan for `hir` where it has one, else the meta engine
+    /// `build` returns. The meta engine is still built, and dropped, wherever
+    /// explicit size limits or the size of the pattern could make building it
+    /// fail, so compiling reports exactly the errors it did.
+    pub(crate) fn new(
+        hir: Option<&regex_syntax::hir::Hir>,
+        options: &CompileOptions,
+        usage: compile::DelegateUsage,
+        build: impl FnOnce() -> Result<RaRegex>,
+    ) -> Result<WrapEngine> {
+        let Some(plan) = hir.and_then(|hir| Plan::new(hir, usage.prefilter())) else {
+            return build().map(WrapEngine::Meta);
+        };
+        let default_limits =
+            options.delegate_size_limit.is_none() && options.delegate_dfa_size_limit.is_none();
+        if !default_limits || plan.nfa_units() > NFA_UNIT_BUDGET {
+            build()?;
+        }
+        Ok(WrapEngine::Plan(Arc::new(plan)))
+    }
+
+    fn captures_len(&self) -> usize {
+        match self {
+            WrapEngine::Meta(inner) => inner.captures_len(),
+            WrapEngine::Plan(plan) => plan.captures_len(),
+        }
+    }
+
+    fn create_captures(&self) -> RaCaptures {
+        match self {
+            WrapEngine::Meta(inner) => inner.create_captures(),
+            WrapEngine::Plan(plan) => plan.create_captures(),
+        }
+    }
 }
 
 /// A single match of a regex or group in an input text
@@ -1399,13 +1455,20 @@ impl Regex {
             // string path for anything the translator doesn't cover.
             let utf8 = matches!(compile_options.bytes_mode, BytesMode::Unicode);
             let mut hir_ctx = to_hir::HirCtx::new(compile_options.unicode, utf8);
-            let inner = match to_hir::expr_to_hir(&tree.expr, &mut hir_ctx) {
-                Some(hir) => compile::compile_inner_from_hir(&hir, &compile_options, usage)?,
-                None => compile::compile_inner(&re_cooked, &compile_options, usage)?,
-            };
+            let hir = to_hir::expr_to_hir(&tree.expr, &mut hir_ctx);
+            // A plan reports a rewritten capture group zero as group 1, within
+            // fixed slot storage.
+            let planned = hir.as_ref().filter(|hir| {
+                !requires_capture_group_fixup
+                    || 2 * (hir.properties().explicit_captures_len() + 1) <= FIXUP_SLOTS
+            });
+            let engine = WrapEngine::new(planned, &compile_options, usage, || match &hir {
+                Some(hir) => compile::compile_inner_from_hir(hir, &compile_options, usage),
+                None => compile::compile_inner(&re_cooked, &compile_options, usage),
+            })?;
             return Ok(Regex {
                 inner: RegexImpl::Wrap {
-                    inner,
+                    engine,
                     pattern,
                     explicit_capture_group_0: requires_capture_group_fixup,
                     delegated_pattern: re_cooked,
@@ -1432,13 +1495,14 @@ impl Regex {
             },
         )?;
         let n_groups = info.end_group();
-        let regular = if requires_capture_group_fixup
-            || options.explicit_backtrack_limit
-            || prog.repeats_empty_matches()
-        {
+        let regular = if options.explicit_backtrack_limit || prog.repeats_empty_matches() {
             None
+        } else if requires_capture_group_fixup {
+            assertion_route(&pattern, flags, options, n_groups).map(Arc::new)
         } else {
-            word_boundary_automata(&tree.expr, options, n_groups).map(Arc::new)
+            word_boundary_automata(&tree.expr, options, n_groups)
+                .or_else(|| assertion_route(&pattern, flags, options, n_groups))
+                .map(Arc::new)
         };
         Ok(Regex {
             #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
@@ -1539,13 +1603,11 @@ impl Regex {
         input: RegexInput<'_, S>,
     ) -> Result<bool> {
         match &self.inner {
-            RegexImpl::Wrap { inner, .. } => {
-                if input.is_done() {
-                    Ok(false)
-                } else {
-                    Ok(inner.is_match(ra_input(&input)))
-                }
-            }
+            RegexImpl::Wrap { engine, .. } => Ok(!input.is_done()
+                && match engine {
+                    WrapEngine::Plan(plan) => plan_is_match(plan, &input),
+                    WrapEngine::Meta(inner) => inner.is_match(ra_input(&input)),
+                }),
             RegexImpl::Fancy { .. } => self.fancy_is_match(&input, false, None),
         }
     }
@@ -1562,13 +1624,21 @@ impl Regex {
         if input.is_done() {
             return Ok(false);
         }
-        if let Some(route) = self.regular_route(input)
-            && let Ok(found) = route.is_match(
-                &ra_input(input),
-                cache.as_deref_mut().and_then(|cache| cache.route(route)),
-            )
-        {
-            return Ok(found);
+        if let Some(route) = self.regular_route(input) {
+            if let Some(found) = route
+                .plan()
+                .and_then(|plan| plan.is_match(&plan_input(input)))
+            {
+                return Ok(found);
+            }
+            if let Some(automata) = route.automata()
+                && let Ok(found) = automata.is_match(
+                    &ra_input(input),
+                    cache.as_deref_mut().and_then(|cache| cache.route(automata)),
+                )
+            {
+                return Ok(found);
+            }
         }
         if whole_text && let Some(found) = self.native_match(input.haystack()) {
             return Ok(found);
@@ -1576,8 +1646,8 @@ impl Regex {
         Ok(self.find_on_vm(input, 0, cache)?.is_some())
     }
 
-    /// The automata of a word-boundary pattern, when they report exactly what
-    /// the VM would for `input`:
+    /// The route of a word-boundary pattern, when its automata report exactly
+    /// what the VM would for `input`:
     ///
     /// - The range must end at the end of the haystack. The VM matches over
     ///   the whole haystack and rejects a match that ends past the range,
@@ -1590,11 +1660,12 @@ impl Regex {
     ///   the automata would not.
     ///
     /// The route's lazy DFAs can still give up on non-ASCII text, leaving the
-    /// search to the VM. The automata are built here on first use.
+    /// search to the VM; its plan, if any, answers only where they
+    /// would not. The route's engine is decided and built here on first use.
     pub(crate) fn regular_route<S: input::Input + ?Sized>(
         &self,
         input: &RegexInput<'_, S>,
-    ) -> Option<&Automata> {
+    ) -> Option<&RouteEngine> {
         let RegexImpl::Fancy {
             regular: Some(route),
             ..
@@ -1608,7 +1679,7 @@ impl Regex {
                 || haystack
                     .as_utf8()
                     .is_some_and(|text| text.is_char_boundary(input.effective_start())));
-        if eligible { route.automata() } else { None }
+        eligible.then(|| route.engine())
     }
 
     /// Returns an iterator for each successive non-overlapping match in `text`.
@@ -1719,13 +1790,21 @@ impl Regex {
         if input.is_done() {
             return Ok(None);
         }
-        if let Some(route) = self.regular_route(input)
-            && let Ok(found) = route.find(
-                &ra_input(input),
-                cache.as_deref_mut().and_then(|cache| cache.route(route)),
-            )
-        {
-            return Ok(found);
+        if let Some(route) = self.regular_route(input) {
+            if let Some(found) = route
+                .plan()
+                .and_then(|plan| plan.find::<[usize]>(&plan_input(input), None))
+            {
+                return Ok(found);
+            }
+            if let Some(automata) = route.automata()
+                && let Ok(found) = automata.find(
+                    &ra_input(input),
+                    cache.as_deref_mut().and_then(|cache| cache.route(automata)),
+                )
+            {
+                return Ok(found);
+            }
         }
         self.find_on_vm(input, option_flags, cache)
     }
@@ -1739,7 +1818,17 @@ impl Regex {
     ) -> Result<Option<(usize, usize)>> {
         match &self.inner {
             RegexImpl::Wrap {
-                inner,
+                engine: WrapEngine::Plan(plan),
+                explicit_capture_group_0,
+                ..
+            } => {
+                if !*explicit_capture_group_0 {
+                    return Ok(plan_find(plan, input, None));
+                }
+                Ok(plan_find_rewritten(plan, input))
+            }
+            RegexImpl::Wrap {
+                engine: WrapEngine::Meta(inner),
                 explicit_capture_group_0,
                 ..
             } => {
@@ -1787,7 +1876,10 @@ impl Regex {
                     None => vm::run_spans(prog, input, option_flags, options),
                 };
                 match found {
-                    Err(error) => match limit_recovery(self.regular_route(input), &error) {
+                    Err(error) => match limit_recovery(
+                        self.regular_route(input).and_then(RouteEngine::automata),
+                        &error,
+                    ) {
                         Some((route, regex)) => Ok(regular_find(
                             regex,
                             &ra_input(input),
@@ -1975,6 +2067,13 @@ impl Regex {
                 input: haystack,
             })
         };
+        if let Some(locations) = route
+            .and_then(RouteEngine::plan)
+            .and_then(|plan| plan.captures(&plan_input(input)))
+        {
+            return Ok(routed(locations));
+        }
+        let route = route.and_then(RouteEngine::automata);
         if let Some(route) = route
             && let Some(regex) = route.regex()
             && let Ok(found) = route.find(
@@ -1994,7 +2093,23 @@ impl Regex {
         }
         match &self.inner {
             RegexImpl::Wrap {
-                inner,
+                engine: WrapEngine::Plan(plan),
+                explicit_capture_group_0,
+                ..
+            } => {
+                let mut locations = plan.create_captures();
+                plan_captures_into(plan, input, &mut locations);
+                Ok(locations.is_match().then_some(Captures {
+                    inner: CapturesImpl::Wrap {
+                        locations,
+                        explicit_capture_group_0: *explicit_capture_group_0,
+                    },
+                    named_groups,
+                    input: haystack,
+                }))
+            }
+            RegexImpl::Wrap {
+                engine: WrapEngine::Meta(inner),
                 explicit_capture_group_0,
                 ..
             } => {
@@ -2083,10 +2198,10 @@ impl Regex {
     pub fn captures_len(&self) -> usize {
         match &self.inner {
             RegexImpl::Wrap {
-                inner,
+                engine,
                 explicit_capture_group_0,
                 ..
-            } => inner.captures_len() - if *explicit_capture_group_0 { 1 } else { 0 },
+            } => engine.captures_len() - if *explicit_capture_group_0 { 1 } else { 0 },
             RegexImpl::Fancy { n_groups, .. } => *n_groups,
         }
     }
@@ -2096,11 +2211,11 @@ impl Regex {
     pub fn capture_locations(&self) -> CaptureLocations {
         let slots = match &self.inner {
             RegexImpl::Wrap {
-                inner,
+                engine,
                 explicit_capture_group_0,
                 ..
             } => CapturesImpl::Wrap {
-                locations: inner.create_captures(),
+                locations: engine.create_captures(),
                 explicit_capture_group_0: *explicit_capture_group_0,
             },
             RegexImpl::Fancy { n_groups, .. } => CapturesImpl::Fancy {
@@ -2130,6 +2245,22 @@ impl Regex {
             return Ok(false);
         }
         let route = self.regular_route(input);
+        if let (Some(plan), CapturesImpl::Fancy { saves }) =
+            (route.and_then(RouteEngine::plan), &mut locations.slots)
+        {
+            saves.clear();
+            saves.resize(plan.slot_len(), usize::MAX);
+            match plan.find(&plan_input(input), Some(&mut saves[..])) {
+                Some(Some(_)) => return Ok(true),
+                Some(None) => {
+                    saves.clear();
+                    return Ok(false);
+                }
+                // The automata and the VM below refill `saves`.
+                None => {}
+            }
+        }
+        let route = route.and_then(RouteEngine::automata);
         if let (Some(route), CapturesImpl::Fancy { saves }) = (route, &mut locations.slots)
             && let Some(regex) = route.regex()
             && let Ok(found) = route.find(
@@ -2146,7 +2277,23 @@ impl Regex {
             return Ok(regular_captures_into(regex, &span, meta, saves));
         }
         match (&self.inner, &mut locations.slots) {
-            (RegexImpl::Wrap { inner, .. }, CapturesImpl::Wrap { locations, .. }) => {
+            (
+                RegexImpl::Wrap {
+                    engine: WrapEngine::Plan(plan),
+                    ..
+                },
+                CapturesImpl::Wrap { locations, .. },
+            ) => {
+                plan_captures_into(plan, input, locations);
+                Ok(locations.is_match())
+            }
+            (
+                RegexImpl::Wrap {
+                    engine: WrapEngine::Meta(inner),
+                    ..
+                },
+                CapturesImpl::Wrap { locations, .. },
+            ) => {
                 let delegated_input = ra_input(input);
                 match cache.and_then(searcher::Cache::regular) {
                     Some((cache, _)) => {
@@ -2201,6 +2348,22 @@ impl Regex {
     /// Returns an iterator over the capture names.
     pub fn capture_names(&self) -> CaptureNames<'_> {
         capture_names_of(&self.named_groups, self.captures_len())
+    }
+
+    /// Whether searches run on a plan: the whole pattern's, or the route's of
+    /// a pattern that needs the VM only for word boundaries, for the searches
+    /// the route takes. For tests and diagnostics, not part of the supported
+    /// interface.
+    #[doc(hidden)]
+    pub fn planned(&self) -> bool {
+        match &self.inner {
+            RegexImpl::Wrap { engine, .. } => matches!(engine, WrapEngine::Plan(_)),
+            RegexImpl::Fancy {
+                regular: Some(route),
+                ..
+            } => route.engine().plan().is_some(),
+            RegexImpl::Fancy { .. } => false,
+        }
     }
 
     // for debugging only
@@ -2542,7 +2705,108 @@ fn word_boundary_automata(
         compile::DelegateUsage::unanchored_no_prefilter()
     };
     let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
-    Some(RegularRoute::new(hir, compile_options, usage, ascii))
+    Some(RegularRoute::new(hir, compile_options, usage, ascii, None))
+}
+
+/// A route to a plan for a regular pattern between fixed-width lookbehinds
+/// at its start and lookaheads at its end, or `None`. It is built from the
+/// pattern as written, before the optimizer turns a final lookahead into a
+/// rewritten capture group zero, so its groups are those `Regex` reports.
+fn assertion_route(
+    pattern: &str,
+    flags: u32,
+    options: &RegexOptions,
+    n_groups: usize,
+) -> Option<RegularRoute> {
+    if regular::rich_option(options).is_some() {
+        return None;
+    }
+    let tree = Expr::parse_tree_with_flags(pattern, flags).ok()?;
+    let Expr::Concat(children) = &tree.expr else {
+        return None;
+    };
+    // Assertions next to the lookarounds test the same position, so they
+    // stay with the core, at its edges.
+    let edge = |child: &&Expr, kinds: [LookAround; 2]| match child {
+        Expr::LookAround(_, kind) => kinds.contains(kind),
+        Expr::Assertion(_) => true,
+        _ => false,
+    };
+    let front = children
+        .iter()
+        .take_while(|child| edge(child, [LookAround::LookBehind, LookAround::LookBehindNeg]))
+        .count();
+    let back = children[front..]
+        .iter()
+        .rev()
+        .take_while(|child| edge(child, [LookAround::LookAhead, LookAround::LookAheadNeg]))
+        .count();
+    let is_lookaround = |child: &&Expr| matches!(child, Expr::LookAround(..));
+    let (behind, ahead): (Vec<&Expr>, Vec<&Expr>) = (
+        children[..front].iter().filter(is_lookaround).collect(),
+        children[children.len() - back..]
+            .iter()
+            .filter(is_lookaround)
+            .collect(),
+    );
+    if behind.len() + ahead.len() == 0 || front + back == children.len() {
+        return None;
+    }
+    // Lookarounds anywhere between the edges stay in the core, which then
+    // has a rich construct.
+    let middle = &children[front..children.len() - back];
+    let core = Expr::Concat(
+        children[..front]
+            .iter()
+            .filter(|child| !is_lookaround(child))
+            .chain(middle)
+            .chain(
+                children[children.len() - back..]
+                    .iter()
+                    .filter(|child| !is_lookaround(child)),
+            )
+            .cloned()
+            .collect(),
+    );
+    if regular::rich_construct(&core).is_some() {
+        return None;
+    }
+    let unicode = options.syntaxc.get_unicode() && !matches!(options.bytes_mode, BytesMode::Ascii);
+    let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+    let hir = to_hir::expr_to_hir(&core, &mut to_hir::HirCtx::new(unicode, utf8))
+        .filter(|hir| hir.properties().explicit_captures_len() + 1 == n_groups)?;
+    let lookaround = |child: &Expr| {
+        let Expr::LookAround(body, kind) = child else {
+            return None;
+        };
+        let negated = matches!(kind, LookAround::LookAheadNeg | LookAround::LookBehindNeg);
+        let body = to_hir::expr_to_hir(body, &mut to_hir::HirCtx::new(unicode, utf8))?;
+        plan::Edge::new(&body, negated)
+    };
+    let edges = plan::Edges {
+        behind: behind.into_iter().map(lookaround).collect::<Option<_>>()?,
+        ahead: ahead.into_iter().map(lookaround).collect::<Option<_>>()?,
+    };
+    let compile_options = CompileOptions {
+        bytes_mode: options.bytes_mode,
+        unicode,
+        delegate_size_limit: options.delegate_size_limit,
+        delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+        ..CompileOptions::default()
+    };
+    let usage = if options.delegate_prefilter {
+        compile::DelegateUsage::unanchored()
+    } else {
+        compile::DelegateUsage::unanchored_no_prefilter()
+    };
+    let ascii = matches!(options.bytes_mode, BytesMode::Ascii);
+    Some(RegularRoute::new(
+        hir,
+        compile_options,
+        usage,
+        ascii,
+        Some(edges),
+    ))
 }
 
 /// The route and meta engine that answer a routed search after the VM itself
@@ -2570,6 +2834,7 @@ type RegularCache<'c> = Option<(&'c mut regex_automata::meta::Cache, &'c mut RaC
 
 /// The leftmost-first match span of an ordinary engine, through a searcher's
 /// cache when there is one.
+#[inline]
 fn regular_find(
     regex: &RaRegex,
     input: &RaInput<'_>,
@@ -2714,6 +2979,7 @@ where
 
 /// The `regex-automata` input for a search: same haystack, range, start and
 /// anchoring, so every entry point of an ordinary pattern agrees.
+#[inline]
 fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInput<'a> {
     let mut ra_input = RaInput::new(input.haystack().as_bytes()).range(input.get_range());
     ra_input.set_start(input.effective_start());
@@ -2721,6 +2987,60 @@ fn ra_input<'a, S: input::Input + ?Sized>(input: &'a RegexInput<'a, S>) -> RaInp
         ra_input.set_anchored(RaAnchored::Yes);
     }
     ra_input
+}
+
+/// The most capture slots a plan for a pattern with a rewritten capture
+/// group zero may have, so that a search for its span needs no allocation.
+const FIXUP_SLOTS: usize = 32;
+
+/// Where a plan searches `input`, which must not be done: the same
+/// span and anchoring as [`ra_input`].
+fn plan_input<'h, S: input::Input + ?Sized>(input: &RegexInput<'h, S>) -> PlanInput<'h> {
+    let haystack = input.haystack();
+    PlanInput {
+        haystack: haystack.as_bytes(),
+        start: input.effective_start(),
+        end: input.get_range().end,
+        anchored: input.is_anchored(),
+        utf8: haystack.as_utf8().is_some(),
+    }
+}
+
+/// A plan's leftmost-first span in `input`, which must not be done.
+fn plan_find<S: input::Input + ?Sized>(
+    plan: &Plan,
+    input: &RegexInput<'_, S>,
+    slots: Option<&mut [Option<NonMaxUsize>]>,
+) -> Option<(usize, usize)> {
+    plan.find(&plan_input(input), slots)
+}
+
+/// The span of a plan for a pattern whose final lookahead the optimizer
+/// consumed: group 1 holds the match. Kept out of line, so that the common
+/// search keeps its small frame.
+#[inline(never)]
+fn plan_find_rewritten<S: input::Input + ?Sized>(
+    plan: &Plan,
+    input: &RegexInput<'_, S>,
+) -> Option<(usize, usize)> {
+    let mut slots = [usize::MAX; FIXUP_SLOTS];
+    let found = plan.find(&plan_input(input), Some(&mut slots[..plan.slot_len()]));
+    found.and((slots[2] != usize::MAX).then_some((slots[2], slots[3])))
+}
+
+/// Whether a plan matches in `input`, which must not be done.
+fn plan_is_match<S: input::Input + ?Sized>(plan: &Plan, input: &RegexInput<'_, S>) -> bool {
+    plan.is_match(&plan_input(input))
+}
+
+/// Fill regex-automata capture storage from a plan's search.
+fn plan_captures_into<S: input::Input + ?Sized>(
+    plan: &Plan,
+    input: &RegexInput<'_, S>,
+    locations: &mut RaCaptures,
+) {
+    let found = plan_find(plan, input, Some(locations.slots_mut())).is_some();
+    locations.set_pattern(found.then_some(regex_automata::PatternID::ZERO));
 }
 
 impl TryFrom<&str> for Regex {
@@ -3889,7 +4209,7 @@ mod tests {
             RegexImpl::Fancy {
                 regular: Some(route),
                 ..
-            } => route.automata().is_some(),
+            } => route.engine().automata().is_some(),
             _ => false,
         }
     }
@@ -4036,7 +4356,7 @@ mod tests {
         let regex = Regex::new(r"\b(?:a|a)+\b!").unwrap();
         let find = |text: &str| {
             let input = RegexInput::new(text);
-            let route = regex.regular_route(&input).unwrap();
+            let route = regex.regular_route(&input).unwrap().automata().unwrap();
             (
                 route.find(&crate::ra_input(&input), None).is_err(),
                 route.is_match(&crate::ra_input(&input), None).is_err(),
@@ -4044,6 +4364,43 @@ mod tests {
         };
         assert_eq!(find("aaaa a!"), (false, false));
         assert_eq!(find("aaaaé"), (true, true));
+    }
+
+    /// A route's plan answers every search on valid UTF-8, where its Unicode
+    /// word boundaries are the VM's, including text where the automata would
+    /// give up. In ASCII mode it answers only the searches the automata would:
+    /// those reading only ASCII bytes, without alternatives or groups, which
+    /// can read past the match.
+    #[test]
+    fn regular_route_plan_answers_on_utf8_and_defers_in_ascii_mode() {
+        let answered = |pattern: &str, text: &str| {
+            let regex = Regex::new(pattern).unwrap();
+            let input = RegexInput::new(text);
+            let plan = regex.regular_route(&input).unwrap().plan().unwrap();
+            plan.find::<[usize]>(&crate::plan_input(&input), None)
+        };
+        assert_eq!(answered(r"\b\w+\b", "ab cd"), Some(Some((0, 2))));
+        assert_eq!(answered(r"\b\w+\b", "ab é"), Some(Some((0, 2))));
+        assert_eq!(answered(r"\b\w+\b", "ab\u{e9}"), Some(Some((0, 4))));
+        assert_eq!(answered(r"\b\w+\b", "\u{e9}\u{e9} x"), Some(Some((0, 4))));
+        assert_eq!(answered(r"\b\w+!", "\u{e9}\u{e9}"), Some(None));
+        assert_eq!(answered(r"\b(?:fn|let)\b", "é let"), Some(Some((3, 6))));
+        // Word boundaries stay Unicode's in ASCII mode, where the VM steps
+        // one byte at a time.
+        let ascii = |pattern: &str, text: &[u8]| {
+            let regex = RegexBuilder::new(pattern)
+                .bytes_mode(crate::BytesMode::Ascii)
+                .build()
+                .unwrap();
+            let input = RegexInput::new(text);
+            let plan = regex.regular_route(&input).unwrap().plan().unwrap();
+            plan.find::<[usize]>(&crate::plan_input(&input), None)
+        };
+        // The automata may read one byte past the match; that byte is checked too.
+        assert_eq!(ascii(r"\bfn\b", b"x fn  \xFF"), Some(Some((2, 4))));
+        assert_eq!(ascii(r"\bfn\b", b"x fn \xFF"), None);
+        assert_eq!(ascii(r"\bfn\b", b"\xFF fn"), None);
+        assert_eq!(ascii(r"\b(?:fn|let)\b", b"x fn  "), None);
     }
 
     #[test]

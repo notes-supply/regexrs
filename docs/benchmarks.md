@@ -26,6 +26,26 @@ The toolchain is the project's Mise configuration. Runner dependencies are
 pinned in `benchmarks/runner/Cargo.lock`: regex 1.13.1, fancy-regex 0.19.2 and
 resharp 0.7.5. Earlier comparisons against fancy-regex 0.19.1 are historical.
 
+### Revision comparisons
+
+`mise run bench:rebar:compare -- LABEL=COMMIT LABEL=COMMIT ...` freezes committed
+sources and compares them on one CPU with the same adapter, fixtures and lock.
+Use full commit IDs. Results and verification logs go to
+`.benchmark-results/comparison/`; use a fresh output directory for each run.
+
+The default quick mode uses the 18 representative cases in
+`benchmarks/quick-cases.txt`, with five rotated repetitions. It covers construction,
+first use, Unicode, captures, replacement, misses and backreferences. Set
+`BENCH_MODE=full` for every workload and the requested revisions. Quick mode is a
+regression signal, not complete coverage or an overall engine ranking.
+
+The benchmark workflow defaults to quick mode for benchmark-branch pushes; its
+manual `mode` input selects quick or full. It caches tools and Rust dependencies,
+not measured answers. The selected library is rebuilt to prevent backdated
+archived sources from reusing stale product code. All verification and timed
+operations still run. Hosted-VM results are relative comparisons; do not combine
+their absolute times with measurements from another machine.
+
 ## Correctness gates
 
 Nothing is timed until `verify.sh` passes for every row:
@@ -57,6 +77,10 @@ terminators.
 counting the participating groups of its first match. It is the record
 extraction case where caller-owned capture storage matters, and is only
 compared within `definitions/scratch.toml`.
+
+`replace` applies `<$0>` to every match; `replace-capture` applies `[${1}]`.
+They count output bytes, with complete replacement bytes checked against Fancy
+Regex before timing. Both include construction of the replacement result.
 
 Two prefixes time a regex's first use with any of these models:
 
@@ -90,7 +114,7 @@ A gap between the two kinds reflects the API choice, not engine speed.
 | `regexrs-native` | `Regex` with the `native` feature; boolean searches only |
 | `regexrs-searcher` | `Regex` through one reused `Searcher` and `CaptureLocations` |
 | `regexrs-seek` | `Regex` with its opt-in seek prefilter, `seek(true)`, and native code disabled; the same methods as `regexrs` |
-| `regexrs-regular` | `RegularRegex`: no backtracking, regex-automata's bounded backtracker disabled |
+| `regexrs-regular` | `RegularRegex`: no backtracking; a plan, or regex-automata with its bounded backtracker disabled |
 | `regex` | regex 1.13.1, defaults |
 | `fancy` | fancy-regex 0.19.2, defaults |
 | `fancy-seek` | fancy-regex with its opt-in seek prefilter |
@@ -119,8 +143,19 @@ All rows use Unicode mode.
   words before `!`, Rust raw strings and method calls.
   A whole-text search for the miss `\b(\w+) \1 \1\b` exceeds the default
   backtrack limit in regexrs and fancy-regex alike, so that row is per line.
-- `regular.toml`: `RegularRegex` against `Regex` and the regex crate.
+- `regular.toml`: `RegularRegex` against `Regex` and the regex crate, with
+  regexrs-searcher for retained captures and per-line booleans. Families cover:
+  - dense class runs (ASCII, Cyrillic and Han)
+  - quoted fields, literal sets and alternation
+  - Unicode word boundaries and case folding
+  - finite repeats (log dates and UUIDs), anchors and multi-line lines
+  - greedy and lazy runs, word-bounded runs and folded literals
+  - captured log records
+
+  Each family also has `compile`, `fresh-MODEL`, `startup-MODEL` and warmed rows
+  on a one-line store, a hundred-line store and whole haystacks.
 - `scratch.toml`: `Searcher` and `CaptureLocations` against plain calls.
+- `operations.toml`: replacement output and failed short-run searches.
 - `edge.toml`: small checked-in fixtures for empty matches at UTF-8
   boundaries, unmatched versus empty groups, and case folds of different
   UTF-8 widths.
@@ -136,8 +171,8 @@ All rows use Unicode mode.
   controls, where fancy delegates the whole pattern and seek does nothing.
   regexrs-regular, regex and resharp only appear where their semantics match.
 
-The suite has 76 definitions and 351 engine rows; the 219 `planning/` rows can
-be selected or excluded with Rebar's `-f`/`-F '^planning/'`.
+The suite has 121 definitions and 518 engine rows. The 219 `planning/` rows
+and the 128 `regular/` rows can be selected or excluded with Rebar's `-f`/`-F`.
 
 ### Comparing revisions
 
@@ -151,6 +186,7 @@ mise run bench:rebar:revision build /tmp/base 9ebb13d
 mise run bench:rebar:revision build "$PWD" candidate
 mise run bench:rebar:revision verify 9ebb13d
 mise run bench:rebar:revision verify candidate
+mise run bench:rebar:revision verify candidate '^regular/'   # any row filter
 cd benchmarks
 taskset -c 2 target/release/rebar measure -d target/planning/9ebb13d/suite \
   -f '^planning/' > base.csv
@@ -167,10 +203,11 @@ Alternate the revision order across repeated runs.
 
 - From the pinned Rebar checkout, not redistributed here:
   - `sherlock.txt`, *The Adventures of Sherlock Holmes* from Project Gutenberg, public domain.
-  - `opensubtitles/ru-sampled.txt`, a sample of the OPUS OpenSubtitles 2018 corpus.
+  - `opensubtitles/ru-sampled.txt` and `opensubtitles/zh-sampled.txt`, samples of the OPUS OpenSubtitles 2018 corpus.
   - `rust-src-tools-3b0d4813.txt`, Rust project source, MIT/Apache-2.0.
   - `wild/unstructured-to-json.log` and its regex, from a public regex discussion; see Rebar's `curated/11-unstructured-to-json.toml`.
-- Checked in: `haystacks/synthetic/` holds three small hand-written fixtures.
+- Checked in: `haystacks/synthetic/` holds hand-written fixtures and generated
+  replacement and short-run inputs.
 
 Expected counts come from the oracle. The regex crate agrees on every regular
 row, and resharp on its rows.
