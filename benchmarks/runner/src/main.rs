@@ -458,7 +458,10 @@ fn replacement<'a>(
         Engine::RegexrsRegular(re) => re.replace_all(text, template),
         Engine::Regex(re) => re.replace_all(text, template),
         Engine::Fancy(re) | Engine::FancySeek(re) => re.try_replacen(text, 0, template)?,
-        _ => bail!("replacement model requires an engine with a replacement API"),
+        Engine::RegexrsSearcher(_) => bail!(
+            "the retained Searcher adapter has no replacement API; use regexrs for Regex::try_replace_all"
+        ),
+        Engine::Resharp(_) => bail!("replacement model requires an engine with a replacement API"),
     })
 }
 
@@ -733,6 +736,17 @@ mod tests {
         let mut workload = Workload::new(&engine, "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!");
         assert!(workload.run(&b.model).is_err());
         assert!(workload.run("first-captures-per-line").is_err());
+    }
+
+    #[test]
+    fn retained_searcher_replacement_reports_unsupported_adapter() {
+        let b = benchmark("Holmes|Watson", "replace", "Holmes and Watson");
+        let error = verify("regexrs-searcher", &b).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("use regexrs for Regex::try_replace_all")
+        );
     }
 
     /// The per-record capture path, including `captures_read` into retained

@@ -51,6 +51,10 @@ verify)
         "$rebar" klv -d "$suite" "$name" | "$runner" "$engine" --verify
         rows=$((rows + 1))
     done < <("$rebar" measure -d "$suite" --list -f "$filter")
+    if ((rows == 0)); then
+        printf 'Verification filter %q selected no rows.\n' "$filter" >&2
+        exit 1
+    fi
     printf 'Verified spans and captures for %s rows.\n' "$rows"
     "$rebar" measure -d "$suite" -f "$filter" -t
     ;;
