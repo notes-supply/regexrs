@@ -155,6 +155,7 @@ All rows use Unicode mode.
   Each family also has `compile`, `fresh-MODEL`, `startup-MODEL` and warmed rows
   on a one-line store, a hundred-line store and whole haystacks.
 - `scratch.toml`: `Searcher` and `CaptureLocations` against plain calls.
+- `operations.toml`: replacement output and failed short-run searches.
 - `edge.toml`: small checked-in fixtures for empty matches at UTF-8
   boundaries, unmatched versus empty groups, and case folds of different
   UTF-8 widths.
@@ -170,7 +171,7 @@ All rows use Unicode mode.
   controls, where fancy delegates the whole pattern and seek does nothing.
   regexrs-regular, regex and resharp only appear where their semantics match.
 
-The suite has 112 definitions and 464 engine rows. The 219 `planning/` rows
+The suite has 121 definitions and 518 engine rows. The 219 `planning/` rows
 and the 128 `regular/` rows can be selected or excluded with Rebar's `-f`/`-F`.
 
 ### Comparing revisions
@@ -205,7 +206,8 @@ Alternate the revision order across repeated runs.
   - `opensubtitles/ru-sampled.txt` and `opensubtitles/zh-sampled.txt`, samples of the OPUS OpenSubtitles 2018 corpus.
   - `rust-src-tools-3b0d4813.txt`, Rust project source, MIT/Apache-2.0.
   - `wild/unstructured-to-json.log` and its regex, from a public regex discussion; see Rebar's `curated/11-unstructured-to-json.toml`.
-- Checked in: `haystacks/synthetic/` holds three small hand-written fixtures.
+- Checked in: `haystacks/synthetic/` holds hand-written fixtures and generated
+  replacement and short-run inputs.
 
 Expected counts come from the oracle. The regex crate agrees on every regular
 row, and resharp on its rows.
