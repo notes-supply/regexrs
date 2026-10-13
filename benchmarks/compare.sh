@@ -31,6 +31,12 @@ fi
 
 [[ $# -ge 2 ]] || { echo 'usage: compare.sh LABEL=COMMIT LABEL=COMMIT ...' >&2; exit 2; }
 [[ -z ${RUSTFLAGS:-} ]] || { echo 'Unexpected RUSTFLAGS' >&2; exit 2; }
+mode=${BENCH_MODE:-full}
+case "$mode" in
+quick) filter="^($(paste -sd '|' quick-cases.txt))$" ;;
+full) filter='.' ;;
+*) echo 'BENCH_MODE must be quick or full' >&2; exit 2 ;;
+esac
 labels=()
 commits=()
 for input in "$@"; do
@@ -55,7 +61,7 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 cpu=$(awk '/Cpus_allowed_list/ { split($2, parts, /[-,]/); print parts[1] }' /proc/self/status)
 [[ $cpu =~ ^[0-9]+$ ]]
 {
-    printf 'source=%s\ncpu=%s\nrepetitions=5\nmax-time=100ms\nwarmup=50ms\n' "$(git rev-parse HEAD)" "$cpu"
+    printf 'source=%s\nmode=%s\nfilter=%s\ncpu=%s\nrepetitions=5\nmax-time=100ms\nwarmup=50ms\n' "$(git rev-parse HEAD)" "$mode" "$filter" "$cpu"
     printf 'runner=%s\n' "${RUNNER_NAME:-local}"
     printf 'hosted-VM results are relative comparisons, not historical Aeolus timings\n'
     rustc -Vv
@@ -89,8 +95,13 @@ for index in "${!labels[@]}"; do
     gate "$label-build" bash revision.sh build "$out/sources/$label" "$label"
     gate "$label-runner-tests" env CARGO_TARGET_DIR="$here/target/planning/cargo" \
         cargo test --locked --release --features native --manifest-path "target/planning/$label/adapter/Cargo.toml"
-    gate "$label-verify" bash revision.sh verify "$label" '.'
-    target/release/rebar measure -d "target/planning/$label/suite" --list > "$out/$label-rows.csv"
+    gate "$label-verify" bash revision.sh verify "$label" "$filter"
+    target/release/rebar measure -d "target/planning/$label/suite" --list -f "$filter" > "$out/$label-rows.csv"
+    if [[ $mode == quick ]]; then
+        LC_ALL=C sort quick-cases.txt > "$out/expected-workloads.txt"
+        cut -d, -f1 "$out/$label-rows.csv" | LC_ALL=C sort -u > "$out/$label-workloads.txt"
+        cmp "$out/expected-workloads.txt" "$out/$label-workloads.txt"
+    fi
     cmp "$out/${labels[0]}-rows.csv" "$out/$label-rows.csv"
     sha256sum "target/planning/$label/regexrs-rebar-runner" >> "$out/binaries.sha256"
 done
@@ -118,7 +129,7 @@ for ((repetition = 0; repetition < 5; repetition++)); do
             measured="$out/$name.csv"
             gate "$name" taskset -c "$cpu" target/release/rebar measure \
                 -d "target/planning/$label/suite" -e "^$engine$" \
-                --max-time 100ms --max-warmup-time 50ms --max-iters 10000000
+                -f "$filter" --max-time 100ms --max-warmup-time 50ms --max-iters 10000000
             cp "$out/logs/$name.stdout" "$measured"
             check_batch "$out/$label-rows.csv" "$measured" "$engine"
             awk -v label="$label" -v repetition="$((repetition + 1))" \
