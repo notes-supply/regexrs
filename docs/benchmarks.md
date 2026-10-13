@@ -26,6 +26,26 @@ The toolchain is the project's Mise configuration. Runner dependencies are
 pinned in `benchmarks/runner/Cargo.lock`: regex 1.13.1, fancy-regex 0.19.2 and
 resharp 0.7.5. Earlier comparisons against fancy-regex 0.19.1 are historical.
 
+### Revision comparisons
+
+`mise run bench:rebar:compare -- LABEL=COMMIT LABEL=COMMIT ...` freezes committed
+sources and compares them on one CPU with the same adapter, fixtures and lock.
+Use full commit IDs. Results and verification logs go to
+`.benchmark-results/comparison/`; use a fresh output directory for each run.
+
+The default quick mode uses the 18 representative cases in
+`benchmarks/quick-cases.txt`, with five rotated repetitions. It covers construction,
+first use, Unicode, captures, replacement, misses and backreferences. Set
+`BENCH_MODE=full` for every workload and the requested revisions. Quick mode is a
+regression signal, not complete coverage or an overall engine ranking.
+
+The benchmark workflow defaults to quick mode for benchmark-branch pushes; its
+manual `mode` input selects quick or full. It caches tools and Rust dependencies,
+not measured answers. The selected library is rebuilt to prevent backdated
+archived sources from reusing stale product code. All verification and timed
+operations still run. Hosted-VM results are relative comparisons; do not combine
+their absolute times with measurements from another machine.
+
 ## Correctness gates
 
 Nothing is timed until `verify.sh` passes for every row:
@@ -57,6 +77,10 @@ terminators.
 counting the participating groups of its first match. It is the record
 extraction case where caller-owned capture storage matters, and is only
 compared within `definitions/scratch.toml`.
+
+`replace` applies `<$0>` to every match; `replace-capture` applies `[${1}]`.
+They count output bytes, with complete replacement bytes checked against Fancy
+Regex before timing. Both include construction of the replacement result.
 
 Two prefixes time a regex's first use with any of these models:
 

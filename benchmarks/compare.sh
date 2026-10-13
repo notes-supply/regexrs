@@ -31,7 +31,7 @@ fi
 
 [[ $# -ge 2 ]] || { echo 'usage: compare.sh LABEL=COMMIT LABEL=COMMIT ...' >&2; exit 2; }
 [[ -z ${RUSTFLAGS:-} ]] || { echo 'Unexpected RUSTFLAGS' >&2; exit 2; }
-mode=${BENCH_MODE:-full}
+mode=${BENCH_MODE:-quick}
 case "$mode" in
 quick) filter="^($(paste -sd '|' quick-cases.txt))$" ;;
 full) filter='.' ;;

@@ -102,7 +102,7 @@ dir = "{{config_root}}/benchmarks"
 run = "target/release/rebar measure -d rebar --max-time 50ms --max-warmup-time 10ms --max-iters 50 --max-warmup-iters 5"
 
 [tasks."bench:rebar:compare"]
-description = "Five rotated same-job comparisons: LABEL=full-commit LABEL=full-commit ..."
+description = "Five rotated representative comparisons; BENCH_MODE=full selects every workload: LABEL=full-commit ..."
 depends = ["bench:rebar:fetch"]
 dir = "{{config_root}}/benchmarks"
 run = "bash compare.sh"
