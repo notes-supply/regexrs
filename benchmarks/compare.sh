@@ -44,7 +44,8 @@ for input in "$@"; do
 done
 
 here=$PWD
-out=$(git rev-parse --show-toplevel)/.benchmark-results/comparison
+project=$(git rev-parse --show-toplevel)
+out=$project/.benchmark-results/comparison
 mkdir -p "$(dirname -- "$out")"
 mkdir "$out"
 mkdir "$out/sources" "$out/logs"
@@ -84,7 +85,7 @@ for index in "${!labels[@]}"; do
     commit=${commits[index]}
     printf '%s,%s\n' "$label" "$commit" >> "$out/sources.csv"
     mkdir "$out/sources/$label"
-    git archive "$commit" | tar -x -C "$out/sources/$label"
+    git -C "$project" archive "$commit" | tar -x -C "$out/sources/$label"
     gate "$label-build" bash revision.sh build "$out/sources/$label" "$label"
     gate "$label-runner-tests" env CARGO_TARGET_DIR="$here/target/planning/cargo" \
         cargo test --locked --release --features native --manifest-path "target/planning/$label/adapter/Cargo.toml"
