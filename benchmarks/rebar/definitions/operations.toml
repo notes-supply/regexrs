@@ -1,0 +1,82 @@
+analysis = "Literal and capture replacements plus failed-short-run scans. Replacement bytes are verified before timing."
+
+[[bench]]
+name = "names-tiny"
+model = "replace"
+regex = 'Holmes|Watson'
+unicode = true
+haystack = { path = "synthetic/acceptance-names-tiny.txt" }
+count = 23
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "names-dense"
+model = "replace"
+regex = 'Holmes|Watson'
+unicode = true
+haystack = { path = "synthetic/acceptance-names-dense.txt" }
+count = 180000
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "names-sparse"
+model = "replace"
+regex = 'Holmes|Watson'
+unicode = true
+haystack = { path = "synthetic/acceptance-names-sparse.txt" }
+count = 150900
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "names-miss"
+model = "replace"
+regex = 'Holmes|Watson'
+unicode = true
+haystack = { path = "synthetic/acceptance-names-miss.txt" }
+count = 150000
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "captures-dense"
+model = "replace-capture"
+regex = '(a)(b)?'
+unicode = true
+haystack = { path = "synthetic/acceptance-captures-dense.txt" }
+count = 100000
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "short-run-8-32"
+model = "count"
+regex = '[a-z]{8,}\d'
+unicode = true
+haystack = { path = "synthetic/acceptance-short-run-8-32.txt" }
+count = 0
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "short-run-64-32"
+model = "count"
+regex = '[a-z]{64,}\d'
+unicode = true
+haystack = { path = "synthetic/acceptance-short-run-64-32.txt" }
+count = 0
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "short-run-64-4096"
+model = "count"
+regex = '[a-z]{64,}\d'
+unicode = true
+haystack = { path = "synthetic/acceptance-short-run-64-4096.txt" }
+count = 0
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]
+
+[[bench]]
+name = "short-run-512-32"
+model = "count"
+regex = '[a-z]{512,}\d'
+unicode = true
+haystack = { path = "synthetic/acceptance-short-run-512-32.txt" }
+count = 0
+engines = ["regexrs", "regexrs-regular", "regexrs-seek", "regex", "fancy", "fancy-seek"]

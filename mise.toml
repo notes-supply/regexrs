@@ -100,3 +100,9 @@ description = "Short run that exercises the harness; not for performance claims"
 depends = ["bench:rebar:verify"]
 dir = "{{config_root}}/benchmarks"
 run = "target/release/rebar measure -d rebar --max-time 50ms --max-warmup-time 10ms --max-iters 50 --max-warmup-iters 5"
+
+[tasks."bench:rebar:compare"]
+description = "Five rotated same-job comparisons: LABEL=full-commit LABEL=full-commit ..."
+depends = ["bench:rebar:fetch"]
+dir = "{{config_root}}/benchmarks"
+run = "bash compare.sh"
