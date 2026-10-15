@@ -809,11 +809,14 @@ fn expansion_writers_agree() {
         .write_expansion_vec(&mut bytes, template, &cap)
         .unwrap();
     assert_eq!(bytes, format!(">{expected}").into_bytes());
-    let mut written = b">".to_vec();
-    expander
-        .write_expansion(&mut written, template, &cap)
-        .unwrap();
-    assert_eq!(written, bytes);
+    #[cfg(feature = "std")]
+    {
+        let mut written = b">".to_vec();
+        expander
+            .write_expansion(&mut written, template, &cap)
+            .unwrap();
+        assert_eq!(written, bytes);
+    }
 }
 
 #[cfg_attr(feature = "track_caller", track_caller)]
