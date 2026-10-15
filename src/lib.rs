@@ -1385,6 +1385,9 @@ impl Regex {
     pub(crate) fn new_options(pattern: String, options: &RegexOptions) -> Result<Regex> {
         let flags = options.compute_flags();
         let mut tree = Expr::parse_tree_with_flags(&pattern, flags)?;
+        // The pattern as written, before the optimizer rewrites a final
+        // lookahead, for a route between edge lookarounds.
+        let edged = edge_lookarounds(&tree.expr).then(|| tree.expr.clone());
         // Lower the already-parsed original tree before capture-boundary rewrites.
         // Emission happens only after the portable compiler validates everything.
         #[cfg(all(feature = "native", target_os = "linux", target_arch = "x86_64"))]
@@ -1498,10 +1501,16 @@ impl Regex {
         let regular = if options.explicit_backtrack_limit || prog.repeats_empty_matches() {
             None
         } else if requires_capture_group_fixup {
-            assertion_route(&pattern, flags, options, n_groups).map(Arc::new)
+            edged
+                .as_ref()
+                .and_then(|expr| assertion_route(expr, options, n_groups))
+                .map(Arc::new)
         } else {
             word_boundary_automata(&tree.expr, options, n_groups)
-                .or_else(|| assertion_route(&pattern, flags, options, n_groups))
+                .or_else(|| {
+                    let expr = edged.as_ref()?;
+                    assertion_route(expr, options, n_groups)
+                })
                 .map(Arc::new)
         };
         Ok(Regex {
@@ -2727,21 +2736,31 @@ fn word_boundary_automata(
     Some(RegularRoute::new(hir, compile_options, usage, ascii, None))
 }
 
+/// Whether `expr` is a sequence with a lookaround at an edge, among the
+/// assertions there: the shape [`assertion_route`] takes.
+fn edge_lookarounds(expr: &Expr) -> bool {
+    let Expr::Concat(children) = expr else {
+        return false;
+    };
+    let edge = |child: &Expr| match child {
+        Expr::LookAround(..) => Some(true),
+        Expr::Assertion(_) => None,
+        _ => Some(false),
+    };
+    children.iter().find_map(edge) == Some(true)
+        || children.iter().rev().find_map(edge) == Some(true)
+}
+
 /// A route to a plan for a regular pattern between fixed-width lookbehinds
-/// at its start and lookaheads at its end, or `None`. It is built from the
-/// pattern as written, before the optimizer turns a final lookahead into a
-/// rewritten capture group zero, so its groups are those `Regex` reports.
-fn assertion_route(
-    pattern: &str,
-    flags: u32,
-    options: &RegexOptions,
-    n_groups: usize,
-) -> Option<RegularRoute> {
+/// at its start and lookaheads at its end, or `None`. It is built from
+/// `expr`, the pattern as written, before the optimizer turns a final
+/// lookahead into a rewritten capture group zero, so its groups are those
+/// `Regex` reports.
+fn assertion_route(expr: &Expr, options: &RegexOptions, n_groups: usize) -> Option<RegularRoute> {
     if regular::rich_option(options).is_some() {
         return None;
     }
-    let tree = Expr::parse_tree_with_flags(pattern, flags).ok()?;
-    let Expr::Concat(children) = &tree.expr else {
+    let Expr::Concat(children) = expr else {
         return None;
     };
     // Assertions next to the lookarounds test the same position, so they
