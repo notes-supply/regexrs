@@ -2235,7 +2235,7 @@ impl Regex {
         &self,
         input: &RegexInput<'_, S>,
         locations: &mut CaptureLocations,
-        mut cache: Option<&mut searcher::Cache>,
+        cache: Option<&mut searcher::Cache>,
     ) -> Result<bool> {
         if !Arc::ptr_eq(&locations.named_groups, &self.named_groups) {
             *locations = self.capture_locations();
@@ -2244,9 +2244,22 @@ impl Regex {
             locations.clear();
             return Ok(false);
         }
+        self.captures_into(input, 0, &mut locations.slots, cache)
+    }
+
+    /// Fill `slots`, storage from [`Regex::capture_locations`], from one
+    /// search of `input`, which must not be done, returning whether it
+    /// matched. `option_flags` are those of an iteration's later searches.
+    fn captures_into<S: input::Input + ?Sized>(
+        &self,
+        input: &RegexInput<'_, S>,
+        option_flags: u32,
+        slots: &mut CapturesImpl,
+        mut cache: Option<&mut searcher::Cache>,
+    ) -> Result<bool> {
         let route = self.regular_route(input);
         if let (Some(plan), CapturesImpl::Fancy { saves }) =
-            (route.and_then(RouteEngine::plan), &mut locations.slots)
+            (route.and_then(RouteEngine::plan), &mut *slots)
         {
             saves.clear();
             saves.resize(plan.slot_len(), usize::MAX);
@@ -2261,7 +2274,7 @@ impl Regex {
             }
         }
         let route = route.and_then(RouteEngine::automata);
-        if let (Some(route), CapturesImpl::Fancy { saves }) = (route, &mut locations.slots)
+        if let (Some(route), CapturesImpl::Fancy { saves }) = (route, &mut *slots)
             && let Some(regex) = route.regex()
             && let Ok(found) = route.find(
                 &ra_input(input),
@@ -2276,7 +2289,7 @@ impl Regex {
             let meta = cache.and_then(|cache| cache.route_meta(route));
             return Ok(regular_captures_into(regex, &span, meta, saves));
         }
-        match (&self.inner, &mut locations.slots) {
+        match (&self.inner, slots) {
             (
                 RegexImpl::Wrap {
                     engine: WrapEngine::Plan(plan),
@@ -2312,11 +2325,12 @@ impl Regex {
                 },
                 CapturesImpl::Fancy { saves },
             ) => {
-                let option_flags = if options.find_not_empty {
-                    OPTION_FIND_NOT_EMPTY
-                } else {
-                    0
-                };
+                let option_flags = option_flags
+                    | if options.find_not_empty {
+                        OPTION_FIND_NOT_EMPTY
+                    } else {
+                        0
+                    };
                 let scratch = cache.as_deref_mut().and_then(searcher::Cache::rich);
                 let found = vm::run_into(
                     prog,
@@ -2583,7 +2597,12 @@ impl Regex {
             limit,
             rep,
             || self.find_iter(text),
-            || self.captures_iter(text),
+            || Captures {
+                inner: self.capture_locations().slots,
+                named_groups: Arc::clone(&self.named_groups),
+                input: text,
+            },
+            |input, flags, slots| self.captures_into(input, flags, slots, None),
         )
     }
 
@@ -2910,19 +2929,21 @@ fn capture_names_of(named_groups: &NamedGroups, len: usize) -> CaptureNames<'_> 
     CaptureNames(names.into_iter())
 }
 
-/// Shared body of the replacement methods. `matches` and `captures` start an
-/// iteration over `text`; only the one the replacer needs is used.
-fn replacen_with<'t, R, E, M, C>(
+/// Shared body of the replacement methods. `matches` starts an iteration
+/// over `text`. `fill` writes one search's captures into storage that
+/// `captures` creates and every match reuses: a replacer only borrows each
+/// match's captures, so it cannot keep one that a later search overwrites.
+fn replacen_with<'t, R, E, M>(
     text: &'t str,
     limit: usize,
     mut rep: R,
     matches: impl FnOnce() -> M,
-    captures: impl FnOnce() -> C,
+    captures: impl FnOnce() -> Captures<'t, str>,
+    mut fill: impl FnMut(&RegexInput<'t, str>, u32, &mut CapturesImpl) -> core::result::Result<bool, E>,
 ) -> core::result::Result<Cow<'t, str>, E>
 where
     R: Replacer,
     M: Iterator<Item = core::result::Result<Match<'t>, E>>,
-    C: Iterator<Item = core::result::Result<Captures<'t>, E>>,
 {
     // If we know that the replacement doesn't have any capture expansions,
     // then we can fast path. The fast path can make a tremendous
@@ -2956,25 +2977,39 @@ where
 
     // The slower path, which we use if the replacement needs access to
     // capture groups.
-    let mut it = captures().enumerate().peekable();
-    if it.peek().is_none() {
-        return Ok(Cow::Borrowed(text));
-    }
-    let mut new = String::with_capacity(text.len());
+    let mut captures = captures();
+    let mut state = IterState::new(RegexInput::new(text));
+    let mut new = None;
     let mut last_match = 0;
-    for (i, cap) in it {
-        let cap = cap?;
+    for i in 0.. {
+        let found = state.next_with(|input, flags| {
+            let matched = fill(input, flags, &mut captures.inner)?;
+            Ok(matched.then(|| {
+                let span = captures.inner.get_span(0);
+                ((), span.expect("captures only report matches"))
+            }))
+        });
+        let Some(found) = found else {
+            break;
+        };
+        found?;
 
         if limit > 0 && i >= limit {
             break;
         }
-        let m = cap.get(0).expect("captures only report matches");
-        new.push_str(&text[last_match..m.start()]);
-        rep.replace_append(&cap, &mut new);
-        last_match = m.end();
+        let (start, end) = captures.inner.get_span(0).expect("a match has group 0");
+        let new = new.get_or_insert_with(|| String::with_capacity(text.len()));
+        new.push_str(&text[last_match..start]);
+        rep.replace_append(&captures, new);
+        last_match = end;
     }
-    new.push_str(&text[last_match..]);
-    Ok(Cow::Owned(new))
+    Ok(match new {
+        Some(mut new) => {
+            new.push_str(&text[last_match..]);
+            Cow::Owned(new)
+        }
+        None => Cow::Borrowed(text),
+    })
 }
 
 /// The `regex-automata` input for a search: same haystack, range, start and

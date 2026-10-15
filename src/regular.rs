@@ -318,7 +318,24 @@ impl RegularRegex {
             limit,
             rep,
             || self.find_iter(text).map(Ok::<_, Infallible>),
-            || self.captures_iter(text).map(Ok),
+            || Captures {
+                inner: CapturesImpl::Wrap {
+                    locations: self.engine.create_captures(),
+                    explicit_capture_group_0: false,
+                },
+                named_groups: Arc::clone(&self.named_groups),
+                input: text,
+            },
+            |input, _, slots| {
+                let CapturesImpl::Wrap { locations, .. } = slots else {
+                    unreachable!("regular captures are regex-automata's");
+                };
+                match &self.engine {
+                    WrapEngine::Plan(plan) => plan_captures_into(plan, input, locations),
+                    WrapEngine::Meta(inner) => inner.search_captures(&ra_input(input), locations),
+                }
+                Ok(locations.is_match())
+            },
         );
         match replaced {
             Ok(replaced) => replaced,

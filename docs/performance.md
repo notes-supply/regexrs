@@ -151,3 +151,7 @@ The seek approximation is only derived when a seek filter may use it.
 Caller-owned scratch is an allocation/ownership interface, not a guaranteed
 speedup: the portable implementation already pools working memory. Owned capture
 results still allocate independent snapshots. No results or haystacks are cached.
+
+Replacement expands its template in one pass, appending to the output, and
+fills one capture buffer for every match. A replacer only borrows each match's
+captures, so none can observe a later match's groups.
