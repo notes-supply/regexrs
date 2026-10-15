@@ -380,7 +380,7 @@ impl Edge {
 /// capture group, and each copy of a repetition's expression plus one. No
 /// node is left out, so a pattern whose engine the default size limit rejects
 /// always exceeds [`NFA_UNIT_BUDGET`].
-fn nfa_bound(hir: &Hir) -> usize {
+pub(crate) fn nfa_bound(hir: &Hir) -> usize {
     let own = match hir.kind() {
         HirKind::Empty | HirKind::Look(_) | HirKind::Concat(_) | HirKind::Alternation(_) => 1,
         HirKind::Literal(hir::Literal(bytes)) => bytes.len(),

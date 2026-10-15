@@ -98,6 +98,10 @@ unbounded repetition the VM runs over an expression that can match empty, such
 as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
 do, and automata can report other captures or spans. The automata are built on
 the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
+The engines the VM delegates regular parts of a pattern to are built on the
+first search that runs them too, where they certainly fit the default size
+limits; otherwise construction builds them and reports their errors. A
+pattern whose searches its route answers never builds them.
 A word-boundary pattern with a plan uses it in place of the automata for
 every search on text, including non-ASCII text where the lazy DFAs would give
 up and leave the search to the VM. Unicode word boundaries there are the same

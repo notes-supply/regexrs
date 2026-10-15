@@ -71,14 +71,15 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-#[cfg(feature = "variable-lookbehinds")]
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::panic::{RefUnwindSafe, UnwindSafe};
 use regex_automata::Anchored;
 use regex_automata::Input;
 use regex_automata::meta::Regex;
+use regex_automata::util::lazy::Lazy;
 use regex_automata::util::look::LookMatcher;
 use regex_automata::util::pool::Pool;
 use regex_automata::util::primitives::NonMaxUsize;
@@ -311,11 +312,46 @@ pub(crate) fn range_contains<T: Ord + Copy>(ranges: &[(T, T)], needle: T) -> boo
         .is_ok()
 }
 
+/// Builds a delegate's engine on its first search.
+type DelegateFn = Box<dyn Fn() -> Regex + Send + Sync + UnwindSafe + RefUnwindSafe>;
+
+/// A delegated regex-automata engine, built on the first search that runs
+/// it where building cannot fail, so that a pattern whose searches never
+/// reach the VM, as one with a planned route, never builds it.
+#[derive(Clone)]
+pub struct DelegateEngine(Arc<Lazy<Regex, DelegateFn>>);
+
+impl core::fmt::Debug for DelegateEngine {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DelegateEngine")
+    }
+}
+
+impl DelegateEngine {
+    /// An engine already built.
+    pub(crate) fn built(regex: Regex) -> Self {
+        let engine = Self::deferred(Box::new(move || regex.clone()));
+        engine.get();
+        engine
+    }
+
+    /// An engine `build` creates when first searched; it must not fail.
+    pub(crate) fn deferred(build: DelegateFn) -> Self {
+        Self(Arc::new(Lazy::new(build)))
+    }
+
+    /// The engine, built now if this is its first use.
+    #[inline]
+    pub fn get(&self) -> &Regex {
+        Lazy::get(&self.0)
+    }
+}
+
 #[derive(Clone)]
 /// Delegate matching to the regex crate
 pub struct Delegate {
     /// The regex
-    pub inner: Regex,
+    pub inner: DelegateEngine,
     /// The regex pattern as a string
     pub pattern: String,
     /// The range of capture groups. None if there are no capture groups.
@@ -1564,6 +1600,7 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                     if past_end(haystack, ix) {
                         break 'fail;
                     }
+                    let inner = inner.get();
                     let input = Input::new(haystack.as_bytes())
                         .span(ix..haystack.len())
                         .anchored(Anchored::Yes);
@@ -1598,7 +1635,7 @@ fn run_in_scratch<S: HaystackInput + ?Sized, T>(
                         let input = Input::new(haystack.as_bytes())
                             .span(ix..haystack.len())
                             .anchored(Anchored::Yes);
-                        delegate.inner.search_half(&input).is_some()
+                        delegate.inner.get().search_half(&input).is_some()
                     };
 
                     if delegate_matches_here {
