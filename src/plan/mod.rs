@@ -1532,13 +1532,7 @@ impl Plan {
     #[inline]
     fn next_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
         let (haystack, end) = (input.haystack, input.end);
-        let candidates = match &self.candidates {
-            // Decoding backwards needs valid UTF-8 to agree with a forward
-            // attempt; other haystacks take the scan an inner literal replaced.
-            Candidates::Inner(.., scan) if !input.utf8 => scan,
-            candidates => candidates,
-        };
-        let found = match candidates {
+        let found = match &self.candidates {
             Candidates::Literal(finder) => finder.find(&haystack[from..end]),
             Candidates::Prefilter(prefilter) => {
                 return prefilter
@@ -1598,10 +1592,21 @@ impl Plan {
     /// common finders keep their code: each occurrence matched backwards.
     #[inline(never)]
     fn inner_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
-        let Candidates::Inner(finder, index, min, _) = &self.candidates else {
+        let Candidates::Inner(finder, index, min, scan) = &self.candidates else {
             unreachable!("only inner-literal candidates are searched here");
         };
         let (haystack, end) = (input.haystack, input.end);
+        // Decoding backwards needs valid UTF-8 to agree with a forward
+        // attempt; other haystacks take the scan an inner literal replaced.
+        if !input.utf8 {
+            return match &**scan {
+                Candidates::Ranges(ranges, class) => {
+                    Plan::range_candidate(ranges, class, haystack, from, end)
+                }
+                Candidates::Class(class) => Plan::class_candidate(class, haystack, from, end),
+                _ => unreachable!("an inner literal replaces only a scan of each byte"),
+            };
+        }
         let before = &self.steps[self.first..*index];
         let mut at = from + min;
         while let Some(offset) = haystack.get(at..end).and_then(|rest| finder.find(rest)) {
