@@ -194,6 +194,16 @@ impl Expander {
         }
     }
 
+    /// Where the next substitution character in `text` is. Templates are
+    /// usually short, where a plain loop costs less than memchr's dispatch.
+    fn find_sub(&self, text: &str) -> Option<usize> {
+        match u8::try_from(self.sub_char) {
+            Ok(byte) if byte.is_ascii() && text.len() < 16 => text.bytes().position(|b| b == byte),
+            Ok(byte) if byte.is_ascii() => memchr::memchr(byte, text.as_bytes()),
+            _ => text.find(self.sub_char),
+        }
+    }
+
     /// Parse `template` and pass its steps to `f`: runs of literal text whole,
     /// so expanding costs one pass over the template.
     fn exec<'t, E>(
@@ -205,7 +215,7 @@ impl Expander {
         debug_assert!(!self.close.is_empty());
         let sub_len = self.sub_char.len_utf8();
         let mut rest = template;
-        while let Some(at) = rest.find(self.sub_char) {
+        while let Some(at) = self.find_sub(rest) {
             if at > 0 {
                 f(Step::Literal(&rest[..at]))?;
             }
@@ -214,6 +224,13 @@ impl Expander {
             let skip = if tail.starts_with(self.sub_char) {
                 f(Step::Literal(sub))?;
                 sub_len
+            } else if let Some(len) = self
+                .allow_undelimited_name
+                .then(|| ascii_id(tail))
+                .flatten()
+            {
+                f(Step::GroupName(&tail[..len]))?;
+                len
             } else if let Some(ParsedId {
                 id,
                 relative: None,
@@ -249,13 +266,39 @@ impl Expander {
 fn group_text<'t>(step: Step<'t>, captures: &Captures<'t, str>) -> Option<&'t str> {
     let group = match step {
         Step::Literal(text) => return Some(text),
-        Step::GroupName(name) => captures
-            .name(name)
-            .or_else(|| name.parse().ok().and_then(|num| captures.get(num))),
+        Step::GroupName(name) => {
+            let named = (!captures.named_groups.is_empty())
+                .then(|| captures.name(name))
+                .flatten();
+            named.or_else(|| group_number(name).and_then(|num| captures.get(num)))
+        }
         Step::GroupNum(num) => captures.get(num),
         Step::Error => None,
     };
     group.map(|m| m.as_str())
+}
+
+/// The length of the name `text` starts with when it is ASCII and no
+/// character that could continue it follows; [`parse_id`] reads the rest.
+fn ascii_id(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    (len > 0 && bytes.get(len).is_none_or(u8::is_ascii)).then_some(len)
+}
+
+/// The number `name` spells, as `usize::from_str` reads the ASCII digits a
+/// reference holds.
+fn group_number(name: &str) -> Option<usize> {
+    if (1..=4).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(
+            name.bytes()
+                .fold(0, |num, b| num * 10 + usize::from(b - b'0')),
+        );
+    }
+    name.parse().ok()
 }
 
 enum Step<'a> {

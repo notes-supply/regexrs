@@ -3015,18 +3015,18 @@ where
             let matched = fill(input, flags, &mut captures.inner)?;
             Ok(matched.then(|| {
                 let span = captures.inner.get_span(0);
-                ((), span.expect("captures only report matches"))
+                let span = span.expect("captures only report matches");
+                (span, span)
             }))
         });
         let Some(found) = found else {
             break;
         };
-        found?;
+        let (start, end) = found?;
 
         if limit > 0 && i >= limit {
             break;
         }
-        let (start, end) = captures.inner.get_span(0).expect("a match has group 0");
         let new = new.get_or_insert_with(|| String::with_capacity(text.len()));
         new.push_str(&text[last_match..start]);
         rep.replace_append(&captures, new);
