@@ -112,9 +112,10 @@ pub(crate) struct Plan {
     /// An upper bound on the size of the pattern's Thompson NFA; see
     /// [`nfa_bound`].
     nfa_units: usize,
-    /// For a program of one unbounded run of at least one member, the bytes
-    /// that are members on their own: every member byte of a byte class, or
-    /// the ASCII members of a character class.
+    /// For a program of one greedy unbounded run of at least one member
+    /// whose end no stop byte finds, the bytes that are members on their own:
+    /// every member byte of a byte class, or the ASCII members of a character
+    /// class. Such a run is searched by [`Plan::search_maximal_run`].
     run_bytes: Option<Box<[bool; 256]>>,
 }
 
@@ -1425,9 +1426,13 @@ impl Plan {
             && !start_only
             && matches!(&*steps, [Step::Run(run)] if run.max == usize::MAX && run.min > 0);
         let run_bytes = match &*steps {
-            [Step::Run(run)] if single_run => Some(Box::new(core::array::from_fn(|b| {
-                run.class.has_single_byte(b as u8)
-            }))),
+            [Step::Run(run)]
+                if single_run && run.min == 1 && !run.shortest && run.stops.is_none() =>
+            {
+                Some(Box::new(core::array::from_fn(|b| {
+                    run.class.has_single_byte(b as u8)
+                })))
+            }
             _ => None,
         };
         Some(Plan {
@@ -1527,7 +1532,13 @@ impl Plan {
     #[inline]
     fn next_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
         let (haystack, end) = (input.haystack, input.end);
-        let found = match &self.candidates {
+        let candidates = match &self.candidates {
+            // Decoding backwards needs valid UTF-8 to agree with a forward
+            // attempt; other haystacks take the scan an inner literal replaced.
+            Candidates::Inner(.., scan) if !input.utf8 => scan,
+            candidates => candidates,
+        };
+        let found = match candidates {
             Candidates::Literal(finder) => finder.find(&haystack[from..end]),
             Candidates::Prefilter(prefilter) => {
                 return prefilter
@@ -1542,51 +1553,12 @@ impl Plan {
                     .and_then(|rest| finder.find(rest))
                     .map(|at| from + at);
             }
-            Candidates::Inner(finder, index, min, scan) => {
-                // Decoding backwards needs valid UTF-8 to agree with a
-                // forward attempt; other haystacks take the replaced scan.
-                if !input.utf8 {
-                    return Plan::scan_candidates(scan, haystack, from, end);
-                }
-                let before = &self.steps[self.first..*index];
-                let mut at = from + min;
-                while let Some(offset) = haystack.get(at..end).and_then(|rest| finder.find(rest)) {
-                    let found = at + offset;
-                    if let Some(start) = Plan::start_before(before, haystack, found)
-                        && start >= from
-                    {
-                        return Some(start);
-                    }
-                    at = found + 1;
-                }
-                return None;
+            Candidates::Inner(..) => return self.inner_candidate(input, from),
+            Candidates::Lines(..) => return self.line_candidate(input, from),
+            Candidates::Ranges(ranges, class) => {
+                return Plan::range_candidate(ranges, class, haystack, from, end);
             }
-            Candidates::Lines(crlf, firsts) => {
-                let ends_line = |b: u8| b == b'\n' || (*crlf && b == b'\r');
-                let mut at = from;
-                while at < end {
-                    if (at == 0 || ends_line(haystack[at - 1])) && has_byte(firsts, haystack[at]) {
-                        return Some(at);
-                    }
-                    // The next line starts after the next line end, which in
-                    // a run of empty lines is the next byte.
-                    if ends_line(haystack[at]) {
-                        at += 1;
-                        continue;
-                    }
-                    let rest = &haystack[at..end];
-                    let found = if *crlf {
-                        memchr::memchr2(b'\n', b'\r', rest)
-                    } else {
-                        memchr::memchr(b'\n', rest)
-                    };
-                    at += found? + 1;
-                }
-                return None;
-            }
-            scan @ (Candidates::Ranges(..) | Candidates::Class(_)) => {
-                return Plan::scan_candidates(scan, haystack, from, end);
-            }
+            Candidates::Class(class) => return Plan::class_candidate(class, haystack, from, end),
             Candidates::Behind(prefilter, len) => {
                 // A literal ending at or after `from`, perhaps before the
                 // search's start; all have the same length, so their ends
@@ -1622,6 +1594,59 @@ impl Plan {
         found.map(|offset| from + offset)
     }
 
+    /// [`Plan::next_candidate`] for an inner literal, out of line so that the
+    /// common finders keep their code: each occurrence matched backwards.
+    #[inline(never)]
+    fn inner_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        let Candidates::Inner(finder, index, min, _) = &self.candidates else {
+            unreachable!("only inner-literal candidates are searched here");
+        };
+        let (haystack, end) = (input.haystack, input.end);
+        let before = &self.steps[self.first..*index];
+        let mut at = from + min;
+        while let Some(offset) = haystack.get(at..end).and_then(|rest| finder.find(rest)) {
+            let found = at + offset;
+            if let Some(start) = Plan::start_before(before, haystack, found)
+                && start >= from
+            {
+                return Some(start);
+            }
+            at = found + 1;
+        }
+        None
+    }
+
+    /// [`Plan::next_candidate`] for line starts, out of line so that the
+    /// common finders keep their code.
+    #[inline(never)]
+    fn line_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        let Candidates::Lines(crlf, firsts) = &self.candidates else {
+            unreachable!("only line-start candidates are searched here");
+        };
+        let (haystack, end) = (input.haystack, input.end);
+        let ends_line = |b: u8| b == b'\n' || (*crlf && b == b'\r');
+        let mut at = from;
+        while at < end {
+            if (at == 0 || ends_line(haystack[at - 1])) && has_byte(firsts, haystack[at]) {
+                return Some(at);
+            }
+            // The next line starts after the next line end, which in a run
+            // of empty lines is the next byte.
+            if ends_line(haystack[at]) {
+                at += 1;
+                continue;
+            }
+            let rest = &haystack[at..end];
+            let found = if *crlf {
+                memchr::memchr2(b'\n', b'\r', rest)
+            } else {
+                memchr::memchr(b'\n', rest)
+            };
+            at += found? + 1;
+        }
+        None
+    }
+
     /// Where a match starts whose fixed `steps` before an inner literal end
     /// at `at`, matching them backwards, or `None` where they do not match.
     #[inline]
@@ -1651,53 +1676,37 @@ impl Plan {
         Some(at)
     }
 
-    /// The first candidate in `from..end` of `scan`, a test of each byte for
-    /// a character of the first class, word-at-a-time for byte ranges.
-    #[inline(always)]
-    fn scan_candidates(
-        scan: &Candidates,
-        haystack: &[u8],
-        from: usize,
-        end: usize,
-    ) -> Option<usize> {
-        match scan {
-            Candidates::Ranges(ranges, class) => {
-                let mut at = from;
-                while let Some(found) = ranges.find(haystack, at, end) {
-                    if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
-                        return Some(found);
-                    }
-                    at = found + 1;
-                }
-                None
-            }
-            Candidates::Class(Class::Bytes(set)) => haystack[from..end]
-                .iter()
-                .position(|&b| has_byte(set, b))
-                .map(|offset| from + offset),
-            Candidates::Class(class @ Class::Chars(set)) => {
-                let mut at = from;
-                while at < end {
-                    let b = haystack[at];
-                    if b < 0x80 {
-                        if bit128(set.ascii, b) {
-                            return Some(at);
-                        }
-                    } else if class.match_len(haystack, at, end).is_some() {
-                        return Some(at);
-                    }
-                    at += 1;
-                }
-                None
-            }
-            _ => unreachable!("only scans of each byte are kept as a fallback"),
-        }
-    }
-
     /// The first position in `from..end` holding a member of `class`, for
     /// candidates that cannot use their faster search on this input.
     #[inline(never)]
     fn find_class(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
+        Plan::class_candidate(class, haystack, from, end)
+    }
+
+    /// The first position in `from..end` holding a byte of `ranges` that
+    /// begins a member of `class`.
+    #[inline(always)]
+    fn range_candidate(
+        ranges: &ByteRanges,
+        class: &Class,
+        haystack: &[u8],
+        from: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let mut at = from;
+        while let Some(found) = ranges.find(haystack, at, end) {
+            if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
+                return Some(found);
+            }
+            at = found + 1;
+        }
+        None
+    }
+
+    /// The first position in `from..end` holding a member of `class`, testing
+    /// each byte.
+    #[inline(always)]
+    fn class_candidate(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
         match class {
             Class::Bytes(set) => haystack[from..end]
                 .iter()
@@ -2274,9 +2283,6 @@ impl Plan {
         }
         if let Some(member) = &self.run_bytes
             && !earliest
-            && run.min == 1
-            && !run.shortest
-            && run.stops.is_none()
         {
             return self.search_maximal_run(run, member, input);
         }
