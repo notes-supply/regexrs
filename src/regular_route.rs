@@ -58,6 +58,9 @@ pub(crate) struct RegularRoute {
 }
 
 /// How a route searches, decided on its first search.
+// Built once per pattern inside a `Lazy` and never moved while searching, so
+// boxing the larger variant would only add a load to every routed search.
+#[expect(clippy::large_enum_variant)]
 pub(crate) enum RouteEngine {
     /// The pattern's plan, and the automata for the searches it leaves
     /// to them, built on the first such search.

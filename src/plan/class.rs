@@ -439,6 +439,15 @@ impl Class {
         }
     }
 
+    /// Whether the byte `b` alone is a member: a member byte of a byte
+    /// class, or an ASCII member of a character class.
+    pub(super) fn has_single_byte(&self, b: u8) -> bool {
+        match self {
+            Class::Chars(set) => b < 0x80 && bit128(set.ascii, b),
+            Class::Bytes(set) => has_byte(set, b),
+        }
+    }
+
     /// The most bytes one member takes.
     pub(super) fn max_len(&self) -> usize {
         match self {

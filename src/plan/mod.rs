@@ -112,6 +112,10 @@ pub(crate) struct Plan {
     /// An upper bound on the size of the pattern's Thompson NFA; see
     /// [`nfa_bound`].
     nfa_units: usize,
+    /// For a program of one unbounded run of at least one member, the bytes
+    /// that are members on their own: every member byte of a byte class, or
+    /// the ASCII members of a character class.
+    run_bytes: Option<Box<[bool; 256]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1399,6 +1403,12 @@ impl Plan {
             && !checks_end
             && !start_only
             && matches!(&*steps, [Step::Run(run)] if run.max == usize::MAX && run.min > 0);
+        let run_bytes = match &*steps {
+            [Step::Run(run)] if single_run => Some(Box::new(core::array::from_fn(|b| {
+                run.class.has_single_byte(b as u8)
+            }))),
+            _ => None,
+        };
         Some(Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
@@ -1426,6 +1436,7 @@ impl Plan {
             look_matcher: LookMatcher::new(),
             group_info,
             nfa_units,
+            run_bytes,
         })
     }
 
@@ -1460,6 +1471,7 @@ impl Plan {
             look_matcher: LookMatcher::new(),
             group_info: GroupInfo::new([[None::<&str>]]).ok()?,
             nfa_units: nfa_bound(hir),
+            run_bytes: None,
         })
     }
 
@@ -2212,6 +2224,14 @@ impl Plan {
             tests::cover(input.start, end);
             return found.then_some((input.start, end));
         }
+        if let Some(member) = &self.run_bytes
+            && !earliest
+            && run.min == 1
+            && !run.shortest
+            && run.stops.is_none()
+        {
+            return self.search_maximal_run(run, member, input);
+        }
         let mut from = input.start;
         loop {
             let candidate = self.next_candidate(input, from)?;
@@ -2226,6 +2246,59 @@ impl Plan {
             // later start inside the same run.
             from = end.max(candidate + 1);
             if from >= input.end {
+                return None;
+            }
+        }
+    }
+
+    /// [`Plan::search_run`] for a greedy run of at least one member whose
+    /// end no stop byte finds: the maximal run from the first member. In
+    /// dense text a member usually follows within a byte or two, so those are
+    /// tested before the candidate search, and member bytes are tested
+    /// against `member` without counting them.
+    #[inline]
+    fn search_maximal_run(
+        &self,
+        run: &Run,
+        member: &[bool; 256],
+        input: &PlanInput<'_>,
+    ) -> Option<(usize, usize)> {
+        let (haystack, end) = (input.haystack, input.end);
+        let is_member = |at: usize| at < end && member[usize::from(haystack[at])];
+        let mut from = input.start;
+        loop {
+            let start = if is_member(from) {
+                from
+            } else if is_member(from + 1) {
+                from + 1
+            } else {
+                self.next_candidate(input, from)?
+            };
+            let mut pos = start;
+            while pos < end {
+                let b = haystack[pos];
+                if member[usize::from(b)] {
+                    pos += 1;
+                } else if b < 0x80 {
+                    break;
+                } else {
+                    match run.class.match_len(haystack, pos, end) {
+                        Some(len) => pos += len,
+                        None => break,
+                    }
+                }
+            }
+            #[cfg(all(test, feature = "std"))]
+            {
+                tests::SCANNED.with(|scanned| scanned.set(scanned.get() + pos - start));
+                tests::cover(start, pos);
+            }
+            if pos > start {
+                return Some((start, pos));
+            }
+            // The candidate's lead byte began no member.
+            from = start + 1;
+            if from >= end {
                 return None;
             }
         }
