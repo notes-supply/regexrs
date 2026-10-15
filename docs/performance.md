@@ -60,7 +60,12 @@ The plan finds candidates with memmem, a literal at a fixed offset, a
 `regex-automata` prefilter, memchr or a word-at-a-time byte-range test. A
 literal after an unbounded first run that the run cannot take, as `@` in
 `\w+@\w+`, gives the candidates instead: at each of its occurrences the plan
-scans back over the run to the match start. A pattern that is a finite set of
+scans back over the run to the match start. So does a literal after a fixed
+number of characters wider than a byte, as `:` in `(\d{2}):(\d{2})` with
+Unicode digits: each occurrence is matched backwards to where a match would
+start, in valid UTF-8, while byte haystacks scan for the first character. A
+leading multi-line `^` whose first character would otherwise be found by
+testing every byte takes line starts, found with memchr, as candidates. A pattern that is a finite set of
 literals without captures or assertions is searched with its prefilter alone,
 as the meta engine's literal strategy does, whatever the shape of its
 alternatives, so `ab|ac` and `(?:a|)b` need no program. Alternatives are chosen

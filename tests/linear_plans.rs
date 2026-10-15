@@ -96,6 +96,17 @@ const PATTERNS: &[&str] = &[
     r"(?:\.(\w))*",
     "(?:foo|bar)(?:baz)?",
     r"(?:-(\d+)){1,3}",
+    // A leading multi-line `^` takes its candidates from line starts.
+    r"(?m)^\w+\r?$",
+    r"(?m)^[A-Z]\w*",
+    r"(?mR)^\w+$",
+    r"(?m)^[\w\n]+;",
+    // A literal after a fixed number of characters of any width gives the
+    // candidates, matched backwards to where each match would start.
+    r"(\d{2}):(\d{2}):(\d{2})",
+    r"\d{4}/\d{2}/\d{2}",
+    r"(\w)(\w)-\d",
+    "é{2}x",
     // Patterns that can match nothing.
     r"\w*",
     "(?:ab)*",
@@ -164,6 +175,11 @@ const TEXTS: &[&str] = &[
     "aabacb abcabc bc ac",
     "xyw xzw xw xyzw",
     "é êx ê ex éêx",
+    "12:34:56 ١٢:٣٤:٥٦ 1:23:45 123:45:678 ١2:3٤:٥6 12:34:5 ：12:34:56",
+    "2022/06/17 ٢٠٢٢/٠٦/١٧ 22/06/17 12345/67/89 2022/6/17 ２０２２/１２/３１",
+    "Holmes\r\nab cd\r\nWatson\r\n\rx\r\n\r\nZ\nÉcole",
+    "éé éex éééx xéx ab-1 é-2 éé-3 ä1-4 -5",
+    "ab\ncd; ef\n\ngh;\nx y;\n;\nü\nß;",
 ];
 
 fn oracle_captures(
@@ -350,11 +366,13 @@ fn retained_storage_follows_plans() {
 /// Unicode modes, and single bytes in ASCII mode.
 #[test]
 fn plans_follow_byte_modes() {
-    let texts: [&[u8]; 4] = [
+    let texts: [&[u8]; 6] = [
         b"ab\xFFcd",
         b"\xC3\xA9\xC3",
         b"12\x80 34",
         b"\"q\xFF\" \"\"",
+        b"\xD9\xA1\xD9\xA2:3 1\xFF2:3 \xA22:3 12:3",
+        b"ab\n\xFF\ncd\n\xA9x\nef",
     ];
     for (pattern, unicode) in [
         ("[a-z]+", false),
@@ -363,6 +381,8 @@ fn plans_follow_byte_modes() {
         (r"\w+", true),
         (r#""[^"]*""#, true),
         ("é+", true),
+        (r"(\d{2}):\d", true),
+        (r"(?m)^\w+$", true),
     ] {
         let mode = if unicode {
             BytesMode::UnicodeBytes
