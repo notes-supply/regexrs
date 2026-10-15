@@ -4,6 +4,8 @@ ordinary/literal-miss
 regular/class-run-han
 regular/log-uuids
 regular/log-records
+regular/log-times
+regular/multiline-words
 regular/words-compile
 regular/words-startup-tiny
 regular/words-fresh-small
@@ -11,6 +13,7 @@ rich/doubled-words-lines
 rich/titled-names
 planning/titled-compile
 planning/titled-startup-small
+planning/titled-miss-fresh-small
 operations/names-dense
 operations/names-miss
 operations/captures-dense
