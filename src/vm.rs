@@ -648,7 +648,6 @@ impl Prog {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn start_filter(&self) -> Option<&StartFilter> {
         self.start_filter.as_ref()
     }

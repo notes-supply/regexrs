@@ -262,6 +262,9 @@ const EDGE_CHARS: usize = 256;
 pub(crate) struct Edges {
     pub(crate) behind: Vec<Edge>,
     pub(crate) ahead: Vec<Edge>,
+    /// Literals, in order, with a leftmost-first prefilter already built for
+    /// them, which candidates from the same lookbehind literals reuse.
+    pub(crate) prefilter: Option<(Vec<Vec<u8>>, Prefilter)>,
 }
 
 impl Edge {
@@ -1302,7 +1305,12 @@ impl Plan {
                 suffix(&steps, first, leading.is_empty() && edges.behind.is_empty()),
             ) {
                 // The literals of a lookbehind end where matches start.
-                (Some((literals, len)), _) => Prefilter::new(MatchKind::LeftmostFirst, &literals)
+                (Some((literals, len)), _) => edges
+                    .prefilter
+                    .as_ref()
+                    .filter(|(built, _)| *built == literals)
+                    .map(|(_, prefilter)| prefilter.clone())
+                    .or_else(|| Prefilter::new(MatchKind::LeftmostFirst, &literals))
                     .map_or(weaker, |prefilter| Candidates::Behind(prefilter, len)),
                 (None, Some((literal, class))) => Candidates::Suffix(
                     Box::new(memchr::memmem::Finder::new(&literal).into_owned()),

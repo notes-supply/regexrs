@@ -81,6 +81,7 @@ use crate::parse::{ExprTree, NamedGroups, Parser};
 use crate::parse_flags::*;
 use crate::plan::{NFA_UNIT_BUDGET, Plan, PlanInput};
 use crate::regular_route::{Automata, RegularRoute, RouteEngine};
+use crate::start::StartFilter;
 use crate::vm::{OPTION_FIND_NOT_EMPTY, OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH, Prog};
 
 pub use crate::bytes::MatchBytes;
@@ -1503,13 +1504,13 @@ impl Regex {
         } else if requires_capture_group_fixup {
             edged
                 .as_ref()
-                .and_then(|expr| assertion_route(expr, options, n_groups))
+                .and_then(|expr| assertion_route(expr, &prog, options, n_groups))
                 .map(Arc::new)
         } else {
             word_boundary_automata(&tree.expr, options, n_groups)
                 .or_else(|| {
                     let expr = edged.as_ref()?;
-                    assertion_route(expr, options, n_groups)
+                    assertion_route(expr, &prog, options, n_groups)
                 })
                 .map(Arc::new)
         };
@@ -2756,7 +2757,12 @@ fn edge_lookarounds(expr: &Expr) -> bool {
 /// `expr`, the pattern as written, before the optimizer turns a final
 /// lookahead into a rewritten capture group zero, so its groups are those
 /// `Regex` reports.
-fn assertion_route(expr: &Expr, options: &RegexOptions, n_groups: usize) -> Option<RegularRoute> {
+fn assertion_route(
+    expr: &Expr,
+    prog: &Prog,
+    options: &RegexOptions,
+    n_groups: usize,
+) -> Option<RegularRoute> {
     if regular::rich_option(options).is_some() {
         return None;
     }
@@ -2824,6 +2830,10 @@ fn assertion_route(expr: &Expr, options: &RegexOptions, n_groups: usize) -> Opti
     let edges = plan::Edges {
         behind: behind.into_iter().map(lookaround).collect::<Option<_>>()?,
         ahead: ahead.into_iter().map(lookaround).collect::<Option<_>>()?,
+        prefilter: prog
+            .start_filter()
+            .and_then(StartFilter::behind_prefilter)
+            .map(|(literals, prefilter)| (literals.to_vec(), prefilter.clone())),
     };
     let compile_options = CompileOptions {
         bytes_mode: options.bytes_mode,

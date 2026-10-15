@@ -62,6 +62,8 @@ enum Candidates {
         literals: Prefilter,
         len: usize,
         firsts: Option<ByteSet>,
+        /// The literals the prefilter searches for, in order.
+        needles: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     },
 }
 
@@ -169,8 +171,8 @@ impl StartFilter {
         // needle every candidate starts with. A walk through the lookbehind
         // costs one failure, as the lookbehind alone does.
         if !(cost.is_some() && firsts_usable && shared_prefix)
-            && let Some((literals, len)) = behind_literals(body, start, delegates, bytes_mode)
-            && let Some(literals) = Prefilter::new(MatchKind::LeftmostFirst, &literals)
+            && let Some((needles, len)) = behind_literals(body, start, delegates, bytes_mode)
+            && let Some(literals) = Prefilter::new(MatchKind::LeftmostFirst, &needles)
         {
             let firsts = (cost == Some(1) && firsts_usable).then_some(first_bytes);
             return Some(StartFilter {
@@ -178,6 +180,7 @@ impl StartFilter {
                     literals,
                     len,
                     firsts,
+                    needles,
                 },
                 seconds: None,
                 cost: 1,
@@ -228,6 +231,18 @@ impl StartFilter {
         matches!(self.candidates, Candidates::Behind { .. })
     }
 
+    /// A leading lookbehind's literals, in order, and the leftmost-first
+    /// prefilter built for them, which a plan for the same literals can
+    /// share.
+    pub(crate) fn behind_prefilter(&self) -> Option<(&[alloc::vec::Vec<u8>], &Prefilter)> {
+        match &self.candidates {
+            Candidates::Behind {
+                literals, needles, ..
+            } => Some((needles, literals)),
+            Candidates::Literal(_) | Candidates::Bytes(_) => None,
+        }
+    }
+
     /// The first candidate in `from..=end`.
     pub(crate) fn next(&self, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
         self.find(haystack, from).filter(|&at| at <= end)
@@ -246,6 +261,7 @@ impl StartFilter {
                 literals,
                 len,
                 firsts,
+                ..
             } => {
                 at >= *len
                     && literals
@@ -276,6 +292,7 @@ impl StartFilter {
                     literals,
                     len,
                     firsts,
+                    ..
                 } => {
                     // An occurrence ending at `start` or later starts at most
                     // `len` bytes earlier.
