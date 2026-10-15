@@ -1649,6 +1649,8 @@ impl Plan {
                 }
                 Step::Run(run) => {
                     for _ in 0..run.min {
+                        #[cfg(all(test, feature = "std"))]
+                        tests::SCANNED.with(|scanned| scanned.set(scanned.get() + 1));
                         at -= run.class.len_before(haystack, at)?;
                     }
                 }
@@ -2812,10 +2814,15 @@ mod tests {
             r"(?:\w\.)+x",
             r"[a-z]{3,}\d",
             r"\w{4,}",
+            r"(\d{2}):(\d{2})",
+            r"\d{4}/\d{2}x",
+            r"\w{8}:",
+            r"(?m)^\w+$",
+            r"(?m)^[\w\n]+;",
         ];
         let fragments = [
             "ab", "abab", "foo", "bar", "qu", "a.", "1.", "x", "ba", "-", "Ho", "c", "a,", "b",
-            "q", ".", " ", "1",
+            "q", ".", " ", "1", "12:", "١٢", "/", ":", "\n", "é", ";",
         ];
         let mut seed = 7u64;
         let mut next = move |n: usize| {
