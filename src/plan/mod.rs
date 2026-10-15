@@ -231,8 +231,13 @@ enum Candidates {
     /// Every match holds this literal where the steps before step `.1`, a
     /// fixed number of characters at least `.2` bytes long, end: each
     /// occurrence is matched backwards over them to where a match would
-    /// start, which needs valid UTF-8.
-    Inner(Box<memchr::memmem::Finder<'static>>, usize, usize),
+    /// start, which needs valid UTF-8. Other haystacks take the scan `.3`.
+    Inner(
+        Box<memchr::memmem::Finder<'static>>,
+        usize,
+        usize,
+        Box<Candidates>,
+    ),
     /// Every match starts where a line does, after `\n`, or after `\r` too
     /// when `true`: a leading multi-line `^` before a first step whose
     /// characters only a scan of every byte finds.
@@ -1328,12 +1333,13 @@ impl Plan {
                 Candidates::Lines(!leading.contains(&Look::StartLF))
             }
             (
-                Candidates::Ranges(..) | Candidates::Class(_),
+                scan @ (Candidates::Ranges(..) | Candidates::Class(_)),
                 Some((index, offset, false, bytes)),
             ) => Candidates::Inner(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 index,
                 offset,
+                Box::new(scan),
             ),
             (candidates, _) => candidates,
         };
@@ -1505,8 +1511,20 @@ impl Plan {
     /// match.
     #[inline]
     fn next_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        self.find_candidate(&self.candidates, input, from)
+    }
+
+    /// The first position in `from..end` where `candidates` finds that the
+    /// first consuming step can match.
+    #[inline]
+    fn find_candidate(
+        &self,
+        candidates: &Candidates,
+        input: &PlanInput<'_>,
+        from: usize,
+    ) -> Option<usize> {
         let (haystack, end) = (input.haystack, input.end);
-        let found = match &self.candidates {
+        let found = match candidates {
             Candidates::Literal(finder) => finder.find(&haystack[from..end]),
             Candidates::Prefilter(prefilter) => {
                 return prefilter
@@ -1521,14 +1539,11 @@ impl Plan {
                     .and_then(|rest| finder.find(rest))
                     .map(|at| from + at);
             }
-            Candidates::Inner(finder, index, min) => {
-                let Step::Run(run) = &self.steps[self.first] else {
-                    unreachable!("an inner literal follows a first run");
-                };
+            Candidates::Inner(finder, index, min, scan) => {
                 // Decoding backwards needs valid UTF-8 to agree with a
                 // forward attempt.
                 if !input.utf8 {
-                    return Plan::find_class(&run.class, haystack, from, end);
+                    return self.find_candidate(scan, input, from);
                 }
                 let before = &self.steps[self.first..*index];
                 let mut at = from + min;
@@ -2534,29 +2549,36 @@ mod tests {
     /// Candidates come from line starts after a leading multi-line `^` that
     /// would otherwise scan every byte, and from a literal after a fixed
     /// number of characters even where those are wider than a byte or
-    /// captured. Faster finders and unbounded distances keep their kind.
+    /// captured, which byte haystacks replace by the scan they took over.
+    /// Faster finders and unbounded distances keep their kind.
     #[test]
     fn candidates_follow_pattern_shape() {
-        let kind = |pattern: &str| match plan(pattern).expect(pattern).candidates {
-            Candidates::Lines(crlf) => format!("lines {crlf}"),
-            Candidates::Inner(_, index, min) => format!("inner {index} {min}"),
-            Candidates::Offset(_, offset) => format!("offset {offset}"),
-            Candidates::Literal(_) => "literal".into(),
-            Candidates::Bytes(_) => "bytes".into(),
-            Candidates::Ranges(..) => "ranges".into(),
-            Candidates::Class(_) => "class".into(),
-            Candidates::Prefilter(_) => "prefilter".into(),
-            Candidates::Behind(..) => "behind".into(),
-            Candidates::Suffix(..) => "suffix".into(),
-        };
+        fn name(candidates: &Candidates) -> String {
+            match candidates {
+                Candidates::Lines(crlf) => format!("lines {crlf}"),
+                Candidates::Inner(_, index, min, scan) => {
+                    format!("inner {index} {min} else {}", name(scan))
+                }
+                Candidates::Offset(_, offset) => format!("offset {offset}"),
+                Candidates::Literal(_) => "literal".into(),
+                Candidates::Bytes(_) => "bytes".into(),
+                Candidates::Ranges(..) => "ranges".into(),
+                Candidates::Class(_) => "class".into(),
+                Candidates::Prefilter(_) => "prefilter".into(),
+                Candidates::Behind(..) => "behind".into(),
+                Candidates::Suffix(..) => "suffix".into(),
+            }
+        }
+        let kind = |pattern: &str| name(&plan(pattern).expect(pattern).candidates);
         for (pattern, expected) in [
             (r"(?m)^\w+\r?$", "lines false"),
             (r"(?mR)^\w+$", "lines true"),
             (r"(?m)^[A-Z]\w*", "lines false"),
             (r"(?m)^#\w+", "literal"),
             (r"(?m)\w+$", "class"),
-            (r"(\d{2}):(\d{2}):(\d{2})", "inner 3 2"),
-            (r"\d{4}/\d{2}/\d{2}", "inner 1 4"),
+            (r"(\d{2}):(\d{2}):(\d{2})", "inner 3 2 else ranges"),
+            (r"\d{4}/\d{2}/\d{2}", "inner 1 4 else ranges"),
+            (r"\w{2}-", "inner 1 2 else class"),
             (r"(?-u:\d{4})/\d", "offset 4"),
             (r"(?-u:(\d{2})):\d", "offset 2"),
             (r"(?-u:\d)[a-z]{70}:", "offset 71"),
