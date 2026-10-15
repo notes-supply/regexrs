@@ -213,6 +213,16 @@ fn decode_wide(bytes: &[u8]) -> Option<(char, usize)> {
 }
 
 /// Whether `haystack` has no UTF-8 continuation byte at `at`.
+/// Set bits `lo..=hi` of a set of 64-bit words, a word at a time.
+fn fill(words: &mut [u64], lo: usize, hi: usize) {
+    for (index, word) in words.iter_mut().enumerate().take(hi / 64 + 1).skip(lo / 64) {
+        let base = index * 64;
+        let first = lo.max(base) - base;
+        let last = hi.min(base + 63) - base;
+        *word |= (u64::MAX >> (63 - last)) & (u64::MAX << first);
+    }
+}
+
 pub(super) fn char_boundary(haystack: &[u8], at: usize) -> bool {
     haystack.get(at).is_none_or(|&b| (b as i8) >= -0x40)
 }
@@ -226,13 +236,12 @@ impl CharSet {
         };
         let mut wide = Vec::new();
         for (start, end) in ranges {
-            let (lo, hi) = (u32::from(start), u32::from(end));
-            for c in lo..=hi.min(0x7F) {
-                set.ascii |= 1 << c;
+            let (lo, hi) = (u32::from(start) as usize, u32::from(end) as usize);
+            if lo <= 0x7F {
+                set.ascii |= (u128::MAX >> (0x7F - hi.min(0x7F))) & (u128::MAX << lo);
             }
-            for c in lo.max(0x80)..=hi.min(0x7FF) {
-                let index = (c - 0x80) as usize;
-                set.two[index >> 6] |= 1 << (index & 63);
+            if lo <= 0x7FF && hi >= 0x80 {
+                fill(&mut set.two, lo.max(0x80) - 0x80, hi.min(0x7FF) - 0x80);
             }
             if hi >= 0x800 {
                 wide.push((start.max('\u{800}'), end));
@@ -339,9 +348,7 @@ impl Class {
             hir::Class::Bytes(class) => {
                 let mut set = [0u64; 4];
                 for range in class.iter() {
-                    for b in range.start()..=range.end() {
-                        insert_byte(&mut set, b);
-                    }
+                    fill(&mut set, range.start().into(), range.end().into());
                 }
                 Class::Bytes(set)
             }
@@ -596,6 +603,41 @@ impl Stops {
 
 #[cfg(test)]
 mod tests {
+    /// Ranges fill the ASCII and two-byte bit sets a word at a time exactly
+    /// as setting each member's bit would, across word and encoding-width
+    /// boundaries.
+    #[test]
+    fn char_sets_fill_exactly_the_ranges() {
+        let ranges = [
+            ('\u{0}', '\u{0}'),
+            ('\u{3F}', '\u{40}'),
+            ('\u{7E}', '\u{85}'),
+            ('\u{BF}', '\u{C0}'),
+            ('\u{100}', '\u{13F}'),
+            ('\u{7C0}', '\u{900}'),
+            ('\u{21}', '\u{10FFFF}'),
+        ];
+        for (index, &range) in ranges.iter().enumerate() {
+            let set = super::CharSet::new(ranges[index..].iter().copied().chain([range]));
+            let mut ascii = 0u128;
+            let mut two = [0u64; 30];
+            for &(start, end) in &ranges[index..] {
+                for c in u32::from(start)..=u32::from(end).min(0x7FF) {
+                    match c {
+                        0..=0x7F => ascii |= 1 << c,
+                        _ => two[(c as usize - 0x80) >> 6] |= 1 << ((c - 0x80) & 63),
+                    }
+                }
+            }
+            assert_eq!(set.ascii, ascii, "{range:?}");
+            assert_eq!(set.two, two, "{range:?}");
+        }
+        let mut bytes = [0u64; 4];
+        super::fill(&mut bytes, 0x3F, 0xC1);
+        let expected: [u64; 4] = [1 << 63, u64::MAX, u64::MAX, 0b11];
+        assert_eq!(bytes, expected);
+    }
+
     /// The word-at-a-time test marks exactly the bytes in the set, in every
     /// lane and whatever the neighbouring lanes hold.
     #[test]
