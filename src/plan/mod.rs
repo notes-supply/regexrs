@@ -1253,11 +1253,6 @@ impl Plan {
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
             ),
-            (Step::Run(_), Some((index, offset, false, bytes))) => Candidates::Inner(
-                Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
-                index,
-                offset,
-            ),
             (Step::Literal(bytes), _) => {
                 Candidates::Literal(Box::new(memchr::memmem::Finder::new(bytes).into_owned()))
             }
@@ -1294,9 +1289,7 @@ impl Plan {
         };
         let skip_first_run = matches!(&steps[first], Step::Run(run) if run.max == usize::MAX);
         let candidates = match candidates {
-            candidates @ (Candidates::Literal(_)
-            | Candidates::Offset(..)
-            | Candidates::Inner(..)) => candidates,
+            candidates @ (Candidates::Literal(_) | Candidates::Offset(..)) => candidates,
             Candidates::Prefilter(prefilter) if prefilter.is_fast() => {
                 Candidates::Prefilter(prefilter)
             }
@@ -1319,16 +1312,26 @@ impl Plan {
                 (None, None) => weaker,
             },
         };
-        // Line starts are fewer than the positions such a scan stops at.
-        let candidates = match candidates {
-            Candidates::Ranges(..) | Candidates::Class(_)
-                if leading
-                    .iter()
-                    .any(|&look| matches!(look, Look::StartLF | Look::StartCRLF)) =>
-            {
+        // Line starts, or an inner literal's occurrences, are fewer than the
+        // positions a scan of every byte for the first class stops at. They
+        // replace only such a scan: a literal or prefilter search for the
+        // pattern's start finds candidates faster.
+        let line_start = leading
+            .iter()
+            .any(|&look| matches!(look, Look::StartLF | Look::StartCRLF));
+        let candidates = match (candidates, inner) {
+            (Candidates::Ranges(..) | Candidates::Class(_), _) if line_start => {
                 Candidates::Lines(!leading.contains(&Look::StartLF))
             }
-            candidates => candidates,
+            (
+                Candidates::Ranges(..) | Candidates::Class(_),
+                Some((index, offset, false, bytes)),
+            ) => Candidates::Inner(
+                Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
+                index,
+                offset,
+            ),
+            (candidates, _) => candidates,
         };
         let look_skip = skip_first_run
             && leading.is_empty()
@@ -2484,6 +2487,8 @@ mod tests {
             (r"(?-u:\d{4})/\d", "offset 4"),
             (r"(?-u:(\d{2})):\d", "offset 2"),
             (r"(?-u:\d)[a-z]{70}:", "offset 71"),
+            // A fast prefilter for the start keeps precedence.
+            ("(?i)Sherlock Holmes", "prefilter"),
             (r"\d\pL{70}:", "ranges"),
         ] {
             assert_eq!(kind(pattern), expected, "{pattern}");
