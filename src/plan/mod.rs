@@ -239,9 +239,9 @@ enum Candidates {
         Box<Candidates>,
     ),
     /// Every match starts where a line does, after `\n`, or after `\r` too
-    /// when `true`: a leading multi-line `^` before a first step whose
-    /// characters only a scan of every byte finds.
-    Lines(bool),
+    /// when `true`, with one of these bytes: a leading multi-line `^` before
+    /// a first step whose characters only a scan of every byte finds.
+    Lines(bool, [u64; 4]),
     /// Every match starts with a character of this class.
     Class(Class),
     /// Every match is preceded by one of a prefilter's literals, all of this
@@ -1235,30 +1235,43 @@ impl Plan {
         // from every match start, so its occurrences give the candidates.
         // After a fixed number of wider characters, each occurrence is
         // matched backwards to its start instead, over a bounded distance.
+        // Its first character must be outside every run before it: an
+        // occurrence inside one would be matched back over again from each
+        // later start in that run.
         let mut offset = 0;
         let mut fixed = true;
-        let mut inner: Option<(usize, usize, bool, &[u8])> = None;
+        let mut runs: Vec<&Class> = Vec::new();
+        let mut at_offset: Option<(usize, &[u8])> = None;
+        let mut inner: Option<(usize, usize, &[u8])> = None;
         for (index, step) in steps.iter().enumerate().skip(first) {
             match step {
-                Step::Literal(bytes) => {
-                    if index != first
-                        && (fixed || offset <= RESCAN_BOUND)
+                Step::Literal(bytes) if index != first => {
+                    if fixed && at_offset.is_none_or(|(_, best)| bytes.len() > best.len()) {
+                        at_offset = Some((offset, bytes));
+                    }
+                    if !fixed
+                        && offset <= RESCAN_BOUND
+                        && runs
+                            .iter()
+                            .all(|class| class.match_len(bytes, 0, bytes.len()).is_none())
                         && inner.is_none_or(|(.., best)| bytes.len() > best.len())
                     {
-                        inner = Some((index, offset, fixed, bytes));
+                        inner = Some((index, offset, bytes));
                     }
                     offset += bytes.len();
                 }
+                Step::Literal(bytes) => offset += bytes.len(),
                 Step::Run(run) if run.min == run.max => {
                     fixed &= run.class.max_len() == 1;
                     offset += run.min;
+                    runs.push(&run.class);
                 }
                 Step::Save(_) => {}
                 _ => break,
             }
         }
-        let candidates = match (&steps[first], inner) {
-            (Step::Run(_), Some((_, offset, true, bytes))) => Candidates::Offset(
+        let candidates = match (&steps[first], at_offset) {
+            (Step::Run(_), Some((offset, bytes))) => Candidates::Offset(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
             ),
@@ -1330,11 +1343,11 @@ impl Plan {
             .any(|&look| matches!(look, Look::StartLF | Look::StartCRLF));
         let candidates = match (candidates, inner) {
             (Candidates::Ranges(..) | Candidates::Class(_), _) if line_start => {
-                Candidates::Lines(!leading.contains(&Look::StartLF))
+                Candidates::Lines(!leading.contains(&Look::StartLF), first_class.first_bytes())
             }
             (
                 scan @ (Candidates::Ranges(..) | Candidates::Class(_)),
-                Some((index, offset, false, bytes)),
+                Some((index, offset, bytes)),
             ) => Candidates::Inner(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 index,
@@ -1372,8 +1385,10 @@ impl Plan {
                 exposure.then(Exposure::read(0, Some(0))?)?;
             }
         }
+        // A search through valid UTF-8 takes inner-literal candidates
+        // instead; see `search`.
         let window = !edged
-            && !matches!(candidates, Candidates::Offset(..) | Candidates::Inner(..))
+            && !matches!(candidates, Candidates::Offset(..))
             && match &steps[first] {
                 // Retrying shorter runs costs little more than a window.
                 Step::Run(run)
@@ -1511,20 +1526,8 @@ impl Plan {
     /// match.
     #[inline]
     fn next_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
-        self.find_candidate(&self.candidates, input, from)
-    }
-
-    /// The first position in `from..end` where `candidates` finds that the
-    /// first consuming step can match.
-    #[inline]
-    fn find_candidate(
-        &self,
-        candidates: &Candidates,
-        input: &PlanInput<'_>,
-        from: usize,
-    ) -> Option<usize> {
         let (haystack, end) = (input.haystack, input.end);
-        let found = match candidates {
+        let found = match &self.candidates {
             Candidates::Literal(finder) => finder.find(&haystack[from..end]),
             Candidates::Prefilter(prefilter) => {
                 return prefilter
@@ -1541,9 +1544,9 @@ impl Plan {
             }
             Candidates::Inner(finder, index, min, scan) => {
                 // Decoding backwards needs valid UTF-8 to agree with a
-                // forward attempt.
+                // forward attempt; other haystacks take the replaced scan.
                 if !input.utf8 {
-                    return self.find_candidate(scan, input, from);
+                    return Plan::scan_candidates(scan, haystack, from, end);
                 }
                 let before = &self.steps[self.first..*index];
                 let mut at = from + min;
@@ -1558,46 +1561,31 @@ impl Plan {
                 }
                 return None;
             }
-            Candidates::Lines(crlf) => {
+            Candidates::Lines(crlf, firsts) => {
                 let ends_line = |b: u8| b == b'\n' || (*crlf && b == b'\r');
-                if from == 0 || ends_line(haystack[from - 1]) {
-                    return (from < end).then_some(from);
-                }
-                let rest = &haystack[from..end];
-                let found = if *crlf {
-                    memchr::memchr2(b'\n', b'\r', rest)
-                } else {
-                    memchr::memchr(b'\n', rest)
-                };
-                return found.map(|at| from + at + 1).filter(|&at| at < end);
-            }
-            Candidates::Ranges(ranges, class) => {
-                let mut at = from;
-                while let Some(found) = ranges.find(haystack, at, end) {
-                    if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
-                        return Some(found);
-                    }
-                    at = found + 1;
-                }
-                return None;
-            }
-            Candidates::Class(Class::Bytes(set)) => {
-                haystack[from..end].iter().position(|&b| has_byte(set, b))
-            }
-            Candidates::Class(class @ Class::Chars(set)) => {
                 let mut at = from;
                 while at < end {
-                    let b = haystack[at];
-                    if b < 0x80 {
-                        if bit128(set.ascii, b) {
-                            return Some(at);
-                        }
-                    } else if class.match_len(haystack, at, end).is_some() {
+                    if (at == 0 || ends_line(haystack[at - 1])) && has_byte(firsts, haystack[at]) {
                         return Some(at);
                     }
-                    at += 1;
+                    // The next line starts after the next line end, which in
+                    // a run of empty lines is the next byte.
+                    if ends_line(haystack[at]) {
+                        at += 1;
+                        continue;
+                    }
+                    let rest = &haystack[at..end];
+                    let found = if *crlf {
+                        memchr::memchr2(b'\n', b'\r', rest)
+                    } else {
+                        memchr::memchr(b'\n', rest)
+                    };
+                    at += found? + 1;
                 }
                 return None;
+            }
+            scan @ (Candidates::Ranges(..) | Candidates::Class(_)) => {
+                return Plan::scan_candidates(scan, haystack, from, end);
             }
             Candidates::Behind(prefilter, len) => {
                 // A literal ending at or after `from`, perhaps before the
@@ -1661,6 +1649,49 @@ impl Plan {
             }
         }
         Some(at)
+    }
+
+    /// The first candidate in `from..end` of `scan`, a test of each byte for
+    /// a character of the first class, word-at-a-time for byte ranges.
+    #[inline(always)]
+    fn scan_candidates(
+        scan: &Candidates,
+        haystack: &[u8],
+        from: usize,
+        end: usize,
+    ) -> Option<usize> {
+        match scan {
+            Candidates::Ranges(ranges, class) => {
+                let mut at = from;
+                while let Some(found) = ranges.find(haystack, at, end) {
+                    if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
+                        return Some(found);
+                    }
+                    at = found + 1;
+                }
+                None
+            }
+            Candidates::Class(Class::Bytes(set)) => haystack[from..end]
+                .iter()
+                .position(|&b| has_byte(set, b))
+                .map(|offset| from + offset),
+            Candidates::Class(class @ Class::Chars(set)) => {
+                let mut at = from;
+                while at < end {
+                    let b = haystack[at];
+                    if b < 0x80 {
+                        if bit128(set.ascii, b) {
+                            return Some(at);
+                        }
+                    } else if class.match_len(haystack, at, end).is_some() {
+                        return Some(at);
+                    }
+                    at += 1;
+                }
+                None
+            }
+            _ => unreachable!("only scans of each byte are kept as a fallback"),
+        }
     }
 
     /// The first position in `from..end` holding a member of `class`, for
@@ -2153,7 +2184,7 @@ impl Plan {
         {
             return None;
         }
-        if self.window {
+        if self.window && !(input.utf8 && matches!(self.candidates, Candidates::Inner(..))) {
             return self.search_windows(input, earliest, slots);
         }
         if self.branching {
@@ -2557,7 +2588,7 @@ mod tests {
     fn candidates_follow_pattern_shape() {
         fn name(candidates: &Candidates) -> String {
             match candidates {
-                Candidates::Lines(crlf) => format!("lines {crlf}"),
+                Candidates::Lines(crlf, _) => format!("lines {crlf}"),
                 Candidates::Inner(_, index, min, scan) => {
                     format!("inner {index} {min} else {}", name(scan))
                 }
@@ -2586,6 +2617,12 @@ mod tests {
             (r"(?-u:\d)[a-z]{70}:", "offset 71"),
             // A fast prefilter for the start keeps precedence.
             ("(?i)Sherlock Holmes", "prefilter"),
+            // A literal at a fixed byte offset keeps precedence over a longer
+            // one after wider characters.
+            (r"[ab]{2}:\pL{2}:xyzw", "offset 2"),
+            // An inner literal a run before it could hold is not used.
+            (r"\pL{8}é\d", "ranges"),
+            (r".{12}a\d", "ranges"),
             (r"\d\pL{70}:", "ranges"),
         ] {
             assert_eq!(kind(pattern), expected, "{pattern}");

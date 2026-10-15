@@ -212,7 +212,6 @@ fn decode_wide(bytes: &[u8]) -> Option<(char, usize)> {
     }
 }
 
-/// Whether `haystack` has no UTF-8 continuation byte at `at`.
 /// Set bits `lo..=hi` of a set of 64-bit words, a word at a time.
 fn fill(words: &mut [u64], lo: usize, hi: usize) {
     for (index, word) in words.iter_mut().enumerate().take(hi / 64 + 1).skip(lo / 64) {
@@ -223,6 +222,7 @@ fn fill(words: &mut [u64], lo: usize, hi: usize) {
     }
 }
 
+/// Whether `haystack` has no UTF-8 continuation byte at `at`.
 pub(super) fn char_boundary(haystack: &[u8], at: usize) -> bool {
     haystack.get(at).is_none_or(|&b| (b as i8) >= -0x40)
 }

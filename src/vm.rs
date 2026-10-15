@@ -319,7 +319,13 @@ type DelegateFn = Box<dyn Fn() -> Regex + Send + Sync + UnwindSafe + RefUnwindSa
 /// it where building cannot fail, so that a pattern whose searches never
 /// reach the VM, as one with a planned route, never builds it.
 #[derive(Clone)]
-pub struct DelegateEngine(Arc<Lazy<Regex, DelegateFn>>);
+pub struct DelegateEngine(Engine);
+
+#[derive(Clone)]
+enum Engine {
+    Built(Regex),
+    Deferred(Arc<Lazy<Regex, DelegateFn>>),
+}
 
 impl core::fmt::Debug for DelegateEngine {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
@@ -330,20 +336,21 @@ impl core::fmt::Debug for DelegateEngine {
 impl DelegateEngine {
     /// An engine already built.
     pub(crate) fn built(regex: Regex) -> Self {
-        let engine = Self::deferred(Box::new(move || regex.clone()));
-        engine.get();
-        engine
+        Self(Engine::Built(regex))
     }
 
     /// An engine `build` creates when first searched; it must not fail.
     pub(crate) fn deferred(build: DelegateFn) -> Self {
-        Self(Arc::new(Lazy::new(build)))
+        Self(Engine::Deferred(Arc::new(Lazy::new(build))))
     }
 
     /// The engine, built now if this is its first use.
     #[inline]
     pub fn get(&self) -> &Regex {
-        Lazy::get(&self.0)
+        match &self.0 {
+            Engine::Built(regex) => regex,
+            Engine::Deferred(lazy) => Lazy::get(lazy),
+        }
     }
 }
 
