@@ -132,3 +132,16 @@ fn both_constructors_keep_explicit_size_limits() {
         Some(1)
     );
 }
+
+/// The backtracking VM's delegated engines keep the default limit too: one
+/// that could exceed it is built at construction and reports the engine's
+/// error there, while one that certainly fits is built when first searched.
+#[test]
+fn vm_delegates_keep_the_default_nfa_limit() {
+    assert_eq!(regex(r"(a)\1\w{400}"), Err(DEFAULT_LIMIT.to_string()));
+    let fits = Regex::new(r"(a)\1([A-Z]\w+)").unwrap();
+    let text = format!("x aaZ{}!", "é".repeat(30));
+    let captures = fits.captures(&text).unwrap().expect("matches");
+    assert_eq!(captures.get(2).map(|m| m.range()), Some(4..65));
+    assert!(!fits.is_match("aa é").unwrap());
+}

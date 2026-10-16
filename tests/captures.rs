@@ -791,6 +791,59 @@ fn expand() {
     assert_python_expansion(&cap, "\\g<π", "\\g<π");
 }
 
+/// A reference is a name first, then a number, whether or not it is ASCII,
+/// in short and long templates alike.
+#[test]
+fn expansion_resolves_names_before_numbers() {
+    let named = common::regex("(?<0>b)(?<_1>c)(a)");
+    let cap = named.captures("xbca").unwrap().expect("matched");
+    assert_expansion(&cap, "$0", "b");
+    assert_expansion(&cap, "${0}", "b");
+    assert_expansion(&cap, "$_1$3", "ca");
+    assert_expansion(&cap, "$_1é$3", "a");
+    let numbered = common::regex("(b)(c)(a)");
+    let cap = numbered.captures("xbca").unwrap().expect("matched");
+    assert_expansion(&cap, "$0$1$2$3$4", "bcabca");
+    assert_expansion(&cap, "$0é$1", "b");
+    assert_expansion(&cap, "$0 é $1", "bca é b");
+    assert_expansion(&cap, "$0001$01_$1", "bb");
+    let long = "a long template with $1 and $2 past sixteen bytes $3";
+    assert_expansion(
+        &cap,
+        long,
+        "a long template with b and c past sixteen bytes a",
+    );
+    assert_expansion(&cap, "$1234567890123456789012345", "");
+}
+
+/// Every way to expand a template writes the same text, appending to what is
+/// already there.
+#[test]
+fn expansion_writers_agree() {
+    let regex = common::regex("(a)(?<n>b)?(c)");
+    let cap = regex.captures("xacy").unwrap().expect("matched");
+    let template = "lead $1-${n}-$3 $$ $ ${1}π$1π ${9} tail";
+    let expected = "lead a--c $ $ aπ  tail";
+    let expander = Expander::default();
+    assert_eq!(expander.expansion(template, &cap), expected);
+    let mut appended = String::from(">");
+    expander.append_expansion(&mut appended, template, &cap);
+    assert_eq!(appended, format!(">{expected}"));
+    let mut bytes = b">".to_vec();
+    expander
+        .write_expansion_vec(&mut bytes, template, &cap)
+        .unwrap();
+    assert_eq!(bytes, format!(">{expected}").into_bytes());
+    #[cfg(feature = "std")]
+    {
+        let mut written = b">".to_vec();
+        expander
+            .write_expansion(&mut written, template, &cap)
+            .unwrap();
+        assert_eq!(written, bytes);
+    }
+}
+
 #[cfg_attr(feature = "track_caller", track_caller)]
 fn assert_expansion(cap: &Captures<'_, str>, replacement: &str, text: &str) {
     let mut buf = "before".to_string();

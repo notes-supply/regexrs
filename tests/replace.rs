@@ -128,3 +128,73 @@ fn replacement_closures_infer_str_captures() {
     });
     assert_eq!(doubled, "2 44");
 }
+
+fn spans(caps: &Captures) -> Vec<Option<std::ops::Range<usize>>> {
+    caps.iter().map(|m| m.map(|m| m.range())).collect()
+}
+
+/// Replacement reuses one capture buffer across matches, so each match must
+/// see only its own groups: a group that took part in an earlier match is
+/// `None` in a later one where it did not, and an empty group stays empty.
+#[test]
+fn replacement_captures_belong_to_each_match() {
+    let text = "a b aa bc ac c";
+    for pattern in ["(a)|(b)", r"(a)\1|(b)", "(?:(a)|(b))(c)?", "(a)?(b?)c"] {
+        let regex = common::regex(pattern);
+        let expected: Vec<_> = regex
+            .captures_iter(text)
+            .map(|caps| spans(&caps.unwrap()))
+            .collect();
+        let mut seen = Vec::new();
+        regex.replace_all(text, |caps: &Captures| {
+            seen.push(spans(caps));
+            "-"
+        });
+        assert_eq!(seen, expected, "Regex {pattern:?}");
+        if pattern.contains('\\') {
+            continue;
+        }
+        let regular = regexrs::RegularRegex::new(pattern).unwrap();
+        let mut seen = Vec::new();
+        regular.replace_all(text, |caps: &Captures| {
+            seen.push(spans(caps));
+            "-"
+        });
+        assert_eq!(seen, expected, "RegularRegex {pattern:?}");
+    }
+}
+
+/// Template replacement equals expanding each match from `captures_iter`,
+/// including empty matches and `\G`, which depends on where the previous
+/// match ended.
+#[test]
+fn replacement_equals_expanding_each_iterated_match() {
+    let text = "aab a\tb ab\n\nxyz";
+    for pattern in [
+        r"\Ga",
+        r"\G\w?",
+        "(a*)",
+        r"(?:\Gx|y)(z)?",
+        r"(\w)\1?|(\s)",
+        "b|",
+    ] {
+        let regex = common::regex(pattern);
+        for template in ["<$0>", "[$1]", "${2}$$", "$1$2$1", "", "$"] {
+            let mut expected = String::new();
+            let mut last = 0;
+            for caps in regex.captures_iter(text) {
+                let caps = caps.unwrap();
+                let whole = caps.get(0).unwrap();
+                expected.push_str(&text[last..whole.start()]);
+                caps.expand(template, &mut expected);
+                last = whole.end();
+            }
+            expected.push_str(&text[last..]);
+            assert_eq!(
+                regex.replace_all(text, template),
+                expected,
+                "{pattern:?} {template:?}"
+            );
+        }
+    }
+}

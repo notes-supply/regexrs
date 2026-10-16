@@ -33,14 +33,15 @@ sources and compares them on one CPU with the same adapter, fixtures and lock.
 Use full commit IDs. Results and verification logs go to
 `.benchmark-results/comparison/`; use a fresh output directory for each run.
 
-The default quick mode uses the 18 representative cases in
+The default quick mode uses the 21 representative cases in
 `benchmarks/quick-cases.txt`, with five rotated repetitions. It covers construction,
 first use, Unicode, captures, replacement, misses and backreferences. Set
 `BENCH_MODE=full` for every workload and the requested revisions. Quick mode is a
 regression signal, not complete coverage or an overall engine ranking.
 
 The benchmark workflow defaults to quick mode for benchmark-branch pushes; its
-manual `mode` input selects quick or full. It caches tools and Rust dependencies,
+manual `mode` input selects quick or full. It compares the pushed commit with
+its merge base on `main` and with the 0.1.5 release. It caches tools and Rust dependencies,
 not measured answers. The selected library is rebuilt to prevent backdated
 archived sources from reusing stale product code. All verification and timed
 operations still run. Hosted-VM results are relative comparisons; do not combine

@@ -45,17 +45,11 @@ jobs:
           save-if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
       - name: Compare frozen sources and competitors
         run: |
-          if [[ "$BENCH_MODE" == full ]]; then
-            mise run bench:rebar:compare -- \
-              candidate="$GITHUB_SHA" \
-              hybrid=5cc5ce9f485de0e5b16cefa2209340b739ac4a36 \
-              regular=8e0304a6584eaf2dde15681004d09ec9a7120e50 \
-              released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
-          else
-            mise run bench:rebar:compare -- \
-              candidate="$GITHUB_SHA" \
-              released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
-          fi
+          main=$(git merge-base origin/main "$GITHUB_SHA")
+          mise run bench:rebar:compare -- \
+            candidate="$GITHUB_SHA" \
+            main="$main" \
+            released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
       - name: Save raw results and verification evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

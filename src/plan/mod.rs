@@ -36,9 +36,11 @@
 //! which keeps whole iterations linear as well. A bounded first run is tried
 //! once per maximal run of its class, from the starts that can reach its end.
 //!
-//! Candidates come from the first literal, a literal at a fixed offset, a
-//! regex-automata prefilter, memchr over at most three bytes, a word-at-a-time
-//! test of byte ranges or a class scan, in that order of preference.
+//! Candidates come from the first literal, a literal at a fixed offset or
+//! after a fixed number of characters, a regex-automata prefilter, memchr
+//! over at most three bytes, a word-at-a-time test of byte ranges or a class
+//! scan, in that order of preference. A leading multi-line `^` takes line
+//! starts instead of the last two.
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
@@ -110,6 +112,11 @@ pub(crate) struct Plan {
     /// An upper bound on the size of the pattern's Thompson NFA; see
     /// [`nfa_bound`].
     nfa_units: usize,
+    /// For a program of one greedy unbounded run of at least one member
+    /// whose end no stop byte finds, the bytes that are members on their own:
+    /// every member byte of a byte class, or the ASCII members of a character
+    /// class. Such a run is searched by [`Plan::search_maximal_run`].
+    run_bytes: Option<Box<[bool; 256]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +229,20 @@ enum Candidates {
     Ranges(ByteRanges, Class),
     /// Every match holds this literal this many bytes after its start.
     Offset(Box<memchr::memmem::Finder<'static>>, usize),
+    /// Every match holds this literal where the steps before step `.1`, a
+    /// fixed number of characters at least `.2` bytes long, end: each
+    /// occurrence is matched backwards over them to where a match would
+    /// start, which needs valid UTF-8. Other haystacks take the scan `.3`.
+    Inner(
+        Box<memchr::memmem::Finder<'static>>,
+        usize,
+        usize,
+        Box<Candidates>,
+    ),
+    /// Every match starts where a line does, after `\n`, or after `\r` too
+    /// when `true`, with one of these bytes: a leading multi-line `^` before
+    /// a first step whose characters only a scan of every byte finds.
+    Lines(bool, [u64; 4]),
     /// Every match starts with a character of this class.
     Class(Class),
     /// Every match is preceded by one of a prefilter's literals, all of this
@@ -251,6 +272,9 @@ const EDGE_CHARS: usize = 256;
 pub(crate) struct Edges {
     pub(crate) behind: Vec<Edge>,
     pub(crate) ahead: Vec<Edge>,
+    /// Literals, in order, with a leftmost-first prefilter already built for
+    /// them, which candidates from the same lookbehind literals reuse.
+    pub(crate) prefilter: Option<(Vec<Vec<u8>>, Prefilter)>,
 }
 
 impl Edge {
@@ -369,7 +393,7 @@ impl Edge {
 /// capture group, and each copy of a repetition's expression plus one. No
 /// node is left out, so a pattern whose engine the default size limit rejects
 /// always exceeds [`NFA_UNIT_BUDGET`].
-fn nfa_bound(hir: &Hir) -> usize {
+pub(crate) fn nfa_bound(hir: &Hir) -> usize {
     let own = match hir.kind() {
         HirKind::Empty | HirKind::Look(_) | HirKind::Concat(_) | HirKind::Alternation(_) => 1,
         HirKind::Literal(hir::Literal(bytes)) => bytes.len(),
@@ -1210,23 +1234,44 @@ impl Plan {
             .map(|bytes| Box::new(memchr::memmem::Finder::new(bytes).into_owned()));
         // A literal after steps of fixed byte length sits at a fixed offset
         // from every match start, so its occurrences give the candidates.
+        // After a fixed number of wider characters, each occurrence is
+        // matched backwards to its start instead, over a bounded distance.
+        // Its first character must be outside every run before it: an
+        // occurrence inside one would be matched back over again from each
+        // later start in that run.
         let mut offset = 0;
-        let mut inner: Option<(usize, &[u8])> = None;
+        let mut fixed = true;
+        let mut runs: Vec<&Class> = Vec::new();
+        let mut at_offset: Option<(usize, &[u8])> = None;
+        let mut inner: Option<(usize, usize, &[u8])> = None;
         for (index, step) in steps.iter().enumerate().skip(first) {
             match step {
-                Step::Literal(bytes) => {
-                    if index != first && inner.is_none_or(|(_, best)| bytes.len() > best.len()) {
-                        inner = Some((offset, bytes));
+                Step::Literal(bytes) if index != first => {
+                    if fixed && at_offset.is_none_or(|(_, best)| bytes.len() > best.len()) {
+                        at_offset = Some((offset, bytes));
+                    }
+                    if !fixed
+                        && offset <= RESCAN_BOUND
+                        && runs
+                            .iter()
+                            .all(|class| class.match_len(bytes, 0, bytes.len()).is_none())
+                        && inner.is_none_or(|(.., best)| bytes.len() > best.len())
+                    {
+                        inner = Some((index, offset, bytes));
                     }
                     offset += bytes.len();
                 }
-                Step::Run(run) if run.min == run.max && run.class.max_len() == 1 => {
+                Step::Literal(bytes) => offset += bytes.len(),
+                Step::Run(run) if run.min == run.max => {
+                    fixed &= run.class.max_len() == 1;
                     offset += run.min;
+                    runs.push(&run.class);
                 }
+                Step::Save(_) => {}
                 _ => break,
             }
         }
-        let candidates = match (&steps[first], inner) {
+        let candidates = match (&steps[first], at_offset) {
             (Step::Run(_), Some((offset, bytes))) => Candidates::Offset(
                 Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
                 offset,
@@ -1276,7 +1321,12 @@ impl Plan {
                 suffix(&steps, first, leading.is_empty() && edges.behind.is_empty()),
             ) {
                 // The literals of a lookbehind end where matches start.
-                (Some((literals, len)), _) => Prefilter::new(MatchKind::LeftmostFirst, &literals)
+                (Some((literals, len)), _) => edges
+                    .prefilter
+                    .as_ref()
+                    .filter(|(built, _)| *built == literals)
+                    .map(|(_, prefilter)| prefilter.clone())
+                    .or_else(|| Prefilter::new(MatchKind::LeftmostFirst, &literals))
                     .map_or(weaker, |prefilter| Candidates::Behind(prefilter, len)),
                 (None, Some((literal, class))) => Candidates::Suffix(
                     Box::new(memchr::memmem::Finder::new(&literal).into_owned()),
@@ -1284,6 +1334,28 @@ impl Plan {
                 ),
                 (None, None) => weaker,
             },
+        };
+        // Line starts, or an inner literal's occurrences, are fewer than the
+        // positions a scan of every byte for the first class stops at. They
+        // replace only such a scan: a literal or prefilter search for the
+        // pattern's start finds candidates faster.
+        let line_start = leading
+            .iter()
+            .any(|&look| matches!(look, Look::StartLF | Look::StartCRLF));
+        let candidates = match (candidates, inner) {
+            (Candidates::Ranges(..) | Candidates::Class(_), _) if line_start => {
+                Candidates::Lines(!leading.contains(&Look::StartLF), first_class.first_bytes())
+            }
+            (
+                scan @ (Candidates::Ranges(..) | Candidates::Class(_)),
+                Some((index, offset, bytes)),
+            ) => Candidates::Inner(
+                Box::new(memchr::memmem::Finder::new(bytes).into_owned()),
+                index,
+                offset,
+                Box::new(scan),
+            ),
+            (candidates, _) => candidates,
         };
         let look_skip = skip_first_run
             && leading.is_empty()
@@ -1314,6 +1386,8 @@ impl Plan {
                 exposure.then(Exposure::read(0, Some(0))?)?;
             }
         }
+        // A search through valid UTF-8 takes inner-literal candidates
+        // instead; see `search`.
         let window = !edged
             && !matches!(candidates, Candidates::Offset(..))
             && match &steps[first] {
@@ -1351,6 +1425,16 @@ impl Plan {
             && !checks_end
             && !start_only
             && matches!(&*steps, [Step::Run(run)] if run.max == usize::MAX && run.min > 0);
+        let run_bytes = match &*steps {
+            [Step::Run(run)]
+                if single_run && run.min == 1 && !run.shortest && run.stops.is_none() =>
+            {
+                Some(Box::new(core::array::from_fn(|b| {
+                    run.class.has_single_byte(b as u8)
+                })))
+            }
+            _ => None,
+        };
         Some(Plan {
             steps: steps.into_boxed_slice(),
             leading: leading.into_boxed_slice(),
@@ -1378,6 +1462,7 @@ impl Plan {
             look_matcher: LookMatcher::new(),
             group_info,
             nfa_units,
+            run_bytes,
         })
     }
 
@@ -1412,6 +1497,7 @@ impl Plan {
             look_matcher: LookMatcher::new(),
             group_info: GroupInfo::new([[None::<&str>]]).ok()?,
             nfa_units: nfa_bound(hir),
+            run_bytes: None,
         })
     }
 
@@ -1461,34 +1547,12 @@ impl Plan {
                     .and_then(|rest| finder.find(rest))
                     .map(|at| from + at);
             }
+            Candidates::Inner(..) => return self.inner_candidate(input, from),
+            Candidates::Lines(..) => return self.line_candidate(input, from),
             Candidates::Ranges(ranges, class) => {
-                let mut at = from;
-                while let Some(found) = ranges.find(haystack, at, end) {
-                    if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
-                        return Some(found);
-                    }
-                    at = found + 1;
-                }
-                return None;
+                return Plan::range_candidate(ranges, class, haystack, from, end);
             }
-            Candidates::Class(Class::Bytes(set)) => {
-                haystack[from..end].iter().position(|&b| has_byte(set, b))
-            }
-            Candidates::Class(class @ Class::Chars(set)) => {
-                let mut at = from;
-                while at < end {
-                    let b = haystack[at];
-                    if b < 0x80 {
-                        if bit128(set.ascii, b) {
-                            return Some(at);
-                        }
-                    } else if class.match_len(haystack, at, end).is_some() {
-                        return Some(at);
-                    }
-                    at += 1;
-                }
-                return None;
-            }
+            Candidates::Class(class) => return Plan::class_candidate(class, haystack, from, end),
             Candidates::Behind(prefilter, len) => {
                 // A literal ending at or after `from`, perhaps before the
                 // search's start; all have the same length, so their ends
@@ -1524,10 +1588,130 @@ impl Plan {
         found.map(|offset| from + offset)
     }
 
+    /// [`Plan::next_candidate`] for an inner literal, out of line so that the
+    /// common finders keep their code: each occurrence matched backwards.
+    #[inline(never)]
+    fn inner_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        let Candidates::Inner(finder, index, min, scan) = &self.candidates else {
+            unreachable!("only inner-literal candidates are searched here");
+        };
+        let (haystack, end) = (input.haystack, input.end);
+        // Decoding backwards needs valid UTF-8 to agree with a forward
+        // attempt; other haystacks take the scan an inner literal replaced.
+        if !input.utf8 {
+            return match &**scan {
+                Candidates::Ranges(ranges, class) => {
+                    Plan::range_candidate(ranges, class, haystack, from, end)
+                }
+                Candidates::Class(class) => Plan::class_candidate(class, haystack, from, end),
+                _ => unreachable!("an inner literal replaces only a scan of each byte"),
+            };
+        }
+        let before = &self.steps[self.first..*index];
+        let mut at = from + min;
+        while let Some(offset) = haystack.get(at..end).and_then(|rest| finder.find(rest)) {
+            let found = at + offset;
+            if let Some(start) = Plan::start_before(before, haystack, found)
+                && start >= from
+            {
+                return Some(start);
+            }
+            at = found + 1;
+        }
+        None
+    }
+
+    /// [`Plan::next_candidate`] for line starts, out of line so that the
+    /// common finders keep their code.
+    #[inline(never)]
+    fn line_candidate(&self, input: &PlanInput<'_>, from: usize) -> Option<usize> {
+        let Candidates::Lines(crlf, firsts) = &self.candidates else {
+            unreachable!("only line-start candidates are searched here");
+        };
+        let (haystack, end) = (input.haystack, input.end);
+        let ends_line = |b: u8| b == b'\n' || (*crlf && b == b'\r');
+        let mut at = from;
+        while at < end {
+            if (at == 0 || ends_line(haystack[at - 1])) && has_byte(firsts, haystack[at]) {
+                return Some(at);
+            }
+            // The next line starts after the next line end, which in a run
+            // of empty lines is the next byte.
+            if ends_line(haystack[at]) {
+                at += 1;
+                continue;
+            }
+            let rest = &haystack[at..end];
+            let found = if *crlf {
+                memchr::memchr2(b'\n', b'\r', rest)
+            } else {
+                memchr::memchr(b'\n', rest)
+            };
+            at += found? + 1;
+        }
+        None
+    }
+
+    /// Where a match starts whose fixed `steps` before an inner literal end
+    /// at `at`, matching them backwards, or `None` where they do not match.
+    #[inline]
+    fn start_before(steps: &[Step], haystack: &[u8], mut at: usize) -> Option<usize> {
+        for step in steps.iter().rev() {
+            match step {
+                Step::Literal(bytes) => {
+                    let start = at.checked_sub(bytes.len())?;
+                    if haystack[start..at] != **bytes {
+                        return None;
+                    }
+                    at = start;
+                }
+                Step::Run(run) => {
+                    for _ in 0..run.min {
+                        #[cfg(all(test, feature = "std"))]
+                        tests::SCANNED.with(|scanned| scanned.set(scanned.get() + 1));
+                        at -= run.class.len_before(haystack, at)?;
+                    }
+                }
+                Step::Save(_) => {}
+                Step::Alt(_) | Step::Group(_) => {
+                    unreachable!("only fixed steps come before an inner literal")
+                }
+            }
+        }
+        Some(at)
+    }
+
     /// The first position in `from..end` holding a member of `class`, for
     /// candidates that cannot use their faster search on this input.
     #[inline(never)]
     fn find_class(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
+        Plan::class_candidate(class, haystack, from, end)
+    }
+
+    /// The first position in `from..end` holding a byte of `ranges` that
+    /// begins a member of `class`.
+    #[inline(always)]
+    fn range_candidate(
+        ranges: &ByteRanges,
+        class: &Class,
+        haystack: &[u8],
+        from: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let mut at = from;
+        while let Some(found) = ranges.find(haystack, at, end) {
+            if haystack[found] < 0x80 || class.match_len(haystack, found, end).is_some() {
+                return Some(found);
+            }
+            at = found + 1;
+        }
+        None
+    }
+
+    /// The first position in `from..end` holding a member of `class`, testing
+    /// each byte.
+    #[inline(always)]
+    fn class_candidate(class: &Class, haystack: &[u8], from: usize, end: usize) -> Option<usize> {
         match class {
             Class::Bytes(set) => haystack[from..end]
                 .iter()
@@ -2014,7 +2198,7 @@ impl Plan {
         {
             return None;
         }
-        if self.window {
+        if self.window && !(input.utf8 && matches!(self.candidates, Candidates::Inner(..))) {
             return self.search_windows(input, earliest, slots);
         }
         if self.branching {
@@ -2102,6 +2286,11 @@ impl Plan {
             tests::cover(input.start, end);
             return found.then_some((input.start, end));
         }
+        if let Some(member) = &self.run_bytes
+            && !earliest
+        {
+            return self.search_maximal_run(run, member, input);
+        }
         let mut from = input.start;
         loop {
             let candidate = self.next_candidate(input, from)?;
@@ -2116,6 +2305,59 @@ impl Plan {
             // later start inside the same run.
             from = end.max(candidate + 1);
             if from >= input.end {
+                return None;
+            }
+        }
+    }
+
+    /// [`Plan::search_run`] for a greedy run of at least one member whose
+    /// end no stop byte finds: the maximal run from the first member. In
+    /// dense text a member usually follows within a byte or two, so those are
+    /// tested before the candidate search, and member bytes are tested
+    /// against `member` without counting them.
+    #[inline]
+    fn search_maximal_run(
+        &self,
+        run: &Run,
+        member: &[bool; 256],
+        input: &PlanInput<'_>,
+    ) -> Option<(usize, usize)> {
+        let (haystack, end) = (input.haystack, input.end);
+        let is_member = |at: usize| at < end && member[usize::from(haystack[at])];
+        let mut from = input.start;
+        loop {
+            let start = if is_member(from) {
+                from
+            } else if is_member(from + 1) {
+                from + 1
+            } else {
+                self.next_candidate(input, from)?
+            };
+            let mut pos = start;
+            while pos < end {
+                let b = haystack[pos];
+                if member[usize::from(b)] {
+                    pos += 1;
+                } else if b < 0x80 {
+                    break;
+                } else {
+                    match run.class.match_len(haystack, pos, end) {
+                        Some(len) => pos += len,
+                        None => break,
+                    }
+                }
+            }
+            #[cfg(all(test, feature = "std"))]
+            {
+                tests::SCANNED.with(|scanned| scanned.set(scanned.get() + pos - start));
+                tests::cover(start, pos);
+            }
+            if pos > start {
+                return Some((start, pos));
+            }
+            // The candidate's lead byte began no member.
+            from = start + 1;
+            if from >= end {
                 return None;
             }
         }
@@ -2327,7 +2569,7 @@ impl Slots for [usize] {
 
 #[cfg(test)]
 mod tests {
-    use super::{NFA_UNIT_BUDGET, Plan, PlanInput, RESCAN_BOUND};
+    use super::{Candidates, NFA_UNIT_BUDGET, Plan, PlanInput, RESCAN_BOUND};
 
     #[cfg(feature = "std")]
     std::thread_local! {
@@ -2346,6 +2588,56 @@ mod tests {
 
     fn plan(pattern: &str) -> Option<Plan> {
         Plan::new(&regex_syntax::parse(pattern).unwrap(), true)
+    }
+
+    /// Candidates come from line starts after a leading multi-line `^` that
+    /// would otherwise scan every byte, and from a literal after a fixed
+    /// number of characters even where those are wider than a byte or
+    /// captured, which byte haystacks replace by the scan they took over.
+    /// Faster finders and unbounded distances keep their kind.
+    #[test]
+    fn candidates_follow_pattern_shape() {
+        fn name(candidates: &Candidates) -> String {
+            match candidates {
+                Candidates::Lines(crlf, _) => format!("lines {crlf}"),
+                Candidates::Inner(_, index, min, scan) => {
+                    format!("inner {index} {min} else {}", name(scan))
+                }
+                Candidates::Offset(_, offset) => format!("offset {offset}"),
+                Candidates::Literal(_) => "literal".into(),
+                Candidates::Bytes(_) => "bytes".into(),
+                Candidates::Ranges(..) => "ranges".into(),
+                Candidates::Class(_) => "class".into(),
+                Candidates::Prefilter(_) => "prefilter".into(),
+                Candidates::Behind(..) => "behind".into(),
+                Candidates::Suffix(..) => "suffix".into(),
+            }
+        }
+        let kind = |pattern: &str| name(&plan(pattern).expect(pattern).candidates);
+        for (pattern, expected) in [
+            (r"(?m)^\w+\r?$", "lines false"),
+            (r"(?mR)^\w+$", "lines true"),
+            (r"(?m)^[A-Z]\w*", "lines false"),
+            (r"(?m)^#\w+", "literal"),
+            (r"(?m)\w+$", "class"),
+            (r"(\d{2}):(\d{2}):(\d{2})", "inner 3 2 else ranges"),
+            (r"\d{4}/\d{2}/\d{2}", "inner 1 4 else ranges"),
+            (r"\w{2}-", "inner 1 2 else class"),
+            (r"(?-u:\d{4})/\d", "offset 4"),
+            (r"(?-u:(\d{2})):\d", "offset 2"),
+            (r"(?-u:\d)[a-z]{70}:", "offset 71"),
+            // A fast prefilter for the start keeps precedence.
+            ("(?i)Sherlock Holmes", "prefilter"),
+            // A literal at a fixed byte offset keeps precedence over a longer
+            // one after wider characters.
+            (r"[ab]{2}:\pL{2}:xyzw", "offset 2"),
+            // An inner literal a run before it could hold is not used.
+            (r"\pL{8}é\d", "ranges"),
+            (r".{12}a\d", "ranges"),
+            (r"\d\pL{70}:", "ranges"),
+        ] {
+            assert_eq!(kind(pattern), expected, "{pattern}");
+        }
     }
 
     /// Shapes the plan takes, and those it leaves to an engine: overlapping
@@ -2570,10 +2862,15 @@ mod tests {
             r"(?:\w\.)+x",
             r"[a-z]{3,}\d",
             r"\w{4,}",
+            r"(\d{2}):(\d{2})",
+            r"\d{4}/\d{2}x",
+            r"\w{8}:",
+            r"(?m)^\w+$",
+            r"(?m)^[\w\n]+;",
         ];
         let fragments = [
             "ab", "abab", "foo", "bar", "qu", "a.", "1.", "x", "ba", "-", "Ho", "c", "a,", "b",
-            "q", ".", " ", "1",
+            "q", ".", " ", "1", "12:", "١٢", "/", ":", "\n", "é", ";",
         ];
         let mut seed = 7u64;
         let mut next = move |n: usize| {

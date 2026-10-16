@@ -23,7 +23,6 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-#[cfg(feature = "variable-lookbehinds")]
 use alloc::sync::Arc;
 #[cfg(feature = "variable-lookbehinds")]
 use alloc::vec;
@@ -31,6 +30,7 @@ use alloc::vec::Vec;
 use regex_automata::meta::Regex as RaRegex;
 use regex_automata::meta::{Builder as RaBuilder, Config as RaConfig};
 use regex_automata::nfa::thompson::WhichCaptures;
+use regex_automata::util::look::{Look, LookSet};
 #[cfg(feature = "variable-lookbehinds")]
 use regex_automata::util::pool::Pool;
 
@@ -41,12 +41,15 @@ use std::collections::HashMap as Map;
 
 use crate::LookAround::*;
 use crate::analyze::Info;
+use crate::plan::{NFA_UNIT_BUDGET, nfa_bound};
 use crate::seek::build_seek_pattern;
 use crate::start::StartFilter;
 use crate::to_hir::{HirCtx, expr_to_hir};
 #[cfg(feature = "variable-lookbehinds")]
 use crate::vm::{CachePoolFn, ReverseBackwardsDelegate};
-use crate::vm::{CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, Insn, Prog, Seek};
+use crate::vm::{
+    CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, DelegateEngine, Insn, Prog, Seek,
+};
 use crate::{
     Absent, BacktrackingControlVerb, BytesMode, CompileError, Error, Expr, LookAround, Result,
 };
@@ -141,7 +144,7 @@ struct Compiler<'a> {
     /// Alternations (lookbehind branches especially) often repeat the same
     /// fragment, and building a `meta::Regex` dominates compile time, so
     /// identical fragments share one engine (cloning it is a cheap Arc copy).
-    delegate_memo: Map<(String, bool), RaRegex>,
+    delegate_memo: Map<(String, bool), DelegateEngine>,
     /// The `Hir` of each emitted delegate engine, by instruction index, for
     /// start-position analysis once the program is complete.
     delegate_hirs: Vec<(usize, Hir)>,
@@ -973,7 +976,7 @@ impl<'a> Compiler<'a> {
         } else {
             let compiled = compile_inner(pattern, &self.options, DelegateUsage::anchored(false))?;
             self.b.add(Insn::Delegate(Delegate {
-                inner: compiled,
+                inner: DelegateEngine::built(compiled),
                 pattern: pattern.to_string(),
                 capture_groups: None,
             }));
@@ -1055,6 +1058,18 @@ impl DelegateUsage {
             bounded_backtracking: true,
         }
     }
+}
+
+/// Whether an engine for `hir` certainly builds under `options`: under the
+/// default size limits, within [`NFA_UNIT_BUDGET`], and with the data its
+/// word boundaries need. Only such an engine is built on first use; any
+/// other is built at once, so compiling reports its errors.
+fn builds_infallibly(hir: &Hir, options: &CompileOptions) -> bool {
+    options.delegate_size_limit.is_none()
+        && options.delegate_dfa_size_limit.is_none()
+        && nfa_bound(hir) <= NFA_UNIT_BUDGET
+        && (!hir.properties().look_set().contains_word_unicode()
+            || LookSet::singleton(Look::WordUnicode).available().is_ok())
 }
 
 pub(crate) fn compile_inner(
@@ -1466,7 +1481,7 @@ impl DelegateBuilder {
     fn build(
         &mut self,
         options: &CompileOptions,
-        memo: &mut Map<(String, bool), RaRegex>,
+        memo: &mut Map<(String, bool), DelegateEngine>,
     ) -> Result<(Insn, Option<Hir>)> {
         // A single character class is matched directly, skipping engine
         // construction entirely (see CharClassMatcher). A class has no capture
@@ -1495,7 +1510,7 @@ impl DelegateBuilder {
     fn build_delegate(
         &mut self,
         options: &CompileOptions,
-        memo: &mut Map<(String, bool), RaRegex>,
+        memo: &mut Map<(String, bool), DelegateEngine>,
     ) -> Result<(Delegate, Option<Hir>)> {
         let capture_groups = self
             .capture_groups
@@ -1517,8 +1532,17 @@ impl DelegateBuilder {
             Some(engine) => engine.clone(),
             None => {
                 let engine = match &hir {
-                    Some(hir) => compile_inner_from_hir(hir, options, usage)?,
-                    None => compile_inner(&self.re, options, usage)?,
+                    Some(hir) if builds_infallibly(hir, options) => {
+                        let (hir, options) = (Arc::new(hir.clone()), options.clone());
+                        DelegateEngine::deferred(Box::new(move || {
+                            compile_inner_from_hir(&hir, &options, usage)
+                                .expect("an engine within the unit budget builds")
+                        }))
+                    }
+                    Some(hir) => {
+                        DelegateEngine::built(compile_inner_from_hir(hir, options, usage)?)
+                    }
+                    None => DelegateEngine::built(compile_inner(&self.re, options, usage)?),
                 };
                 memo.insert(memo_key, engine.clone());
                 engine
@@ -1537,6 +1561,29 @@ impl DelegateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delegates are built when first searched only where building
+    /// certainly succeeds: never under explicit size limits or beyond the
+    /// unit budget, where construction must report the engine's error.
+    #[test]
+    fn delegates_that_certainly_fit_are_built_when_first_searched() {
+        let hir = |pattern: &str| regex_syntax::parse(pattern).unwrap();
+        let options = CompileOptions::default();
+        for pattern in [r"[A-Z]\w+", "[a-z]{9}", r"(\d+)\s*(?:x|y)"] {
+            assert!(builds_infallibly(&hir(pattern), &options), "{pattern}");
+        }
+        assert!(!builds_infallibly(&hir(r"\w{400}"), &options));
+        let limited = CompileOptions {
+            delegate_size_limit: Some(1 << 20),
+            ..CompileOptions::default()
+        };
+        assert!(!builds_infallibly(&hir(r"[A-Z]\w+"), &limited));
+        let dfa_limited = CompileOptions {
+            delegate_dfa_size_limit: Some(1 << 20),
+            ..CompileOptions::default()
+        };
+        assert!(!builds_infallibly(&hir(r"[A-Z]\w+"), &dfa_limited));
+    }
 
     #[test]
     fn regular_only_engines_disable_bounded_backtracking() {

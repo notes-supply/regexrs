@@ -85,7 +85,7 @@ impl Expander {
             }
         };
         self.exec(template, |step| match step {
-            Step::Char(_) => Ok(()),
+            Step::Literal(_) => Ok(()),
             Step::GroupName(name) => {
                 if regex.named_groups.contains_key(name) {
                     Ok(())
@@ -136,27 +136,15 @@ impl Expander {
     /// Expands the template string `template` using the syntax defined
     /// by this expander and the values of capture groups from `captures`.
     pub fn expansion(&self, template: &str, captures: &Captures<'_, str>) -> String {
-        let mut cursor = Vec::with_capacity(template.len());
-        #[cfg(feature = "std")]
-        self.write_expansion(&mut cursor, template, captures)
-            .expect("expansion succeeded");
-        #[cfg(not(feature = "std"))]
-        self.write_expansion_vec(&mut cursor, template, captures)
-            .expect("expansion succeeded");
-        String::from_utf8(cursor).expect("expansion is UTF-8")
+        let mut expanded = String::with_capacity(template.len());
+        self.append_expansion(&mut expanded, template, captures);
+        expanded
     }
 
     /// Appends the expansion produced by `expansion` to `dst`.  Potentially more efficient
     /// than calling `expansion` directly and appending to an existing string.
     pub fn append_expansion(&self, dst: &mut String, template: &str, captures: &Captures<'_, str>) {
-        let mut cursor = core::mem::take(dst).into_bytes();
-        #[cfg(feature = "std")]
-        self.write_expansion(&mut cursor, template, captures)
-            .expect("expansion succeeded");
-        #[cfg(not(feature = "std"))]
-        self.write_expansion_vec(&mut cursor, template, captures)
-            .expect("expansion succeeded");
-        *dst = String::from_utf8(cursor).expect("expansion is UTF-8");
+        self.expand_into(template, captures, |piece| dst.push_str(piece));
     }
 
     /// Writes the expansion produced by `expansion` to `dst`.  Potentially more efficient
@@ -168,25 +156,9 @@ impl Expander {
         template: &str,
         captures: &Captures<'_, str>,
     ) -> std::io::Result<()> {
-        self.exec(template, |step| match step {
-            Step::Char(c) => write!(dst, "{}", c),
-            Step::GroupName(name) => {
-                if let Some(m) = captures.name(name) {
-                    write!(dst, "{}", m.as_str())
-                } else if let Some(m) = name.parse().ok().and_then(|num| captures.get(num)) {
-                    write!(dst, "{}", m.as_str())
-                } else {
-                    Ok(())
-                }
-            }
-            Step::GroupNum(num) => {
-                if let Some(m) = captures.get(num) {
-                    write!(dst, "{}", m.as_str())
-                } else {
-                    Ok(())
-                }
-            }
-            Step::Error => Ok(()),
+        self.exec(template, |step| match group_text(step, captures) {
+            Some(piece) => dst.write_all(piece.as_bytes()),
+            None => Ok(()),
         })
     }
 
@@ -198,29 +170,42 @@ impl Expander {
         template: &str,
         captures: &Captures<'_, str>,
     ) -> core::fmt::Result {
-        self.exec(template, |step| match step {
-            Step::Char(c) => {
-                dst.extend(c.to_string().as_bytes());
-                Ok(())
-            }
-            Step::GroupName(name) => {
-                if let Some(m) = captures.name(name) {
-                    dst.extend(m.as_str().as_bytes());
-                } else if let Some(m) = name.parse().ok().and_then(|num| captures.get(num)) {
-                    dst.extend(m.as_str().as_bytes());
-                }
-                Ok(())
-            }
-            Step::GroupNum(num) => {
-                if let Some(m) = captures.get(num) {
-                    dst.extend(m.as_str().as_bytes());
-                }
-                Ok(())
-            }
-            Step::Error => Ok(()),
-        })
+        self.expand_into(template, captures, |piece| {
+            dst.extend_from_slice(piece.as_bytes())
+        });
+        Ok(())
     }
 
+    /// Pass each piece of the expansion, in order, to `push`.
+    fn expand_into<'t>(
+        &self,
+        template: &'t str,
+        captures: &Captures<'t, str>,
+        mut push: impl FnMut(&'t str),
+    ) {
+        let expanded: Result<(), core::convert::Infallible> = self.exec(template, |step| {
+            if let Some(piece) = group_text(step, captures) {
+                push(piece);
+            }
+            Ok(())
+        });
+        if let Err(never) = expanded {
+            match never {}
+        }
+    }
+
+    /// Where the next substitution character in `text` is. Templates are
+    /// usually short, where a plain loop costs less than memchr's dispatch.
+    fn find_sub(&self, text: &str) -> Option<usize> {
+        match u8::try_from(self.sub_char) {
+            Ok(byte) if byte.is_ascii() && text.len() < 16 => text.bytes().position(|b| b == byte),
+            Ok(byte) if byte.is_ascii() => memchr::memchr(byte, text.as_bytes()),
+            _ => text.find(self.sub_char),
+        }
+    }
+
+    /// Parse `template` and pass its steps to `f`: runs of literal text whole,
+    /// so expanding costs one pass over the template.
     fn exec<'t, E>(
         &self,
         template: &'t str,
@@ -228,45 +213,96 @@ impl Expander {
     ) -> Result<(), E> {
         debug_assert!(!self.open.is_empty());
         debug_assert!(!self.close.is_empty());
-        let mut iter = template.chars();
-        while let Some(c) = iter.next() {
-            if c == self.sub_char {
-                let tail = iter.as_str();
-                let skip = if tail.starts_with(self.sub_char) {
-                    f(Step::Char(self.sub_char))?;
-                    1
-                } else if let Some(ParsedId {
-                    id,
-                    relative: None,
-                    skip,
-                }) = parse_id(tail, self.open, self.close, false).or_else(|| {
-                    if self.allow_undelimited_name {
-                        parse_id(tail, "", "", false)
-                    } else {
-                        None
-                    }
-                }) {
-                    f(Step::GroupName(id))?;
-                    skip
-                } else if let Some((skip, num)) = parse_usize(tail, 0) {
-                    f(Step::GroupNum(num))?;
-                    skip
-                } else {
-                    f(Step::Error)?;
-                    f(Step::Char(self.sub_char))?;
-                    0
-                };
-                iter = iter.as_str()[skip..].chars();
-            } else {
-                f(Step::Char(c))?;
+        let sub_len = self.sub_char.len_utf8();
+        let mut rest = template;
+        while let Some(at) = self.find_sub(rest) {
+            if at > 0 {
+                f(Step::Literal(&rest[..at]))?;
             }
+            let sub = &rest[at..at + sub_len];
+            let tail = &rest[at + sub_len..];
+            let skip = if tail.starts_with(self.sub_char) {
+                f(Step::Literal(sub))?;
+                sub_len
+            } else if let Some(len) = self
+                .allow_undelimited_name
+                .then(|| ascii_id(tail))
+                .flatten()
+            {
+                f(Step::GroupName(&tail[..len]))?;
+                len
+            } else if let Some(ParsedId {
+                id,
+                relative: None,
+                skip,
+            }) = parse_id(tail, self.open, self.close, false).or_else(|| {
+                if self.allow_undelimited_name {
+                    parse_id(tail, "", "", false)
+                } else {
+                    None
+                }
+            }) {
+                f(Step::GroupName(id))?;
+                skip
+            } else if let Some((skip, num)) = parse_usize(tail, 0) {
+                f(Step::GroupNum(num))?;
+                skip
+            } else {
+                f(Step::Error)?;
+                f(Step::Literal(sub))?;
+                0
+            };
+            rest = &tail[skip..];
+        }
+        if !rest.is_empty() {
+            f(Step::Literal(rest))?;
         }
         Ok(())
     }
 }
 
+/// The text `step` adds to an expansion: its literal text, or the group it
+/// names, by name first and then by number. `None` adds nothing.
+fn group_text<'t>(step: Step<'t>, captures: &Captures<'t, str>) -> Option<&'t str> {
+    let group = match step {
+        Step::Literal(text) => return Some(text),
+        Step::GroupName(name) => {
+            let named = (!captures.named_groups.is_empty())
+                .then(|| captures.name(name))
+                .flatten();
+            named.or_else(|| group_number(name).and_then(|num| captures.get(num)))
+        }
+        Step::GroupNum(num) => captures.get(num),
+        Step::Error => None,
+    };
+    group.map(|m| m.as_str())
+}
+
+/// The length of the name `text` starts with when it is ASCII and no
+/// character that could continue it follows; [`parse_id`] reads the rest.
+fn ascii_id(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+        .count();
+    (len > 0 && bytes.get(len).is_none_or(u8::is_ascii)).then_some(len)
+}
+
+/// The number `name` spells, as `usize::from_str` reads the ASCII digits a
+/// reference holds.
+fn group_number(name: &str) -> Option<usize> {
+    if (1..=4).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(
+            name.bytes()
+                .fold(0, |num, b| num * 10 + usize::from(b - b'0')),
+        );
+    }
+    name.parse().ok()
+}
+
 enum Step<'a> {
-    Char(char),
+    Literal(&'a str),
     GroupName(&'a str),
     GroupNum(usize),
     Error,

@@ -60,7 +60,12 @@ The plan finds candidates with memmem, a literal at a fixed offset, a
 `regex-automata` prefilter, memchr or a word-at-a-time byte-range test. A
 literal after an unbounded first run that the run cannot take, as `@` in
 `\w+@\w+`, gives the candidates instead: at each of its occurrences the plan
-scans back over the run to the match start. A pattern that is a finite set of
+scans back over the run to the match start. So does a literal after a fixed
+number of characters wider than a byte, as `:` in `(\d{2}):(\d{2})` with
+Unicode digits: each occurrence is matched backwards to where a match would
+start, in valid UTF-8, while byte haystacks scan for the first character. A
+leading multi-line `^` whose first character would otherwise be found by
+testing every byte takes line starts, found with memchr, as candidates. A pattern that is a finite set of
 literals without captures or assertions is searched with its prefilter alone,
 as the meta engine's literal strategy does, whatever the shape of its
 alternatives, so `ab|ac` and `(?:a|)b` need no program. Alternatives are chosen
@@ -93,6 +98,10 @@ unbounded repetition the VM runs over an expression that can match empty, such
 as `(\b\w*)*`: the VM ends it after an empty iteration, as backtracking engines
 do, and automata can report other captures or spans. The automata are built on
 the first search that uses them, which costs roughly 0.03–0.3 ms per pattern.
+The engines the VM delegates regular parts of a pattern to are built on the
+first search that runs them too, where they certainly fit the default size
+limits; otherwise construction builds them and reports their errors. A
+pattern whose searches its route answers never builds them.
 A word-boundary pattern with a plan uses it in place of the automata for
 every search on text, including non-ASCII text where the lazy DFAs would give
 up and leave the search to the VM. Unicode word boundaries there are the same
@@ -151,3 +160,7 @@ The seek approximation is only derived when a seek filter may use it.
 Caller-owned scratch is an allocation/ownership interface, not a guaranteed
 speedup: the portable implementation already pools working memory. Owned capture
 results still allocate independent snapshots. No results or haystacks are cached.
+
+Replacement expands its template in one pass, appending to the output, and
+fills one capture buffer for every match. A replacer only borrows each match's
+captures, so none can observe a later match's groups.
