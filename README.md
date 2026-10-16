@@ -28,9 +28,7 @@ backtracks; its searches cannot fail.
 ## Benchmarks
 
 Measured on **2026-10-15** on an AMD EPYC 7763 GitHub-hosted VM, using
-nightly-2026-10-11 and five CPU-pinned passes with rotated engine and revision
-order. Results are relative observations on that host, not an overall engine
-ranking or a comparison with the older Ryzen measurements.
+nightly-2026-10-11 and five CPU-pinned passes with rotated engine order.
 
 In the engine tables, each cell shows the median of five run medians and its
 ratio to the lowest median in that row. **Lower is better; 2.00× takes twice as long.** Bold requires
