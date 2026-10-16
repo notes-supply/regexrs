@@ -30,11 +30,20 @@ backtracks; its searches cannot fail.
 Measured on **2026-10-15** on an AMD EPYC 7763 GitHub-hosted VM, using
 nightly-2026-10-11 and five CPU-pinned passes with rotated engine order.
 
-In the engine tables, each cell shows the median of five run medians and its
-ratio to the lowest median in that row. **Lower is better; 2.00× takes twice as long.** Bold requires
-a run-median range below every other compared engine's range. Overlapping
-ranges are unbolded; ranges are not confidence intervals. Matching excludes
-pattern construction unless the row says otherwise.
+**Wins observed in this hosted run:**
+
+- **Unicode word scanning:** 2.36× faster than regex on English text and 2.14×
+  on Cyrillic text; 1.71× and 1.68× faster than ReSharp, respectively.
+- **Rust method-call matching:** 7.37× faster than Fancy with its seek prefilter
+  enabled, and 1.17× faster than ReSharp, using regexrs's default portable engine.
+- **Captured replacement:** 1.29× faster than regex and 10.84× faster than
+  Fancy + seek on dense matches, including output allocation.
+- **Construction + first search:** 14.04× faster than Fancy for title lookbehind
+  on a hundred-line input: **39.00 µs vs 547.41 µs**.
+
+Table cells show median time and a ratio to the fastest median in that row.
+Bold marks a leader whose run-median range does not overlap any other column.
+Matching excludes construction unless noted. [Ranges and methodology](docs/benchmarks.md#execution-selection-comparison-2026-10-15).
 
 Versions: regexrs 0.1.6, regex 1.13.1, fancy-regex 0.19.2 and
 ReSharp 0.7.5. Defaults unless labeled otherwise. ReSharp uses full Unicode
