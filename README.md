@@ -30,7 +30,7 @@ backtracks; its searches cannot fail.
 Measured on **2026-10-15** on an AMD EPYC 7763 GitHub-hosted VM, using
 nightly-2026-10-11 and five CPU-pinned passes with rotated engine order.
 
-**Where regexrs wins:**
+**Wins observed in this hosted run:**
 
 - **Unicode word scanning:** 2.36× faster than regex on English text and 2.14×
   on Cyrillic text; 1.71× and 1.68× faster than ReSharp, respectively.
