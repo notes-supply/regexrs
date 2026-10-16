@@ -230,13 +230,13 @@ allocations, concurrency or adversarial scaling; those need separate tools.
 
 ## Execution-selection comparison, 2026-10-15
 
-The current README tables use merged engine source
-`ced8f9ed44e23617a0ea2b0cc694d694b251fe64`, whose tree matches the merge commit
-`455a1de3b2d88bca2daec8fe649e33670cec6595`. The same adapter, lock, features,
-fixtures and pinned nightly measured it against previous main
-`17ef31bd8cf4a1d7c0104c5e1569bffe5ba4da65`, released 0.1.5
+This run measures the engine used by regexrs 0.1.6 at
+`ced8f9ed44e23617a0ea2b0cc694d694b251fe64`, alongside regexrs 0.1.5 at
 `4ff7bb0d18f672175a9247e6d31a318996f88ee8` and the pinned competitors.
-The compiler and engine versions are recorded in the metadata below.
+Package metadata and documentation changed for the 0.1.6 release; library code
+is identical to the measured source. The adapter, lock, features, fixtures and
+compiler are the same for every measured version. Exact source identities and
+the compiler configuration are retained in the raw run metadata.
 
 [Workflow 38811114628](https://github.com/notes-supply/regexrs/actions/runs/38811114628)
 ran on an AMD EPYC 7763 GitHub-hosted Ubuntu VM, Linux 6.17.0-1022-azure,
@@ -245,7 +245,7 @@ sibling was not reserved. Builds and verification finished before measurement.
 Each row used a 100 ms measurement budget and 50 ms warmup, up to 10 million
 measured iterations. Five passes rotated engine and revision order; these do
 not fully balance every position. Competitors were measured only in the
-candidate's binary, so unchanged-engine controls in the other linked binaries
+0.1.6 benchmark binary, so unchanged-engine controls in the other linked binaries
 were not measured.
 
 All 105 gates passed. Each revision passed exact span, capture, per-record and
@@ -269,41 +269,59 @@ run.
 - [Adapter, lock and fixture digests](../benchmarks/results/2026-10-15-execution/inputs.sha256).
 - [Measured binary digests](../benchmarks/results/2026-10-15-execution/binaries.sha256).
 
-### Improvements and retained losses
+### Version comparison
 
-The README's six previous-main comparisons have non-overlapping run-median
-ranges. Replacement no longer revalidates the accumulated output for each
-match and reuses capture storage. Multiline and captured-time patterns avoid
-redundant candidates. Routed rich patterns defer bounded delegates they do not
-use. Construction and construction-plus-first-search remain separate from
-warmed matching; lower construction time is not presented as a warm-search gain.
+Replacement reuses capture storage and appends template pieces without
+revalidating the accumulated output for each match. Multiline and captured-time
+patterns avoid redundant candidates. Routed rich patterns defer bounded
+delegates they do not use. Construction, first search and warmed matching remain
+separate measurements.
 
-Across the 270 candidate/main cells, 110 have a lower disjoint range, 50 have a
-higher disjoint range and 110 overlap. The nine disjoint-range paired median
-time increases above 5% are retained here:
+The default `Regex` dense-name replacement takes 1.70 ms in 0.1.6 versus 42.43 ms
+in 0.1.5. Dense captured replacement takes 2.46 ms versus 27.18 ms. Multiline
+word matching takes 462.98 µs versus 1.13 ms. Their run-median ranges do not
+overlap; every range remains in the summary CSV.
 
-| Workload | Engine | Previous main | Merged source | Time increase |
+Across 270 matched 0.1.6/0.1.5 cells, 196 have a lower disjoint range, 33 have a
+higher disjoint range and 41 overlap. The 21 disjoint-range paired median time
+increases above 5% are retained below. Percentages are medians of per-pass
+ratios, not ratios of the displayed rounded times.
+
+<details>
+<summary>Regressions against 0.1.5</summary>
+
+| Workload | Engine | 0.1.5 | 0.1.6 | Time increase |
 |---|---|---:|---:|---:|
-| `planning/class-run-compile` | `regexrs-regular` | 1.96 µs | 2.13 µs | 8.2% |
-| `scratch/rust-fn-lines` | `regexrs` | 13.16 ms | 14.19 ms | 7.4% |
-| `planning/class-run-compile` | `regexrs-seek` | 2.10 µs | 2.24 µs | 7.2% |
-| `ordinary/literal-miss` | `regexrs` | 13.95 µs | 14.87 µs | 6.5% |
-| `planning/literal-miss-warm` | `regexrs-regular` | 13.96 µs | 14.77 µs | 6.3% |
-| `planning/literal-miss-warm` | `regexrs` | 13.97 µs | 14.79 µs | 5.9% |
-| `planning/class-run-compile` | `regexrs` | 2.10 µs | 2.22 µs | 5.7% |
-| `planning/literal-miss-warm` | `regexrs-seek` | 14.06 µs | 14.83 µs | 5.6% |
-| `ordinary/literal-miss` | `regexrs-seek` | 13.99 µs | 14.85 µs | 5.5% |
+| `planning/titled-miss-fresh-small` | `regexrs-seek` | 901 ns | 9.72 µs | 987.3% |
+| `planning/titled-miss-fresh-small` | `regexrs` | 752 ns | 7.14 µs | 834.3% |
+| `planning/method-calls-compile` | `regexrs` | 4.37 µs | 8.00 µs | 81.7% |
+| `operations/short-run-8-32` | `regexrs` | 541 ns | 752 ns | 39.0% |
+| `operations/short-run-8-32` | `regexrs-seek` | 541 ns | 751 ns | 38.8% |
+| `operations/short-run-8-32` | `regexrs-regular` | 541 ns | 731 ns | 35.1% |
+| `planning/method-calls-startup-small` | `regexrs` | 8.12 µs | 10.86 µs | 33.7% |
+| `planning/method-calls-compile` | `regexrs-seek` | 17.05 µs | 21.13 µs | 24.6% |
+| `regular/line-words` | `regexrs-searcher` | 677.61 µs | 783.00 µs | 15.6% |
+| `regular/compile-log-extract` | `regexrs-regular` | 71.26 µs | 77.60 µs | 9.4% |
+| `ordinary/compile-log-extract` | `regexrs-seek` | 75.16 µs | 81.59 µs | 8.5% |
+| `regular/compile-log-extract` | `regexrs` | 75.52 µs | 81.39 µs | 8.5% |
+| `ordinary/compile-log-extract` | `regexrs` | 75.11 µs | 81.01 µs | 8.0% |
+| `regular/line-words` | `regexrs` | 705.37 µs | 761.45 µs | 7.8% |
+| `planning/method-calls-startup-small` | `regexrs-seek` | 23.11 µs | 24.81 µs | 7.5% |
+| `planning/literal-miss-warm` | `regexrs-regular` | 13.94 µs | 14.77 µs | 6.5% |
+| `ordinary/literal-miss` | `regexrs-seek` | 13.99 µs | 14.85 µs | 6.4% |
+| `ordinary/literal-miss` | `regexrs` | 14.00 µs | 14.87 µs | 6.2% |
+| `planning/literal-miss-warm` | `regexrs` | 13.93 µs | 14.79 µs | 6.2% |
+| `planning/literal-miss-warm` | `regexrs-seek` | 13.99 µs | 14.83 µs | 5.9% |
+| `rich/rust-raw-strings` | `regexrs` | 22.26 ms | 23.41 ms | 5.3% |
 
+</details>
+
+First use can expose deferred setup. For example,
+`planning/titled-miss-fresh-small` takes 7.14 µs in 0.1.6 versus 752 ns in 0.1.5,
+while construction plus that first search takes 38.34 µs versus 299.85 µs.
 Small differences on a shared VM may include host or binary-layout effects;
-this run does not establish their cause. They are retained rather than being
-attributed away. ReSharp and the seek-enabled configurations retain their
-separate semantics and settings. A small lead with overlapping ranges is not
-bolded as a clear winner in the README.
-
-Against released 0.1.5, `planning/titled-miss-fresh-small` still takes 7.14 µs
-versus 752 ns, a paired median time ratio of 9.34. Construction plus that first
-search takes 38.34 µs versus 299.85 µs. Both observations remain visible because
-deferring setup can move cost between phases. None of these tables measures
+this run does not establish their cause. ReSharp and seek-enabled configurations
+retain their separate semantics and settings. None of these tables measures
 retained memory, concurrency, arbitrary-byte performance or consumer build time.
 
 ### Reproduction

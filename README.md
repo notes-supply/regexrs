@@ -27,9 +27,7 @@ backtracks; its searches cannot fail.
 
 ## Benchmarks
 
-The tables use the **2026-10-15 hosted comparison** of merged engine source
-[`ced8f9e`](https://github.com/notes-supply/regexrs/commit/ced8f9ed44e23617a0ea2b0cc694d694b251fe64).
-All cells come from the same run on an AMD EPYC 7763 GitHub-hosted VM, using
+Measured on **2026-10-15** on an AMD EPYC 7763 GitHub-hosted VM, using
 nightly-2026-10-11 and five CPU-pinned passes with rotated engine and revision
 order. Results are relative observations on that host, not an overall engine
 ranking or a comparison with the older Ryzen measurements.
@@ -40,31 +38,10 @@ a run-median range below every other compared engine's range. Overlapping
 ranges are unbolded; ranges are not confidence intervals. Matching excludes
 pattern construction unless the row says otherwise.
 
-Versions: regexrs source `ced8f9e`, regex 1.13.1, fancy-regex 0.19.2 and
+Versions: regexrs 0.1.6, regex 1.13.1, fancy-regex 0.19.2 and
 ReSharp 0.7.5. Defaults unless labeled otherwise. ReSharp uses full Unicode
 classes and text-boundary anchors. A dash means not compared, not zero cost.
 Every compared row passed exact-result checks before timing.
-
-### Changes from previous main
-
-These default-`Regex` operations improved with non-overlapping run-median
-ranges against previous main `17ef31b` in the same five-pass run. Percentages
-are the median of the five paired time reductions.
-
-| Workload | Previous main | Merged source | Time reduction |
-|---|---:|---:|---:|
-| Multiline word matching | 6.10 ms | 462.98 µs | 92.4% |
-| Log-time captures | 143.16 µs | 30.07 µs | 79.0% |
-| Dense-name replacement | 40.77 ms | 1.70 ms | 95.8% |
-| Dense captured replacement | 25.11 ms | 2.46 ms | 90.2% |
-| Title-lookbehind construction | 310.85 µs | 31.90 µs | 89.7% |
-| Title construction + first search | 337.95 µs | 39.00 µs | 88.5% |
-
-The full comparison also retains nine non-overlapping regressions above 5%,
-with a largest paired increase of 8.2%. [Ranges, losses and reproduction
-steps](docs/benchmarks.md#execution-selection-comparison-2026-10-15) accompany
-all 5,290 measurements. This selected table is not a claim that every operation
-improved.
 
 ### Regular patterns
 
@@ -102,6 +79,32 @@ exceeds the default backtracking limits in both regexrs and Fancy.
 | Words before `!` | 35.00 µs (1.00×) | 34.95 µs (1.00×) | 54.72 µs (1.57×) | 54.53 µs (1.56×) | 42.39 µs (1.21×) |
 | Rust raw strings | 23.41 ms (1.22×) | 19.35 ms (1.01×) | 178.24 ms (9.32×) | 19.12 ms (1.00×) | — |
 | Rust method calls | 4.61 ms (1.00×) | 4.60 ms (1.00×) | 258.78 ms (56.26×) | 33.96 ms (7.38×) | 5.40 ms (1.17×) |
+
+### Replacement
+
+Complete replacement output, including result allocation. Literal replacements
+use `<$0>`; captured replacements use `[${1}]`.
+[Patterns and workloads](benchmarks/rebar/definitions/operations.toml).
+
+| Workload | regexrs | regexrs + seek | regex | Fancy | Fancy + seek |
+|---|---:|---:|---:|---:|---:|
+| Literal replacement, tiny input | 301 ns (1.00×) | 301 ns (1.00×) | 301 ns (1.00×) | 551 ns (1.83×) | 551 ns (1.83×) |
+| Literal replacement, dense matches | 1.70 ms (1.00×) | 1.70 ms (1.00×) | 1.82 ms (1.07×) | 42.07 ms (24.75×) | 43.40 ms (25.53×) |
+| Literal replacement, sparse matches | 23.59 µs (1.01×) | 23.39 µs (1.00×) | 24.66 µs (1.05×) | 195.93 µs (8.38×) | 195.11 µs (8.34×) |
+| Literal replacement, no matches | 12.11 µs (1.00×) | 12.11 µs (1.00×) | **12.08 µs (1.00×)** | 12.11 µs (1.00×) | 12.10 µs (1.00×) |
+| Captured replacement, dense matches | 2.46 ms (1.00×) | 2.46 ms (1.00×) | 3.18 ms (1.29×) | 26.74 ms (10.87×) | 26.67 ms (10.84×) |
+
+### Construction and first search
+
+Names after `Mr.` or `Dr.` in a hundred-line store. First search excludes
+construction and uses a fresh instance. Startup includes construction and the
+first search. [Patterns and workloads](benchmarks/rebar/definitions/planning.toml).
+
+| Operation | regexrs | regexrs + seek | Fancy | Fancy + seek | ReSharp |
+|---|---:|---:|---:|---:|---:|
+| Construction | **31.90 µs (1.00×)** | 308.68 µs (9.68×) | 286.03 µs (8.97×) | 573.56 µs (17.98×) | 104.76 ms (3284.01×) |
+| First search | **7.63 µs (1.00×)** | 10.23 µs (1.34×) | 254.00 µs (33.29×) | 91.75 µs (12.02×) | 114.07 µs (14.95×) |
+| Startup | **39.00 µs (1.00×)** | 319.55 µs (8.19×) | 547.41 µs (14.04×) | 666.81 µs (17.10×) | 104.78 ms (2686.67×) |
 
 ### Native execution
 
