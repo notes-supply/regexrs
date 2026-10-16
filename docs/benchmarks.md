@@ -221,11 +221,106 @@ losses stay visible, and there is no single cross-workload score.
 
 Public speed claims need repeated, rotated runs on a quiet physical host with a
 pinned CPU, with the same toolchain and recorded sources. A difference smaller
-than the run-to-run variation is inconclusive. Short runs, and anything on a
-shared VM, only show that the harness works.
+than the run-to-run variation is inconclusive. Short smoke runs only show that
+the harness works. Full repeated comparisons on a shared VM provide relative
+development signals, not physical-host acceptance.
 
 The suite does not measure consumer build time, binary size, retained memory,
 allocations, concurrency or adversarial scaling; those need separate tools.
+
+## Execution-selection comparison, 2026-10-15
+
+The current README tables use merged engine source
+`ced8f9ed44e23617a0ea2b0cc694d694b251fe64`, whose tree matches the merge commit
+`455a1de3b2d88bca2daec8fe649e33670cec6595`. The same adapter, lock, features,
+fixtures and pinned nightly measured it against previous main
+`17ef31bd8cf4a1d7c0104c5e1569bffe5ba4da65`, released 0.1.5
+`4ff7bb0d18f672175a9247e6d31a318996f88ee8` and the pinned competitors.
+The compiler and engine versions are recorded in the metadata below.
+
+[Workflow 38811114628](https://github.com/notes-supply/regexrs/actions/runs/38811114628)
+ran on an AMD EPYC 7763 GitHub-hosted Ubuntu VM, Linux 6.17.0-1022-azure,
+with four logical CPUs. Each measured process was pinned to CPU 0; its SMT
+sibling was not reserved. Builds and verification finished before measurement.
+Each row used a 100 ms measurement budget and 50 ms warmup, up to 10 million
+measured iterations. Five passes rotated engine and revision order; these do
+not fully balance every position. Competitors were measured only in the
+candidate's binary, so unchanged-engine controls in the other linked binaries
+were not measured.
+
+All 105 gates passed. Each revision passed exact span, capture, per-record and
+replacement-output verification for 518 engine rows, then Rebar's expected-count
+checks. All 5,290 timed rows across 121 workloads and 1,058 cells passed their
+count checks, with five repetitions per cell. Of those timed rows, 96 have only
+one measured iteration. There are 103 cells with fewer than five iterations in
+at least one pass; those cells still have five independent passes.
+
+Results are medians of five run medians. Ranges are their minimum and maximum,
+not confidence intervals. Paired ratios use matching repetition numbers.
+Hosted-VM observations are relative comparisons, not replacements for acceptance
+on a quiet physical host or an overall engine ranking. The dated October 11
+physical-host datasets below remain unchanged and must not be combined with this
+run.
+
+- [Raw measurements](../benchmarks/results/2026-10-15-execution/measurements.csv).
+- [All medians, ranges and sample counts](../benchmarks/results/2026-10-15-execution/summary.csv).
+- [Sources, host, budgets, exact batch orders and versions](../benchmarks/results/2026-10-15-execution/metadata.json).
+- [Successful gate receipts](../benchmarks/results/2026-10-15-execution/gates.tsv).
+- [Adapter, lock and fixture digests](../benchmarks/results/2026-10-15-execution/inputs.sha256).
+- [Measured binary digests](../benchmarks/results/2026-10-15-execution/binaries.sha256).
+
+### Improvements and retained losses
+
+The README's six previous-main comparisons have non-overlapping run-median
+ranges. Replacement no longer revalidates the accumulated output for each
+match and reuses capture storage. Multiline and captured-time patterns avoid
+redundant candidates. Routed rich patterns defer bounded delegates they do not
+use. Construction and construction-plus-first-search remain separate from
+warmed matching; lower construction time is not presented as a warm-search gain.
+
+Across the 270 candidate/main cells, 110 have a lower disjoint range, 50 have a
+higher disjoint range and 110 overlap. The nine disjoint-range paired median
+time increases above 5% are retained here:
+
+| Workload | Engine | Previous main | Merged source | Time increase |
+|---|---|---:|---:|---:|
+| `planning/class-run-compile` | `regexrs-regular` | 1.96 µs | 2.13 µs | 8.2% |
+| `scratch/rust-fn-lines` | `regexrs` | 13.16 ms | 14.19 ms | 7.4% |
+| `planning/class-run-compile` | `regexrs-seek` | 2.10 µs | 2.24 µs | 7.2% |
+| `ordinary/literal-miss` | `regexrs` | 13.95 µs | 14.87 µs | 6.5% |
+| `planning/literal-miss-warm` | `regexrs-regular` | 13.96 µs | 14.77 µs | 6.3% |
+| `planning/literal-miss-warm` | `regexrs` | 13.97 µs | 14.79 µs | 5.9% |
+| `planning/class-run-compile` | `regexrs` | 2.10 µs | 2.22 µs | 5.7% |
+| `planning/literal-miss-warm` | `regexrs-seek` | 14.06 µs | 14.83 µs | 5.6% |
+| `ordinary/literal-miss` | `regexrs-seek` | 13.99 µs | 14.85 µs | 5.5% |
+
+Small differences on a shared VM may include host or binary-layout effects;
+this run does not establish their cause. They are retained rather than being
+attributed away. ReSharp and the seek-enabled configurations retain their
+separate semantics and settings. A small lead with overlapping ranges is not
+bolded as a clear winner in the README.
+
+Against released 0.1.5, `planning/titled-miss-fresh-small` still takes 7.14 µs
+versus 752 ns, a paired median time ratio of 9.34. Construction plus that first
+search takes 38.34 µs versus 299.85 µs. Both observations remain visible because
+deferring setup can move cost between phases. None of these tables measures
+retained memory, concurrency, arbitrary-byte performance or consumer build time.
+
+### Reproduction
+
+Use a checkout of the measured commit so the adapter, lock and definitions match.
+The command below selects the same full matrix and frozen sources. Use a fresh
+output directory and do not run compilation or profiling during measurement.
+The workflow's hosted machine cannot be recreated by copying its absolute times.
+
+```sh
+git checkout --detach ced8f9ed44e23617a0ea2b0cc694d694b251fe64
+mise install --locked
+BENCH_MODE=full mise run bench:rebar:compare -- \
+  candidate=ced8f9ed44e23617a0ea2b0cc694d694b251fe64 \
+  main=17ef31bd8cf4a1d7c0104c5e1569bffe5ba4da65 \
+  released=4ff7bb0d18f672175a9247e6d31a318996f88ee8
+```
 
 ## Planning and construction pass, 2026-10-11
 
@@ -233,7 +328,9 @@ This pair compares released 0.1.4, `9ebb13d2d262a7c821ab22efad33e917ca75d67f`,
 with `bd59bf9f99aa561e3fc67733949679d71ce9613d`. Both use the candidate's
 adapter, dependency lock, fixtures, features and pinned compiler. The 0.1.5
 release changes package metadata and documentation, not the measured library.
-Earlier 0.1.4 results and README tables are preserved.
+The earlier 0.1.4 results remain in the dated datasets below. The
+[October 11 README tables](https://github.com/notes-supply/regexrs/blob/4ff7bb0d18f672175a9247e6d31a318996f88ee8/README.md#benchmarks)
+remain available at their release commit.
 
 The host was an AMD Ryzen 9 9950X3D running Linux 7.2.5-3-omarchy, with the
 performance governor and nightly-2026-10-11. Each process was pinned to CPU 2.
@@ -360,7 +457,7 @@ taskset -c 2 target/release/rebar measure -d rebar -e '^regexrs$' \
 
 ## Competitive pass, 2026-10-11
 
-The current tables compare candidate `cd261540d684686a71260bd8c556cd5a9c58e53a`
+The historical October 11 tables compare candidate `cd261540d684686a71260bd8c556cd5a9c58e53a`
 with frozen baseline `34cf8625ffecff621ccd94b209e8b19ee031b722`.
 Both library revisions used the candidate's exact runner, dependency lock,
 fixtures, definitions and features, including `regexrs-seek`. The release
