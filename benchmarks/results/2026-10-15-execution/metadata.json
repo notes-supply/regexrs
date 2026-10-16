@@ -1,0 +1,461 @@
+{
+  "date": "2026-10-15",
+  "workflow": "https://github.com/notes-supply/regexrs/actions/runs/38811114628",
+  "sources": {
+    "candidate": "ced8f9ed44e23617a0ea2b0cc694d694b251fe64",
+    "main": "17ef31bd8cf4a1d7c0104c5e1569bffe5ba4da65",
+    "released": "4ff7bb0d18f672175a9247e6d31a318996f88ee8"
+  },
+  "merged_commit": "455a1de3b2d88bca2daec8fe649e33670cec6595",
+  "merged_tree_matches_candidate": true,
+  "rebar": "463d00f31887e84c38467805b9e3122c314b9521",
+  "toolchain": "nightly-2026-10-11",
+  "rustc": "1.101.0-nightly (6f5da406b 2026-10-10)",
+  "dependencies": {
+    "regex": "1.13.1",
+    "fancy-regex": "0.19.2",
+    "resharp": "0.7.5"
+  },
+  "host": {
+    "runner": "GitHub-hosted ubuntu-24.04",
+    "cpu": "AMD EPYC 7763",
+    "logical_cpus": 4,
+    "linux": "6.17.0-1022-azure x86_64",
+    "virtualization": "Microsoft full virtualization",
+    "smt_sibling_reserved": false,
+    "initial_load_average": [
+      1.1,
+      0.34,
+      0.12
+    ]
+  },
+  "pinned_cpu": 0,
+  "build_profile": "release, thin LTO for the adapter",
+  "features": "native enabled in the runner; used only by regexrs-native boolean queries",
+  "repetitions": 5,
+  "max_time": "100ms",
+  "max_warmup_time": "50ms",
+  "max_iters": 10000000,
+  "workloads": 121,
+  "cells": 1058,
+  "measured_rows": 5290,
+  "errors": 0,
+  "successful_gates": 105,
+  "verification_rows_per_revision": 518,
+  "one_iteration_measurements": 96,
+  "cells_with_fewer_than_five_iterations_in_a_pass": 103,
+  "orders": [
+    {
+      "repetition": 1,
+      "batches": [
+        {
+          "revision": "candidate",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regex"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "resharp"
+        }
+      ]
+    },
+    {
+      "repetition": 2,
+      "batches": [
+        {
+          "revision": "main",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "resharp"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regex"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-regular"
+        }
+      ]
+    },
+    {
+      "repetition": 3,
+      "batches": [
+        {
+          "revision": "released",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regex"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "resharp"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-regular"
+        }
+      ]
+    },
+    {
+      "repetition": 4,
+      "batches": [
+        {
+          "revision": "candidate",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "resharp"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regex"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-seek"
+        }
+      ]
+    },
+    {
+      "repetition": 5,
+      "batches": [
+        {
+          "revision": "main",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-native"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regex"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy"
+        },
+        {
+          "revision": "candidate",
+          "engine": "fancy-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "resharp"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-regular"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-searcher"
+        },
+        {
+          "revision": "main",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "released",
+          "engine": "regexrs-seek"
+        },
+        {
+          "revision": "candidate",
+          "engine": "regexrs-seek"
+        }
+      ]
+    }
+  ],
+  "competitors_measured_in": "candidate binary only",
+  "source_and_binary_digests": {
+    "inputs": "inputs.sha256",
+    "binaries": "binaries.sha256"
+  },
+  "summary": "Median of five run medians; ranges are minimum/maximum run medians, not confidence intervals.",
+  "revision_ratios": "Median of per-repetition candidate/main median-time ratios. Lower is faster."
+}
