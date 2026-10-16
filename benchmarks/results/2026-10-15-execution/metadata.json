@@ -6,8 +6,6 @@
     "main": "17ef31bd8cf4a1d7c0104c5e1569bffe5ba4da65",
     "released": "4ff7bb0d18f672175a9247e6d31a318996f88ee8"
   },
-  "merged_commit": "455a1de3b2d88bca2daec8fe649e33670cec6595",
-  "merged_tree_matches_candidate": true,
   "rebar": "463d00f31887e84c38467805b9e3122c314b9521",
   "toolchain": "nightly-2026-10-11",
   "rustc": "1.101.0-nightly (6f5da406b 2026-10-10)",
@@ -457,5 +455,9 @@
     "binaries": "binaries.sha256"
   },
   "summary": "Median of five run medians; ranges are minimum/maximum run medians, not confidence intervals.",
-  "revision_ratios": "Median of per-repetition candidate/main median-time ratios. Lower is faster."
+  "revision_ratios": "Version comparisons use the median of per-repetition candidate/released median-time ratios. Lower is faster.",
+  "release_versions": {
+    "candidate": "0.1.6",
+    "released": "0.1.5"
+  }
 }

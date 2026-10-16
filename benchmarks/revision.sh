@@ -28,6 +28,9 @@ build)
     cp -r runner/src "$out/adapter/"
     sed -i -e "s#path = \"../..\"#path = \"$source\"#" \
         -e "s#path = \"../.rebar/#path = \"$here/.rebar/#" "$out/adapter/Cargo.toml"
+    # Frozen sources can have a different package version. Resolve only that
+    # path dependency, retaining the pinned competitor and harness dependencies.
+    cargo update --manifest-path "$out/adapter/Cargo.toml" --package regexrs
     # Archived sources can have timestamps older than a restored target cache.
     # Keep registry dependencies cached, but always rebuild the selected crate.
     CARGO_TARGET_DIR=$here/target/planning/cargo cargo clean --locked --release \
